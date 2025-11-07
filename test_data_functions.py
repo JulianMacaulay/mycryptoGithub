@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import json
 import time
 import requests
+import ccxt
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -211,6 +212,154 @@ def test_multiple_symbols():
             
     except Exception as e:
         print(f"多币对数据获取失败: {str(e)}")
+
+def test_multiple_symbols_ccxt():
+    """测试获取多个币对数据 - 使用ccxt库 - 支持分段保存"""
+    print("\n" + "=" * 60)
+    print("测试2-CCXT: 获取多个币对数据（使用ccxt库）")
+    print("=" * 60)
+    
+    try:
+        # 初始化币安交易所（公共数据获取不需要apikey和secret）
+        exchange = ccxt.binance({
+            'enableRateLimit': True,  # 启用速率限制
+            'options': {
+                'defaultType': 'spot',  # 现货交易
+            }
+        })
+        
+        symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'AVAX/USDT', 'SOL/USDT', 'AAVE/USDT', 'LTC/USDT']
+        all_data = {}
+        
+        for symbol in symbols:
+            print(f"\n获取 {symbol} 数据...")
+            
+            # ccxt获取历史数据
+            all_klines = []
+            limit = 1000  # 币安API限制
+            total_limit = 3000  # 期望获取的总数据量
+            max_requests = (total_limit + limit - 1) // limit  # 计算需要的请求次数
+            
+            # 使用ccxt的分页方式获取历史数据
+            # 与原始函数保持一致：使用endTime参数来获取更早的数据
+            end_time = None  # 用于分页的时间戳
+            
+            for i in range(max_requests):
+                print(f"   第 {i+1} 次请求...")
+                
+                try:
+                    # 获取OHLCV数据
+                    if end_time is None:
+                        # 第一次请求，获取最新数据
+                        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=limit)
+                    else:
+                        # 后续请求，获取更早的数据
+                        # 使用params传递endTime参数（币安API支持endTime来获取更早的数据）
+                        ohlcv = exchange.fetch_ohlcv(symbol, '1h', since=None, limit=limit, params={'endTime': end_time - 1})
+                    
+                    if not ohlcv:
+                        print(f"   没有更多数据，停止获取")
+                        break
+                    
+                    # 将新获取的数据添加到列表（更早的数据会排在前面）
+                    all_klines = ohlcv + all_klines
+                    
+                    print(f"   获取到 {len(ohlcv)} 条数据，总计 {len(all_klines)} 条")
+                    
+                    # 更新end_time为当前批次第一条数据的时间戳，用于下次请求
+                    end_time = ohlcv[0][0]  # 第一条数据的时间戳（毫秒）
+                    
+                    # 避免请求过于频繁
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"   请求失败: {str(e)}")
+                    break
+            
+            if all_klines:
+                # 解析数据
+                # ccxt返回的OHLCV格式: [timestamp, open, high, low, close, volume]
+                klines = []
+                for kline in all_klines:
+                    klines.append({
+                        'timestamp': datetime.fromtimestamp(kline[0] / 1000),
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'close': float(kline[4]),
+                        'volume': float(kline[5])
+                    })
+                
+                df = pd.DataFrame(klines)
+                df.set_index('timestamp', inplace=True)
+                df = df.sort_index()  # 按时间排序
+                
+                # 将symbol转换为与原始函数一致的格式（去掉斜杠）
+                symbol_key = symbol.replace('/', '')
+                all_data[symbol_key] = df
+                
+                print(f"   成功获取 {len(df)} 条数据")
+                print(f"   时间范围: {df.index[0]} 到 {df.index[-1]}")
+                print(f"   最新价格: {df['close'].iloc[-1]:.4f}")
+                
+            else:
+                print(f"   获取失败: 没有获取到任何数据")
+        
+        # 保存所有数据到CSV文件
+        if all_data:
+            # 保存完整数据
+            csv_filename = f"all_symbols_data_ccxt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            
+            # 合并所有数据到一个DataFrame
+            all_dataframes = []
+            for symbol, df in all_data.items():
+                df_copy = df.copy()
+                df_copy['symbol'] = symbol
+                all_dataframes.append(df_copy)
+            
+            combined_df = pd.concat(all_dataframes, ignore_index=False)
+            combined_df.to_csv(csv_filename)
+            
+            print(f"\n所有数据已保存到: {csv_filename}")
+            print(f"包含 {len(all_data)} 个币对的数据")
+            print(f"总数据行数: {len(combined_df)}")
+            
+            # 分段保存数据
+            print(f"\n--- 分段保存数据 ---")
+            segments = [2000, 1000]  # 第一段2000条，第二段1000条
+            
+            for segment_index, segment_limit in enumerate(segments):
+                print(f"\n保存第 {segment_index + 1} 段数据（{segment_limit} 条）...")
+                
+                segment_dataframes = []
+                for symbol, df in all_data.items():
+                    # 按时间排序，取最新的数据
+                    df_sorted = df.sort_index()
+                    
+                    # 计算当前段的起始位置
+                    start_idx = sum(segments[:segment_index])  # 前面所有段的总和
+                    end_idx = start_idx + segment_limit
+                    
+                    # 取当前段的数据
+                    df_segment = df_sorted.iloc[start_idx:end_idx].copy()
+                    df_segment['symbol'] = symbol
+                    df_segment['segment'] = f'segment_{segment_index + 1}'
+                    segment_dataframes.append(df_segment)
+                
+                if segment_dataframes:
+                    segment_combined_df = pd.concat(segment_dataframes, ignore_index=False)
+                    segment_filename = f"segment_{segment_index + 1}_data_ccxt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    segment_combined_df.to_csv(segment_filename)
+                    
+                    print(f"   第 {segment_index + 1} 段数据已保存到: {segment_filename}")
+                    print(f"   包含 {len(all_data)} 个币对的数据")
+                    print(f"   总数据行数: {len(segment_combined_df)}")
+                    print(f"   时间范围: {segment_combined_df.index[0]} 到 {segment_combined_df.index[-1]}")
+            
+    except Exception as e:
+        print(f"多币对数据获取失败（ccxt）: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def test_different_timeframes():
     """测试不同时间周期的数据获取"""
@@ -470,7 +619,8 @@ def main():
     
     # 运行测试
     # test_binance_data_fetch()
-    test_multiple_symbols()
+    # test_multiple_symbols()
+    test_multiple_symbols_ccxt()
     # test_different_timeframes()
     # test_large_data_fetch()
     # test_data_validation()
