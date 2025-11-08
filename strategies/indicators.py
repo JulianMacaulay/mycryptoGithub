@@ -127,3 +127,4 @@ def detect_crossunder(fast: pd.Series, slow: pd.Series) -> pd.Series:
     """
     return (fast < slow) & (fast.shift(1) >= slow.shift(1))
 
+

@@ -14,6 +14,12 @@ import sys
 import requests
 import ccxt
 import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 # 添加策略模块路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -27,16 +33,24 @@ class BacktestEngine:
     负责执行策略回测，记录交易，计算收益
     """
     
-    def __init__(self, initial_capital: float = 10000, commission_rate: float = 0.001):
+    def __init__(self, initial_capital: float = 10000, commission_rate: float = 0.001, 
+                 leverage: float = 5.0, position_ratio: float = 1.0):
         """
         初始化回测引擎
         
         Args:
             initial_capital: 初始资金
             commission_rate: 手续费率（默认0.1%）
+            leverage: 杠杆倍数（默认5倍）
+            position_ratio: 仓位比例（默认1.0，即100%，0.5表示50%）
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
+        self.leverage = leverage
+        self.position_ratio = position_ratio
+        
+        # 计算可用资金（考虑仓位比例）
+        self.available_capital = initial_capital * position_ratio
         
         # 账户状态
         self.balance = initial_capital
@@ -54,8 +68,9 @@ class BacktestEngine:
         
     def reset(self):
         """重置回测引擎"""
-        self.balance = self.initial_capital
-        self.equity = self.initial_capital
+        # 重置时使用可用资金（考虑仓位比例）
+        self.balance = self.available_capital
+        self.equity = self.available_capital
         self.position_size = 0.0
         self.position_value = 0.0
         self.entry_price = 0.0
@@ -83,8 +98,13 @@ class BacktestEngine:
             self.entry_idx = current_idx
             self.entry_count = 1
             
-            # 计算成本（包含手续费）
-            cost = size * price * (1 + self.commission_rate)
+            # 计算成本（考虑杠杆）
+            # 开仓价值 = size * price
+            # 保证金 = 开仓价值 / 杠杆倍数
+            # 成本 = 保证金 * (1 + 手续费率)
+            position_value = size * price
+            margin = position_value / self.leverage
+            cost = margin * (1 + self.commission_rate)
             self.balance -= cost
             
             self.trades.append({
@@ -93,18 +113,23 @@ class BacktestEngine:
                 'size': size,
                 'idx': current_idx,
                 'balance': self.balance,
+                'equity': self.equity,  # 记录当前权益
                 'reason': reason
             })
             
         elif signal == 'short':
-            self.position_size = -size
-            self.entry_price = price
+            self.position_size = -size  # 负数表示空头
+            self.entry_price = price  # 价格始终是正数
             self.entry_idx = current_idx
             self.entry_count = 1
             
-            # 做空：先卖出，获得资金
-            cost = size * price * (1 + self.commission_rate)
-            self.balance += size * price - cost
+            # 做空：也需要保证金（类似做多），扣除资金
+            # 在期货交易中，做空也需要保证金，只是持仓方向相反
+            # 计算成本（考虑杠杆）
+            position_value = size * price
+            margin = position_value / self.leverage
+            cost = margin * (1 + self.commission_rate)
+            self.balance -= cost
             
             self.trades.append({
                 'type': 'open_short',
@@ -112,6 +137,7 @@ class BacktestEngine:
                 'size': size,
                 'idx': current_idx,
                 'balance': self.balance,
+                'equity': self.equity,  # 记录当前权益
                 'reason': reason
             })
     
@@ -135,8 +161,10 @@ class BacktestEngine:
             self.position_size = total_size
             self.entry_count += 1
             
-            # 扣除成本
-            cost = size * price * (1 + self.commission_rate)
+            # 扣除成本（考虑杠杆）
+            position_value = size * price
+            margin = position_value / self.leverage
+            cost = margin * (1 + self.commission_rate)
             self.balance -= cost
             
             self.trades.append({
@@ -145,20 +173,24 @@ class BacktestEngine:
                 'size': size,
                 'idx': current_idx,
                 'balance': self.balance,
+                'equity': self.equity,  # 记录当前权益
                 'reason': reason
             })
             
         elif signal == 'add_short' and self.position_size < 0:
-            # 计算新的平均入场价格
-            total_size = abs(self.position_size) + size
-            total_cost = abs(self.position_size) * abs(self.entry_price) + size * price
-            self.entry_price = -(total_cost / total_size)
-            self.position_size = -total_size
+            # 计算新的平均入场价格（价格始终是正数）
+            current_size = abs(self.position_size)
+            total_size = current_size + size
+            total_cost = current_size * self.entry_price + size * price
+            self.entry_price = total_cost / total_size  # 价格始终是正数
+            self.position_size = -total_size  # 负数表示空头
             self.entry_count += 1
             
-            # 做空加仓：获得资金
-            cost = size * price * (1 + self.commission_rate)
-            self.balance += size * price - cost
+            # 做空加仓：也需要扣除保证金（考虑杠杆）
+            position_value = size * price
+            margin = position_value / self.leverage
+            cost = margin * (1 + self.commission_rate)
+            self.balance -= cost
             
             self.trades.append({
                 'type': 'add_short',
@@ -166,6 +198,7 @@ class BacktestEngine:
                 'size': size,
                 'idx': current_idx,
                 'balance': self.balance,
+                'equity': self.equity,  # 记录当前权益
                 'reason': reason
             })
     
@@ -179,28 +212,48 @@ class BacktestEngine:
             reason: 平仓原因
         """
         if self.position_size == 0:
-            return
+            return None
         
         # 计算盈亏
         if self.position_size > 0:  # 平多
+            # 多头：买入价 entry_price，卖出价 price
             pnl = (price - self.entry_price) * self.position_size
-            cost = self.position_size * price * self.commission_rate
-            self.balance += self.position_size * price - cost
+            # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
+            # 开仓时扣除了：margin = (entry_price * size) / leverage
+            # 平仓时收回：保证金 + 盈亏 - 平仓手续费
+            size = self.position_size
+            entry_margin = (self.entry_price * size) / self.leverage
+            close_cost = (size * price) * self.commission_rate
+            self.balance += entry_margin + pnl - close_cost
         else:  # 平空
-            pnl = (abs(self.entry_price) - price) * abs(self.position_size)
-            cost = abs(self.position_size) * price * self.commission_rate
-            self.balance += abs(self.position_size) * abs(self.entry_price) - cost
+            # 空头：开仓价 entry_price（正数），平仓价 price
+            # 做空时已经扣除了保证金
+            # 平仓时：如果价格下跌，盈利；如果价格上涨，亏损
+            # 盈亏 = (entry_price - price) * size
+            size = abs(self.position_size)  # 获取数量（正数）
+            entry_price = self.entry_price  # entry_price已经是正数，不需要abs
+            pnl = (entry_price - price) * size
+            
+            # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
+            # 开仓时扣除了：margin = (entry_price * size) / leverage
+            # 平仓时收回：保证金 + 盈亏 - 平仓手续费
+            entry_margin = (entry_price * size) / self.leverage
+            close_cost = (size * price) * self.commission_rate
+            self.balance += entry_margin + pnl - close_cost
         
-        # 记录交易
+        # 记录交易（保存平仓前的entry_price，确保是正数）
         trade_type = 'close_long' if self.position_size > 0 else 'close_short'
+        # 保存entry_price（确保是正数）
+        saved_entry_price = abs(self.entry_price) if self.entry_price < 0 else self.entry_price
         self.trades.append({
             'type': trade_type,
             'price': price,
             'size': abs(self.position_size),
             'idx': current_idx,
-            'entry_price': self.entry_price,
+            'entry_price': saved_entry_price,  # 确保是正数
             'pnl': pnl,
             'balance': self.balance,
+            'equity': self.balance,  # 平仓后无持仓，权益=余额
             'reason': reason,
             'entry_count': self.entry_count
         })
@@ -228,9 +281,13 @@ class BacktestEngine:
             self.equity = self.balance + unrealized_pnl
             self.position_value = self.position_size * current_price
         else:  # 空头
-            unrealized_pnl = (abs(self.entry_price) - current_price) * abs(self.position_size)
+            # 做空：entry_price是正数（开仓价），position_size是负数
+            # 未实现盈亏 = (开仓价 - 当前价) * 数量
+            size = abs(self.position_size)  # 获取数量（正数）
+            entry_price = self.entry_price  # entry_price已经是正数，不需要abs
+            unrealized_pnl = (entry_price - current_price) * size
             self.equity = self.balance + unrealized_pnl
-            self.position_value = abs(self.position_size) * current_price
+            self.position_value = size * current_price
         
         self.equity_curve.append(self.equity)
 
@@ -240,16 +297,23 @@ class BacktestSystem:
     完整的回测系统
     """
     
-    def __init__(self, strategy: BaseStrategy, initial_capital: float = 10000):
+    def __init__(self, strategy: BaseStrategy, initial_capital: float = 10000, 
+                 leverage: float = 5.0, position_ratio: float = 1.0):
         """
         初始化回测系统
         
         Args:
             strategy: 策略实例
             initial_capital: 初始资金
+            leverage: 杠杆倍数（默认5倍）
+            position_ratio: 仓位比例（默认1.0，即100%，0.5表示用50%的资金）
         """
         self.strategy = strategy
-        self.engine = BacktestEngine(initial_capital=initial_capital)
+        self.engine = BacktestEngine(
+            initial_capital=initial_capital,
+            leverage=leverage,
+            position_ratio=position_ratio
+        )
         self.data = None
         
     def load_data_from_csv(self, filepath: str, symbol: str = None):
@@ -264,7 +328,14 @@ class BacktestSystem:
         
         # 如果包含symbol列，筛选特定币种
         if 'symbol' in df.columns and symbol:
-            df = df[df['symbol'] == symbol].copy()
+            # 支持多种格式：ETHUSDT, ETH/USDT, ETH-USDT
+            symbol_variants = [symbol, symbol.replace('USDT', '/USDT'), symbol.replace('/', 'USDT')]
+            df_filtered = df[df['symbol'].isin(symbol_variants)].copy()
+            if len(df_filtered) > 0:
+                df = df_filtered
+                print(f"筛选币种: {symbol}，找到 {len(df)} 条记录")
+            else:
+                print(f"警告: 未找到币种 {symbol}，使用所有数据")
         
         # 确保时间列为datetime类型
         if 'timestamp' in df.columns:
@@ -486,9 +557,16 @@ class BacktestSystem:
             if pnl is not None:
                 self.strategy.update_trade_result(pnl)
         
+        # 计算最终权益
+        final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        total_return = (final_equity - self.engine.available_capital) / self.engine.available_capital * 100
+        
         print(f"\n回测完成！")
-        print(f"最终权益: {self.engine.equity:.2f}")
-        print(f"总收益率: {(self.engine.equity / self.engine.initial_capital - 1) * 100:.2f}%")
+        print(f"初始资金: {self.engine.initial_capital:,.2f}")
+        print(f"可用资金: {self.engine.available_capital:,.2f} (仓位比例: {self.engine.position_ratio * 100:.1f}%)")
+        print(f"杠杆倍数: {self.engine.leverage}x")
+        print(f"最终权益: {final_equity:,.2f}")
+        print(f"总收益率: {total_return:.2f}%")
         print(f"总交易次数: {len([t for t in self.engine.trades if 'close' in t['type']])}")
     
     def generate_report(self) -> Dict:
@@ -498,17 +576,34 @@ class BacktestSystem:
         Returns:
             包含各种统计信息的字典
         """
-        if not self.engine.trades:
-            return {}
-        
         # 提取所有平仓交易
         closed_trades = [t for t in self.engine.trades if 'close' in t['type']]
         
+        # 计算最终权益（如果有持仓，使用当前权益；否则使用余额）
+        final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        
+        # 计算总收益率（使用可用资金作为基准，考虑仓位比例）
+        total_return = (final_equity - self.engine.available_capital) / self.engine.available_capital * 100
+        
         if not closed_trades:
             return {
+                'initial_capital': self.engine.initial_capital,
+                'available_capital': self.engine.available_capital,
+                'leverage': self.engine.leverage,
+                'position_ratio': self.engine.position_ratio,
+                'final_equity': final_equity,
+                'total_return': total_return,
                 'total_trades': 0,
-                'final_equity': self.engine.equity,
-                'total_return': (self.engine.equity / self.engine.initial_capital - 1) * 100
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'win_rate': 0,
+                'avg_win': 0,
+                'avg_loss': 0,
+                'profit_factor': 0,
+                'max_drawdown': 0,
+                'max_drawdown_pct': 0,
+                'sharpe_ratio': 0,
+                'total_pnl': final_equity - self.engine.available_capital
             }
         
         # 计算统计指标
@@ -516,23 +611,39 @@ class BacktestSystem:
         winning_trades = [p for p in pnls if p > 0]
         losing_trades = [p for p in pnls if p < 0]
         
-        total_return = (self.engine.equity / self.engine.initial_capital - 1) * 100
         total_pnl = sum(pnls)
         
         win_rate = len(winning_trades) / len(closed_trades) * 100 if closed_trades else 0
         avg_win = np.mean(winning_trades) if winning_trades else 0
         avg_loss = np.mean(losing_trades) if losing_trades else 0
-        profit_factor = abs(sum(winning_trades) / sum(losing_trades)) if losing_trades and sum(losing_trades) != 0 else 0
+        profit_factor = abs(sum(winning_trades) / sum(losing_trades)) if losing_trades and sum(losing_trades) != 0 else (float('inf') if winning_trades else 0)
         
-        # 计算最大回撤
+        # 计算最大回撤（参考标准计算方式）
         equity_array = np.array(self.engine.equity_curve)
-        running_max = np.maximum.accumulate(equity_array)
-        drawdown = (equity_array - running_max) / running_max * 100
-        max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
+        if len(equity_array) > 0:
+            peak = equity_array[0]
+            max_drawdown = 0
+            max_drawdown_pct = 0
+            
+            for equity in equity_array:
+                if equity > peak:
+                    peak = equity
+                drawdown = peak - equity
+                drawdown_pct = drawdown / peak if peak > 0 else 0  # 先计算比例，后面再乘以100
+                max_drawdown = max(max_drawdown, drawdown)
+                max_drawdown_pct = max(max_drawdown_pct, drawdown_pct)
+            
+            max_drawdown_pct = max_drawdown_pct * 100  # 转换为百分比
+        else:
+            max_drawdown = 0
+            max_drawdown_pct = 0
         
         report = {
             'initial_capital': self.engine.initial_capital,
-            'final_equity': self.engine.equity,
+            'available_capital': self.engine.available_capital,
+            'leverage': self.engine.leverage,
+            'position_ratio': self.engine.position_ratio,
+            'final_equity': final_equity,
             'total_return': total_return,
             'total_pnl': total_pnl,
             'total_trades': len(closed_trades),
@@ -543,26 +654,50 @@ class BacktestSystem:
             'avg_loss': avg_loss,
             'profit_factor': profit_factor,
             'max_drawdown': max_drawdown,
+            'max_drawdown_pct': max_drawdown_pct,
             'sharpe_ratio': self._calculate_sharpe_ratio(),
         }
         
         return report
     
     def _calculate_sharpe_ratio(self, risk_free_rate: float = 0.0) -> float:
-        """计算夏普比率"""
+        """计算夏普比率（参考标准计算方式）"""
         if len(self.engine.equity_curve) < 2:
             return 0.0
         
-        returns = np.diff(self.engine.equity_curve) / self.engine.equity_curve[:-1]
+        # 计算每期收益率
+        returns = []
+        for i in range(1, len(self.engine.equity_curve)):
+            prev_equity = self.engine.equity_curve[i-1]
+            curr_equity = self.engine.equity_curve[i]
+            if prev_equity > 0:
+                ret = (curr_equity - prev_equity) / prev_equity
+                returns.append(ret)
+        
         if len(returns) == 0 or np.std(returns) == 0:
             return 0.0
         
-        sharpe = (np.mean(returns) - risk_free_rate / 252) / np.std(returns) * np.sqrt(252)
+        # 年化夏普比率（假设数据是小时级别，252*24=6048小时/年）
+        # 如果是日线，使用252；如果是小时线，使用6048
+        periods_per_year = 252  # 默认按日线计算
+        if self.data is not None and len(self.data) > 0:
+            time_diff = (self.data.index[-1] - self.data.index[0]).total_seconds() / 3600
+            if time_diff > 0:
+                data_points = len(self.data)
+                hours_per_point = time_diff / data_points
+                if hours_per_point < 2:
+                    periods_per_year = 252 * 24  # 小时线
+                elif hours_per_point < 12:
+                    periods_per_year = 252 * 2  # 4小时线
+                else:
+                    periods_per_year = 252  # 日线
+        
+        sharpe = np.mean(returns) / np.std(returns) * np.sqrt(periods_per_year)
         return sharpe
     
     def plot_results(self, save_path: str = None):
         """
-        绘制回测结果
+        绘制回测结果（参考test_cointegration_trading_advanced.py的展示方式）
         
         Args:
             save_path: 保存路径（可选）
@@ -571,100 +706,167 @@ class BacktestSystem:
             print("没有数据可绘制")
             return
         
-        fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+        print(f"正在处理 {len(self.engine.equity_curve)} 个数据点...")
+        
+        # 准备数据
+        timestamps = self.data.index[:len(self.engine.equity_curve)]
+        equities = self.engine.equity_curve
+        
+        # 计算收益率（相对于可用资金）
+        initial_equity = self.engine.available_capital
+        returns = [(eq - initial_equity) / initial_equity * 100 for eq in equities]
+        
+        print("正在创建图表...")
+        
+        # 创建图表（参考标准格式：资金曲线 + 收益率曲线）
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
         fig.suptitle(f'{self.strategy.name} 回测结果', fontsize=16, fontweight='bold')
         
-        # 1. 价格和信号
-        ax1 = axes[0]
-        ax1.plot(self.data.index, self.data['close'], label='收盘价', linewidth=1, alpha=0.7)
-        
-        # 绘制指标
-        if hasattr(self.strategy, 'donchian_hi'):
-            ax1.plot(self.data.index, self.strategy.donchian_hi, 
-                    label='Donchian High (20)', color='green', alpha=0.5, linewidth=0.8)
-            ax1.plot(self.data.index, self.strategy.donchian_lo, 
-                    label='Donchian Low (20)', color='red', alpha=0.5, linewidth=0.8)
-        
-        # 标记交易点
-        for trade in self.engine.trades:
-            if 'open' in trade['type']:
-                color = 'green' if 'long' in trade['type'] else 'red'
-                marker = '^' if 'long' in trade['type'] else 'v'
-                ax1.scatter(self.data.index[trade['idx']], trade['price'], 
-                           color=color, marker=marker, s=50, alpha=0.7, zorder=5)
-            elif 'close' in trade['type']:
-                ax1.scatter(self.data.index[trade['idx']], trade['price'], 
-                           color='black', marker='x', s=50, alpha=0.7, zorder=5)
-        
-        ax1.set_ylabel('价格', fontsize=10)
-        ax1.set_title('价格走势和交易信号', fontsize=12)
-        ax1.legend(loc='best', fontsize=8)
+        # 1. 权益曲线（资金曲线）
+        print("正在绘制权益曲线...")
+        ax1.plot(timestamps, equities, linewidth=1.5, color='blue', alpha=0.8, label='权益曲线')
+        ax1.axhline(y=initial_equity, color='gray', linestyle='--', alpha=0.7, label='初始资金')
+        ax1.set_title('权益曲线', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('权益 (USDT)', fontsize=12)
+        ax1.legend(loc='best', fontsize=10)
         ax1.grid(True, alpha=0.3)
         
-        # 2. 权益曲线
-        ax2 = axes[1]
-        ax2.plot(self.data.index[:len(self.engine.equity_curve)], 
-                self.engine.equity_curve, label='权益曲线', linewidth=2, color='blue')
-        ax2.axhline(y=self.engine.initial_capital, color='gray', 
-                   linestyle='--', label='初始资金', alpha=0.5)
-        ax2.set_ylabel('权益 (USDT)', fontsize=10)
-        ax2.set_title('权益曲线', fontsize=12)
-        ax2.legend(loc='best', fontsize=8)
+        # 2. 收益率曲线
+        print("正在绘制收益率曲线...")
+        ax2.plot(timestamps, returns, linewidth=1.5, color='green', alpha=0.8, label='收益率')
+        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='零线')
+        ax2.set_title('收益率曲线', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('收益率 (%)', fontsize=12)
+        ax2.set_xlabel('时间', fontsize=12)
+        ax2.legend(loc='best', fontsize=10)
         ax2.grid(True, alpha=0.3)
         
-        # 3. 回撤
-        ax3 = axes[2]
-        equity_array = np.array(self.engine.equity_curve)
-        running_max = np.maximum.accumulate(equity_array)
-        drawdown = (equity_array - running_max) / running_max * 100
-        ax3.fill_between(self.data.index[:len(drawdown)], drawdown, 0, 
-                        color='red', alpha=0.3, label='回撤')
-        ax3.set_ylabel('回撤 (%)', fontsize=10)
-        ax3.set_xlabel('时间', fontsize=10)
-        ax3.set_title('回撤曲线', fontsize=12)
-        ax3.legend(loc='best', fontsize=8)
-        ax3.grid(True, alpha=0.3)
+        # 格式化时间轴（参考标准方式）
+        print("正在格式化时间轴...")
+        if len(timestamps) > 100:
+            # 数据点多时，减少时间轴标签
+            step = max(1, len(timestamps) // 10)
+            for ax in [ax1, ax2]:
+                ax.set_xticks(timestamps[::step])
+                ax.tick_params(axis='x', rotation=45)
+        else:
+            # 数据点少时，正常格式化
+            for ax in [ax1, ax2]:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                ax.tick_params(axis='x', rotation=45)
         
-        # 格式化x轴日期
-        for ax in axes:
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
+        print("正在调整布局...")
         plt.tight_layout()
         
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"图表已保存到: {save_path}")
+            print(f"正在保存图片到: {save_path}")
+            plt.savefig(save_path, dpi=200, bbox_inches='tight')
+            print(f"回测结果图已保存到: {save_path}")
         
-        plt.show()
+        print("正在显示图表...")
+        try:
+            plt.show(block=True)
+            print("图表显示完成")
+        except Exception as e:
+            print(f"图表显示失败: {str(e)}")
+            print("尝试保存图片...")
+            backup_path = save_path or 'backtest_result_backup.png'
+            plt.savefig(backup_path, dpi=200, bbox_inches='tight')
+            print(f"图片已保存为 {backup_path}")
+            plt.close()
+    
+    def export_trades_to_csv(self, filepath: str = None):
+        """
+        导出交易记录到CSV文件
+        
+        Args:
+            filepath: 保存路径，如果为None则自动生成
+        """
+        if not self.engine.trades:
+            print("没有交易记录可导出")
+            return
+        
+        # 准备交易记录数据
+        trades_data = []
+        for trade in self.engine.trades:
+            trade_record = {
+                '交易类型': trade['type'],
+                '时间索引': trade['idx'],
+                '时间': self.data.index[trade['idx']] if self.data is not None and trade['idx'] < len(self.data) else 'N/A',
+                '价格': trade['price'],
+                '数量': trade['size'],
+                '原因': trade.get('reason', ''),
+            }
+            
+            # 如果是平仓交易，添加盈亏信息
+            if 'close' in trade['type']:
+                trade_record['入场价格'] = trade.get('entry_price', 'N/A')
+                trade_record['盈亏'] = trade.get('pnl', 0)
+                trade_record['加仓次数'] = trade.get('entry_count', 0)
+            
+            # 余额：该笔交易后的现金余额（不包括未实现盈亏）
+            # 说明：余额是账户中的现金，开仓时会扣除保证金，平仓时会收回
+            trade_record['余额'] = trade.get('balance', 0)
+            
+            # 权益：该笔交易后的账户总价值（余额 + 未实现盈亏）
+            # 说明：如果有持仓，权益 = 余额 + 未实现盈亏；如果无持仓，权益 = 余额
+            trade_record['权益'] = trade.get('equity', trade.get('balance', 0))
+            
+            trades_data.append(trade_record)
+        
+        # 转换为DataFrame
+        df = pd.DataFrame(trades_data)
+        
+        # 生成文件名
+        if filepath is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filepath = f"trades_{self.strategy.name}_{timestamp}.csv"
+        
+        # 保存到CSV
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(f"\n交易记录已保存到: {filepath}")
+        print(f"共 {len(trades_data)} 笔交易记录")
+        
+        return filepath
     
     def print_report(self):
-        """打印回测报告"""
+        """打印回测报告（参考标准格式）"""
         report = self.generate_report()
         
-        if not report:
-            print("没有交易记录")
+        if not report or report['total_trades'] == 0:
+            print("\n" + "=" * 60)
+            print("回测报告")
+            print("=" * 60)
+            print(f"初始资金: {report.get('initial_capital', 0):,.2f}")
+            print(f"最终权益: {report.get('final_equity', 0):,.2f}")
+            print(f"总收益率: {report.get('total_return', 0):.2f}%")
+            print(f"总交易次数: {report.get('total_trades', 0)}")
+            print("=" * 60)
             return
         
         print("\n" + "=" * 60)
         print("回测报告")
         print("=" * 60)
-        print(f"初始资金: {report['initial_capital']:.2f} USDT")
-        print(f"最终权益: {report['final_equity']:.2f} USDT")
+        print(f"初始资金: {report['initial_capital']:,.2f}")
+        print(f"可用资金: {report['available_capital']:,.2f} (仓位比例: {report['position_ratio']*100:.1f}%)")
+        print(f"杠杆倍数: {report['leverage']}x")
+        print(f"最终权益: {report['final_equity']:,.2f}")
         print(f"总收益率: {report['total_return']:.2f}%")
-        print(f"总盈亏: {report['total_pnl']:.2f} USDT")
-        print(f"最大回撤: {report['max_drawdown']:.2f}%")
-        print(f"夏普比率: {report['sharpe_ratio']:.2f}")
-        print("-" * 60)
         print(f"总交易次数: {report['total_trades']}")
-        print(f"盈利次数: {report['winning_trades']}")
-        print(f"亏损次数: {report['losing_trades']}")
-        print(f"胜率: {report['win_rate']:.2f}%")
-        print(f"平均盈利: {report['avg_win']:.2f} USDT")
-        print(f"平均亏损: {report['avg_loss']:.2f} USDT")
-        print(f"盈亏比: {report['profit_factor']:.2f}")
+        print(f"盈利交易: {report['winning_trades']}")
+        print(f"胜率: {report['win_rate']:.1f}%")
+        
+        print(f"\n风险指标:")
+        print(f"  最大回撤: {report['max_drawdown']:,.2f}")
+        print(f"  最大回撤百分比: {report['max_drawdown_pct']:.2f}%")
+        print(f"  盈亏比: {report['profit_factor']:.2f}" if report['profit_factor'] != float('inf') else f"  盈亏比: ∞")
+        print(f"  夏普比率: {report['sharpe_ratio']:.2f}")
+        print(f"  平均盈利: {report['avg_win']:.2f}")
+        print(f"  平均亏损: {report['avg_loss']:.2f}")
         print("=" * 60)
+        
+        # 自动导出交易记录
+        self.export_trades_to_csv()
 
 
 def main():
@@ -688,14 +890,14 @@ def main():
     backtest = BacktestSystem(strategy, initial_capital=10000)
     
     # 方式1: 从CSV文件加载数据
-    csv_file = "all_symbols_data_ccxt_20251106_195714.csv"
+    csv_file = "segment_1_data_ccxt_20251106_195714.csv"
     if os.path.exists(csv_file):
         print(f"从CSV文件加载数据: {csv_file}")
-        backtest.load_data_from_csv(csv_file, symbol='BTCUSDT')
+        backtest.load_data_from_csv(csv_file, symbol='ETHUSDT')  # 修改为ETHUSDT
     else:
         # 方式2: 从币安API加载数据
         print("从币安API加载数据...")
-        backtest.load_data_from_binance('BTC/USDT', interval='1h', limit=1000)
+        backtest.load_data_from_binance('BTC/USDT', interval='1h', limit=2000)
     
     # 运行回测
     backtest.run_backtest(max_entries=3, risk_ratio=1.0)
