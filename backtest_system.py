@@ -34,7 +34,7 @@ class BacktestEngine:
     """
     
     def __init__(self, initial_capital: float = 10000, commission_rate: float = 0.001, 
-                 leverage: float = 5.0, position_ratio: float = 1.0):
+                 leverage: float = 5.0, position_ratio: float = 0.5):
         """
         初始化回测引擎
         
@@ -52,9 +52,9 @@ class BacktestEngine:
         # 计算可用资金（考虑仓位比例）
         self.available_capital = initial_capital * position_ratio
         
-        # 账户状态
-        self.balance = initial_capital
-        self.equity = initial_capital
+        # 账户状态（使用可用资金，因为只有这部分可以交易）
+        self.balance = self.available_capital
+        self.equity = self.available_capital
         self.position_size = 0.0  # 持仓数量（正数=多头，负数=空头）
         self.position_value = 0.0  # 持仓价值
         self.entry_price = 0.0  # 入场价格
@@ -298,7 +298,7 @@ class BacktestSystem:
     """
     
     def __init__(self, strategy: BaseStrategy, initial_capital: float = 10000, 
-                 leverage: float = 5.0, position_ratio: float = 1.0):
+                 leverage: float = 5.0, position_ratio: float = 0.5):
         """
         初始化回测系统
         
@@ -559,7 +559,9 @@ class BacktestSystem:
         
         # 计算最终权益
         final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
-        total_return = (final_equity - self.engine.available_capital) / self.engine.available_capital * 100
+        # 收益率计算：用盈利除以初始资金（不是可用资金）
+        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
+        total_return = (final_equity - self.engine.available_capital) / self.engine.initial_capital * 100
         
         print(f"\n回测完成！")
         print(f"初始资金: {self.engine.initial_capital:,.2f}")
@@ -582,8 +584,9 @@ class BacktestSystem:
         # 计算最终权益（如果有持仓，使用当前权益；否则使用余额）
         final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
         
-        # 计算总收益率（使用可用资金作为基准，考虑仓位比例）
-        total_return = (final_equity - self.engine.available_capital) / self.engine.available_capital * 100
+        # 计算总收益率：用盈利除以初始资金（不是可用资金）
+        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
+        total_return = (final_equity - self.engine.available_capital) / self.engine.initial_capital * 100
         
         if not closed_trades:
             return {
@@ -618,7 +621,7 @@ class BacktestSystem:
         avg_loss = np.mean(losing_trades) if losing_trades else 0
         profit_factor = abs(sum(winning_trades) / sum(losing_trades)) if losing_trades and sum(losing_trades) != 0 else (float('inf') if winning_trades else 0)
         
-        # 计算最大回撤（参考标准计算方式）
+        # 计算最大回撤：最大回撤百分比相对于初始资金（不是峰值）
         equity_array = np.array(self.engine.equity_curve)
         if len(equity_array) > 0:
             peak = equity_array[0]
@@ -629,7 +632,9 @@ class BacktestSystem:
                 if equity > peak:
                     peak = equity
                 drawdown = peak - equity
-                drawdown_pct = drawdown / peak if peak > 0 else 0  # 先计算比例，后面再乘以100
+                # 最大回撤百分比 = 最大回撤 / 初始资金 * 100
+                # 例如：初始10000，最大回撤2000，回撤百分比 = 2000/10000 = 20%
+                drawdown_pct = drawdown / self.engine.initial_capital if self.engine.initial_capital > 0 else 0
                 max_drawdown = max(max_drawdown, drawdown)
                 max_drawdown_pct = max(max_drawdown_pct, drawdown_pct)
             
@@ -712,9 +717,10 @@ class BacktestSystem:
         timestamps = self.data.index[:len(self.engine.equity_curve)]
         equities = self.engine.equity_curve
         
-        # 计算收益率（相对于可用资金）
-        initial_equity = self.engine.available_capital
-        returns = [(eq - initial_equity) / initial_equity * 100 for eq in equities]
+        # 计算收益率：相对于初始资金（不是可用资金）
+        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
+        initial_equity = self.engine.available_capital  # 权益曲线的起点是available_capital
+        returns = [(eq - initial_equity) / self.engine.initial_capital * 100 for eq in equities]
         
         print("正在创建图表...")
         
