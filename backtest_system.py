@@ -558,10 +558,13 @@ class BacktestSystem:
                 self.strategy.update_trade_result(pnl)
         
         # 计算最终权益
-        final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
-        # 收益率计算：用盈利除以初始资金（不是可用资金）
-        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
-        total_return = (final_equity - self.engine.available_capital) / self.engine.initial_capital * 100
+        # 交易账户权益（只包含投入交易的部分）
+        trading_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        # 最终总资产 = 交易账户权益 + 未投入资金
+        final_equity = trading_equity + (self.engine.initial_capital - self.engine.available_capital)
+        # 收益率计算：用总资产变化除以初始资金
+        # 例如：初始10000，用5000赚了1000，最终总资产=14156，收益率 = (14156-10000)/10000 = 41.56%
+        total_return = (final_equity - self.engine.initial_capital) / self.engine.initial_capital * 100
         
         print(f"\n回测完成！")
         print(f"初始资金: {self.engine.initial_capital:,.2f}")
@@ -582,11 +585,14 @@ class BacktestSystem:
         closed_trades = [t for t in self.engine.trades if 'close' in t['type']]
         
         # 计算最终权益（如果有持仓，使用当前权益；否则使用余额）
-        final_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        # 交易账户权益（只包含投入交易的部分）
+        trading_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        # 最终总资产 = 交易账户权益 + 未投入资金
+        final_equity = trading_equity + (self.engine.initial_capital - self.engine.available_capital)
         
-        # 计算总收益率：用盈利除以初始资金（不是可用资金）
-        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
-        total_return = (final_equity - self.engine.available_capital) / self.engine.initial_capital * 100
+        # 计算总收益率：用总资产变化除以初始资金
+        # 例如：初始10000，用5000赚了1000，最终总资产=14156，收益率 = (14156-10000)/10000 = 41.56%
+        total_return = (final_equity - self.engine.initial_capital) / self.engine.initial_capital * 100
         
         if not closed_trades:
             return {
@@ -606,7 +612,7 @@ class BacktestSystem:
                 'max_drawdown': 0,
                 'max_drawdown_pct': 0,
                 'sharpe_ratio': 0,
-                'total_pnl': final_equity - self.engine.available_capital
+                'total_pnl': final_equity - self.engine.initial_capital
             }
         
         # 计算统计指标
