@@ -217,14 +217,20 @@ class BacktestEngine:
         # 计算盈亏
         if self.position_size > 0:  # 平多
             # 多头：买入价 entry_price，卖出价 price
-            pnl = (price - self.entry_price) * self.position_size
+            gross_pnl = (price - self.entry_price) * self.position_size
             # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
-            # 开仓时扣除了：margin = (entry_price * size) / leverage
-            # 平仓时收回：保证金 + 盈亏 - 平仓手续费
+            # 开仓时扣除了：margin * (1 + commission_rate) = margin + margin * commission_rate
+            # 平仓时收回：margin + gross_pnl - close_cost
             size = self.position_size
             entry_margin = (self.entry_price * size) / self.leverage
             close_cost = (size * price) * self.commission_rate
-            self.balance += entry_margin + pnl - close_cost
+            # 计算开仓手续费（开仓时已经扣除，但需要在pnl中体现，以便CSV中记录的是净盈亏）
+            # 开仓手续费 = (entry_price * size / leverage) * commission_rate
+            open_cost = entry_margin * self.commission_rate
+            # 净盈亏 = 毛盈亏 - 平仓手续费 - 开仓手续费（用于CSV记录）
+            pnl = gross_pnl - close_cost - open_cost
+            # 余额计算：收回保证金 + 毛盈亏 - 平仓手续费（开仓手续费已在开仓时扣除）
+            self.balance += entry_margin + gross_pnl - close_cost
         else:  # 平空
             # 空头：开仓价 entry_price（正数），平仓价 price
             # 做空时已经扣除了保证金
@@ -232,14 +238,20 @@ class BacktestEngine:
             # 盈亏 = (entry_price - price) * size
             size = abs(self.position_size)  # 获取数量（正数）
             entry_price = self.entry_price  # entry_price已经是正数，不需要abs
-            pnl = (entry_price - price) * size
+            gross_pnl = (entry_price - price) * size
             
             # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
-            # 开仓时扣除了：margin = (entry_price * size) / leverage
-            # 平仓时收回：保证金 + 盈亏 - 平仓手续费
+            # 开仓时扣除了：margin * (1 + commission_rate) = margin + margin * commission_rate
+            # 平仓时收回：margin + gross_pnl - close_cost
             entry_margin = (entry_price * size) / self.leverage
             close_cost = (size * price) * self.commission_rate
-            self.balance += entry_margin + pnl - close_cost
+            # 计算开仓手续费（开仓时已经扣除，但需要在pnl中体现，以便CSV中记录的是净盈亏）
+            # 开仓手续费 = (entry_price * size / leverage) * commission_rate
+            open_cost = entry_margin * self.commission_rate
+            # 净盈亏 = 毛盈亏 - 平仓手续费 - 开仓手续费（用于CSV记录）
+            pnl = gross_pnl - close_cost - open_cost
+            # 余额计算：收回保证金 + 毛盈亏 - 平仓手续费（开仓手续费已在开仓时扣除）
+            self.balance += entry_margin + gross_pnl - close_cost
         
         # 记录交易（保存平仓前的entry_price，确保是正数）
         trade_type = 'close_long' if self.position_size > 0 else 'close_short'
@@ -251,7 +263,7 @@ class BacktestEngine:
             'size': abs(self.position_size),
             'idx': current_idx,
             'entry_price': saved_entry_price,  # 确保是正数
-            'pnl': pnl,
+            'pnl': pnl,  # 记录净盈亏（已扣除平仓手续费和开仓手续费）
             'balance': self.balance,
             'equity': self.balance,  # 平仓后无持仓，权益=余额
             'reason': reason,
