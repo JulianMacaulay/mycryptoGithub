@@ -301,7 +301,9 @@ class BacktestEngine:
             self.equity = self.balance + unrealized_pnl
             self.position_value = size * current_price
         
-        self.equity_curve.append(self.equity)
+        # 记录权益曲线：交易账户权益 + 未投入资金（与最终权益计算保持一致）
+        total_equity = self.equity + (self.initial_capital - self.available_capital)
+        self.equity_curve.append(total_equity)
 
 
 class BacktestSystem:
@@ -716,25 +718,72 @@ class BacktestSystem:
     
     def plot_results(self, save_path: str = None):
         """
-        绘制回测结果（参考test_cointegration_trading_advanced.py的展示方式）
+        绘制回测结果（基于交易记录中的盈亏数据）
         
         Args:
             save_path: 保存路径（可选）
         """
-        if self.data is None or not self.engine.equity_curve:
+        if self.data is None:
             print("没有数据可绘制")
             return
         
-        print(f"正在处理 {len(self.engine.equity_curve)} 个数据点...")
+        # 从交易记录中提取盈亏数据，生成权益曲线
+        print("正在从交易记录生成权益曲线...")
         
-        # 准备数据
-        timestamps = self.data.index[:len(self.engine.equity_curve)]
-        equities = self.engine.equity_curve
+        # 获取所有平仓交易（只有平仓交易才有pnl）
+        closed_trades = [t for t in self.engine.trades if 'close' in t['type']]
         
-        # 计算收益率：相对于初始资金（不是可用资金）
-        # 例如：初始10000，用5000赚了1000，收益率 = 1000/10000 = 10%
-        initial_equity = self.engine.available_capital  # 权益曲线的起点是available_capital
+        if not closed_trades:
+            print("没有交易记录可绘制")
+            return
+        
+        # 按时间索引排序
+        closed_trades.sort(key=lambda x: x['idx'])
+        
+        # 计算累计盈亏（基于交易记录中的pnl）
+        cumulative_pnl = 0
+        equity_points = []  # [(时间索引, 总权益)]
+        
+        # 初始权益 = 可用资金
+        initial_trading_equity = self.engine.available_capital
+        
+        # 构建每个K线的权益值
+        trade_idx = 0  # 当前处理的交易索引
+        
+        for idx in range(len(self.data)):
+            # 累加这个K线之前的所有盈亏
+            while trade_idx < len(closed_trades) and closed_trades[trade_idx]['idx'] < idx:
+                cumulative_pnl += closed_trades[trade_idx].get('pnl', 0)
+                trade_idx += 1
+            
+            # 如果这个K线有平仓交易，加上这笔交易的盈亏
+            current_pnl = 0
+            while trade_idx < len(closed_trades) and closed_trades[trade_idx]['idx'] == idx:
+                current_pnl += closed_trades[trade_idx].get('pnl', 0)
+                trade_idx += 1
+            
+            # 计算当前权益 = 初始可用资金 + 累计盈亏
+            current_trading_equity = initial_trading_equity + cumulative_pnl + current_pnl
+            
+            # 总权益 = 交易账户权益 + 未投入资金
+            total_equity = current_trading_equity + (self.engine.initial_capital - self.engine.available_capital)
+            
+            equity_points.append((idx, total_equity))
+            
+            # 更新累计盈亏（用于下一个K线）
+            cumulative_pnl += current_pnl
+        
+        # 提取时间和权益值
+        timestamps = [self.data.index[idx] for idx, _ in equity_points]
+        equities = [eq for _, eq in equity_points]
+        
+        # 计算收益率：相对于初始资金
+        initial_equity = self.engine.initial_capital
         returns = [(eq - initial_equity) / self.engine.initial_capital * 100 for eq in equities]
+        
+        # 计算最终权益（与报告保持一致）
+        trading_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        final_equity = trading_equity + (self.engine.initial_capital - self.engine.available_capital)
         
         print("正在创建图表...")
         
@@ -746,7 +795,15 @@ class BacktestSystem:
         print("正在绘制权益曲线...")
         ax1.plot(timestamps, equities, linewidth=1.5, color='blue', alpha=0.8, label='权益曲线')
         ax1.axhline(y=initial_equity, color='gray', linestyle='--', alpha=0.7, label='初始资金')
-        ax1.set_title('权益曲线', fontsize=14, fontweight='bold')
+        
+        # 添加最终权益标注
+        ax1.axhline(y=final_equity, color='red', linestyle='--', alpha=0.5, 
+                   label=f'最终权益: {final_equity:,.2f}')
+        # 在图表上添加文本标注
+        ax1.text(timestamps[-1], final_equity, f' {final_equity:,.2f}', 
+                verticalalignment='bottom', fontsize=10, color='red')
+        
+        ax1.set_title('权益曲线（基于交易记录）', fontsize=14, fontweight='bold')
         ax1.set_ylabel('权益 (USDT)', fontsize=12)
         ax1.legend(loc='best', fontsize=10)
         ax1.grid(True, alpha=0.3)
