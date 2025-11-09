@@ -440,13 +440,12 @@ class BacktestSystem:
         
         return df
     
-    def run_backtest(self, max_entries: int = 3, risk_ratio: float = 1.0):
+    def run_backtest(self, max_entries: int = 3):
         """
         运行回测
         
         Args:
             max_entries: 最大加仓次数
-            risk_ratio: 风险比例（百分比）
         """
         if self.data is None:
             raise ValueError("请先加载数据")
@@ -504,12 +503,11 @@ class BacktestSystem:
                     self.engine.entry_price
                 )
                 if add_signal:
-                    # 计算加仓数量（使用相同的风险比例）
+                    # 计算加仓数量
                     atr_value = self.strategy.atr.iloc[idx]
                     if not pd.isna(atr_value) and atr_value > 0:
                         add_size = self.strategy.get_position_size(
                             self.engine.equity,
-                            risk_ratio,
                             atr_value,
                             add_signal['price']
                         )
@@ -532,7 +530,6 @@ class BacktestSystem:
                     if not pd.isna(atr_value) and atr_value > 0:
                         position_size = self.strategy.get_position_size(
                             self.engine.equity,
-                            risk_ratio,
                             atr_value,
                             signal['price']
                         )
@@ -550,7 +547,6 @@ class BacktestSystem:
                     if not pd.isna(atr_value) and atr_value > 0:
                         position_size = self.strategy.get_position_size(
                             self.engine.equity,
-                            risk_ratio,
                             atr_value,
                             signal['price']
                         )
@@ -898,7 +894,6 @@ def main():
     # 创建策略
     strategy_params = {
         'n_entries': 3,
-        'risk_ratio': 1.0,
         'atr_length': 20,
         'bo_length': 20,
         'fs_length': 55,
@@ -924,7 +919,7 @@ def main():
         backtest.load_data_from_binance('BTC/USDT', interval='1h', limit=2000)
     
     # 运行回测
-    backtest.run_backtest(max_entries=3, risk_ratio=1.0)
+    backtest.run_backtest(max_entries=3)
     
     # 生成报告
     backtest.print_report()

@@ -36,7 +36,6 @@ class TurtleStrategy(BaseStrategy):
         Args:
             params: 策略参数字典，包含：
                 - n_entries: 最大加仓次数（默认3）
-                - risk_ratio: 风险比例%（默认1.0）
                 - atr_length: ATR周期（默认20）
                 - bo_length: 短周期突破（默认20）
                 - fs_length: 长周期突破（默认55）
@@ -49,7 +48,6 @@ class TurtleStrategy(BaseStrategy):
         
         # 策略参数
         self.n_entries = params.get('n_entries', 3)
-        self.risk_ratio = params.get('risk_ratio', 1.0)
         self.atr_length = params.get('atr_length', 20)
         self.bo_length = params.get('bo_length', 20)
         self.fs_length = params.get('fs_length', 55)

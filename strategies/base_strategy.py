@@ -48,23 +48,25 @@ class BaseStrategy(ABC):
         """
         pass
     
-    def get_position_size(self, account_balance: float, risk_ratio: float, 
-                         atr: float, entry_price: float) -> float:
+    def get_position_size(self, account_balance: float, atr: float, entry_price: float) -> float:
         """
-        计算仓位大小（基于风险比例）
+        计算仓位大小
         
         Args:
             account_balance: 账户余额
-            risk_ratio: 风险比例（百分比）
-            atr: ATR值
+            atr: ATR值（保留参数以兼容调用，但不使用）
             entry_price: 入场价格
             
         Returns:
             仓位大小（数量）
         """
-        risk_amount = account_balance * (risk_ratio / 100)
-        stop_loss_distance = atr * 2  # 默认2倍ATR止损
-        position_size = risk_amount / stop_loss_distance
+        if entry_price <= 0:
+            return 0
+        
+        # 仓位大小 = 账户余额 / 入场价格
+        # 使用账户余额的固定比例（可根据需要调整）
+        position_size = account_balance / entry_price
+        
         return position_size
     
     def on_bar(self, data: pd.DataFrame, current_idx: int, 
