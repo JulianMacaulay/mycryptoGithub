@@ -48,7 +48,7 @@ class BaseStrategy(ABC):
         """
         pass
     
-    def get_position_size(self, account_balance: float, atr: float, entry_price: float) -> float:
+    def get_position_size(self, account_balance: float, atr: float, entry_price: float, leverage: float = 1.0) -> float:
         """
         计算仓位大小
         
@@ -56,6 +56,7 @@ class BaseStrategy(ABC):
             account_balance: 账户余额
             atr: ATR值（保留参数以兼容调用，但不使用）
             entry_price: 入场价格
+            leverage: 杠杆倍数（默认1.0，即无杠杆）
             
         Returns:
             仓位大小（数量）
@@ -63,9 +64,9 @@ class BaseStrategy(ABC):
         if entry_price <= 0:
             return 0
         
-        # 仓位大小 = 账户余额 / 入场价格
-        # 使用账户余额的固定比例（可根据需要调整）
-        position_size = account_balance / entry_price
+        # 能开的仓位价值 = 账户余额 * 杠杆倍数
+        # 能开的数量 = 仓位价值 / 入场价格
+        position_size = (account_balance * leverage) / entry_price
         
         return position_size
     
