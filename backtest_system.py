@@ -92,17 +92,28 @@ class BacktestEngine:
             current_idx: 当前索引
             reason: 开仓原因
         """
+        # 计算最大可开仓位（基于可用资金和杠杆）
+        max_position_value = self.balance * self.leverage  # 最大仓位价值
+        max_size = max_position_value / price if price > 0 else 0  # 最大数量
+        
+        # 取较小值（策略计算的size和最大可开仓位）
+        actual_size = min(size, max_size) if max_size > 0 else 0
+        
+        if actual_size <= 0:
+            # 无法开仓，直接返回
+            return
+        
         if signal == 'long':
-            self.position_size = size
+            self.position_size = actual_size
             self.entry_price = price
             self.entry_idx = current_idx
             self.entry_count = 1
             
             # 计算成本（考虑杠杆）
-            # 开仓价值 = size * price
+            # 开仓价值 = actual_size * price
             # 保证金 = 开仓价值 / 杠杆倍数
             # 成本 = 保证金 * (1 + 手续费率)
-            position_value = size * price
+            position_value = actual_size * price
             margin = position_value / self.leverage
             cost = margin * (1 + self.commission_rate)
             self.balance -= cost
@@ -110,7 +121,7 @@ class BacktestEngine:
             self.trades.append({
                 'type': 'open_long',
                 'price': price,
-                'size': size,
+                'size': actual_size,
                 'idx': current_idx,
                 'balance': self.balance,
                 'equity': self.equity,  # 记录当前权益
@@ -118,7 +129,7 @@ class BacktestEngine:
             })
             
         elif signal == 'short':
-            self.position_size = -size  # 负数表示空头
+            self.position_size = -actual_size  # 负数表示空头
             self.entry_price = price  # 价格始终是正数
             self.entry_idx = current_idx
             self.entry_count = 1
@@ -126,7 +137,7 @@ class BacktestEngine:
             # 做空：也需要保证金（类似做多），扣除资金
             # 在期货交易中，做空也需要保证金，只是持仓方向相反
             # 计算成本（考虑杠杆）
-            position_value = size * price
+            position_value = actual_size * price
             margin = position_value / self.leverage
             cost = margin * (1 + self.commission_rate)
             self.balance -= cost
@@ -134,7 +145,7 @@ class BacktestEngine:
             self.trades.append({
                 'type': 'open_short',
                 'price': price,
-                'size': size,
+                'size': actual_size,
                 'idx': current_idx,
                 'balance': self.balance,
                 'equity': self.equity,  # 记录当前权益
@@ -153,16 +164,27 @@ class BacktestEngine:
             current_idx: 当前索引
             reason: 加仓原因
         """
+        # 计算最大可加仓位（基于可用资金和杠杆）
+        max_position_value = self.balance * self.leverage  # 最大仓位价值
+        max_size = max_position_value / price if price > 0 else 0  # 最大数量
+        
+        # 取较小值（策略计算的size和最大可开仓位）
+        actual_size = min(size, max_size) if max_size > 0 else 0
+        
+        if actual_size <= 0:
+            # 无法加仓（资金不足）
+            return
+        
         if signal == 'add_long' and self.position_size > 0:
             # 计算新的平均入场价格
-            total_size = self.position_size + size
-            total_cost = self.position_size * self.entry_price + size * price
+            total_size = self.position_size + actual_size
+            total_cost = self.position_size * self.entry_price + actual_size * price
             self.entry_price = total_cost / total_size
             self.position_size = total_size
             self.entry_count += 1
             
             # 扣除成本（考虑杠杆）
-            position_value = size * price
+            position_value = actual_size * price
             margin = position_value / self.leverage
             cost = margin * (1 + self.commission_rate)
             self.balance -= cost
@@ -170,7 +192,7 @@ class BacktestEngine:
             self.trades.append({
                 'type': 'add_long',
                 'price': price,
-                'size': size,
+                'size': actual_size,
                 'idx': current_idx,
                 'balance': self.balance,
                 'equity': self.equity,  # 记录当前权益
@@ -180,14 +202,14 @@ class BacktestEngine:
         elif signal == 'add_short' and self.position_size < 0:
             # 计算新的平均入场价格（价格始终是正数）
             current_size = abs(self.position_size)
-            total_size = current_size + size
-            total_cost = current_size * self.entry_price + size * price
+            total_size = current_size + actual_size
+            total_cost = current_size * self.entry_price + actual_size * price
             self.entry_price = total_cost / total_size  # 价格始终是正数
             self.position_size = -total_size  # 负数表示空头
             self.entry_count += 1
             
             # 做空加仓：也需要扣除保证金（考虑杠杆）
-            position_value = size * price
+            position_value = actual_size * price
             margin = position_value / self.leverage
             cost = margin * (1 + self.commission_rate)
             self.balance -= cost
@@ -195,7 +217,7 @@ class BacktestEngine:
             self.trades.append({
                 'type': 'add_short',
                 'price': price,
-                'size': size,
+                'size': actual_size,
                 'idx': current_idx,
                 'balance': self.balance,
                 'equity': self.equity,  # 记录当前权益
@@ -509,17 +531,23 @@ class BacktestSystem:
                     atr_value = self.strategy.atr.iloc[idx]
                     if not pd.isna(atr_value) and atr_value > 0:
                         add_size = self.strategy.get_position_size(
-                            self.engine.equity,
+                            self.engine.balance,
                             atr_value,
-                            add_signal['price']
-                        )
-                        self.engine.add_position(
-                            add_signal['signal'],
                             add_signal['price'],
-                            add_size,
-                            idx,
-                            add_signal['reason']
+                            self.engine.leverage
                         )
+                        # 限制加仓数量不超过最大可开仓位
+                        max_add_value = self.engine.balance * self.engine.leverage
+                        max_add_size = max_add_value / add_signal['price'] if add_signal['price'] > 0 else 0
+                        actual_add_size = min(add_size, max_add_size) if max_add_size > 0 else 0
+                        if actual_add_size > 0:
+                            self.engine.add_position(
+                                add_signal['signal'],
+                                add_signal['price'],
+                                actual_add_size,
+                                idx,
+                                add_signal['reason']
+                            )
                     continue
             
             # 检查入场信号
@@ -531,9 +559,10 @@ class BacktestSystem:
                     atr_value = self.strategy.atr.iloc[idx]
                     if not pd.isna(atr_value) and atr_value > 0:
                         position_size = self.strategy.get_position_size(
-                            self.engine.equity,
+                            self.engine.balance,
                             atr_value,
-                            signal['price']
+                            signal['price'],
+                            self.engine.leverage
                         )
                         self.engine.open_position(
                             'long',
@@ -548,9 +577,10 @@ class BacktestSystem:
                     atr_value = self.strategy.atr.iloc[idx]
                     if not pd.isna(atr_value) and atr_value > 0:
                         position_size = self.strategy.get_position_size(
-                            self.engine.equity,
+                            self.engine.balance,
                             atr_value,
-                            signal['price']
+                            signal['price'],
+                            self.engine.leverage
                         )
                         self.engine.open_position(
                             'short',
