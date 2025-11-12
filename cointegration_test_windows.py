@@ -647,7 +647,8 @@ def configure_trading_parameters():
         'z_exit_threshold': 0.6,
         'take_profit_pct': 0.15,
         'stop_loss_pct': 0.08,
-        'max_holding_hours': 168
+        'max_holding_hours': 168,
+        'position_ratio': 0.5
     }
 
     print("当前默认参数:")
@@ -657,6 +658,7 @@ def configure_trading_parameters():
     print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
     print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
     print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
+    print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1-default_params['position_ratio'])*100:.1f}%作为安全垫)")
 
     print("\n是否要修改参数？")
     print("输入 'y' 修改参数，直接回车使用默认参数")
@@ -714,6 +716,17 @@ def configure_trading_parameters():
             except ValueError:
                 print(f"输入无效，使用默认值: {default_params['max_holding_hours']}")
 
+        # 仓位比例
+        position_ratio_input = input(f"仓位比例 (默认: {default_params['position_ratio'] * 100:.1f}%): ").strip()
+        if position_ratio_input:
+            try:
+                default_params['position_ratio'] = float(position_ratio_input) / 100
+                if default_params['position_ratio'] <= 0 or default_params['position_ratio'] > 1:
+                    print(f"仓位比例应在0-100%之间，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
+                    default_params['position_ratio'] = 0.5
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
+
         print("\n修改后的参数:")
         print(f"  1. 回看期: {default_params['lookback_period']}")
         print(f"  2. Z-score开仓阈值: {default_params['z_threshold']}")
@@ -721,6 +734,7 @@ def configure_trading_parameters():
         print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
         print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
         print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
+        print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1-default_params['position_ratio'])*100:.1f}%作为安全垫)")
 
     return default_params
 
@@ -731,7 +745,8 @@ class AdvancedCointegrationTrading:
     """高级协整交易策略类"""
 
     def __init__(self, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
-                 take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168):
+                 take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
+                 position_ratio=0.5):
         """
         初始化高级协整交易策略
 
@@ -742,6 +757,7 @@ class AdvancedCointegrationTrading:
             take_profit_pct: 止盈百分比
             stop_loss_pct: 止损百分比
             max_holding_hours: 最大持仓时间（小时）
+            position_ratio: 仓位比例（默认0.5，即使用50%资金，留50%作为安全垫）
         """
         self.lookback_period = lookback_period
         self.z_threshold = z_threshold
@@ -749,12 +765,58 @@ class AdvancedCointegrationTrading:
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.max_holding_hours = max_holding_hours
+        self.position_ratio = position_ratio
         self.positions = {}  # 当前持仓
         self.trades = []  # 交易记录
 
     def calculate_current_spread(self, price1, price2, hedge_ratio):
         """计算当前价差（原序列）"""
         return price1 - hedge_ratio * price2
+
+    def calculate_position_size_beta_neutral(self, available_capital, price1, price2, hedge_ratio, signal):
+        """
+        基于Beta中性计算开仓数量
+        
+        Args:
+            available_capital: 可用资金
+            price1: symbol1价格
+            price2: symbol2价格
+            hedge_ratio: 对冲比率
+            signal: 交易信号
+        
+        Returns:
+            (symbol1_size, symbol2_size, total_capital_used) 或 (None, None, 0) 如果计算失败
+        """
+        if available_capital <= 0:
+            return None, None, 0
+        
+        # 计算总资金占用系数
+        # 总资金占用 = |symbol1_size| × (price1 + hedge_ratio × price2)
+        capital_coefficient = price1 + hedge_ratio * price2
+        
+        if capital_coefficient <= 0:
+            return None, None, 0
+        
+        # 计算symbol1的数量（绝对值）
+        symbol1_size_abs = available_capital / capital_coefficient
+        
+        # 计算symbol2的数量（绝对值）
+        symbol2_size_abs = hedge_ratio * symbol1_size_abs
+        
+        # 根据信号方向确定正负
+        if signal['action'] == 'SHORT_LONG':
+            symbol1_size = -symbol1_size_abs  # 做空
+            symbol2_size = +symbol2_size_abs  # 做多
+        elif signal['action'] == 'LONG_SHORT':
+            symbol1_size = +symbol1_size_abs  # 做多
+            symbol2_size = -symbol2_size_abs  # 做空
+        else:
+            return None, None, 0
+        
+        # 计算实际资金占用
+        total_capital_used = abs(symbol1_size) * price1 + abs(symbol2_size) * price2
+        
+        return symbol1_size, symbol2_size, total_capital_used
 
     def calculate_z_score(self, current_spread, historical_spreads):
         """计算当前Z-score"""
@@ -790,42 +852,45 @@ class AdvancedCointegrationTrading:
                 'confidence': 0.0
             }
 
-    def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread):
-        """执行交易"""
+    def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread, available_capital):
+        """
+        执行交易（基于可用资金计算仓位）
+        
+        Args:
+            pair_info: 币对信息
+            current_prices: 当前价格字典
+            signal: 交易信号
+            timestamp: 时间戳
+            current_spread: 当前价差
+            available_capital: 可用资金
+        """
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         hedge_ratio = pair_info['hedge_ratio']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        if signal['action'] == 'SHORT_LONG':
-            # 做空价差：做空symbol1，做多symbol2
-            position = {
-                'pair': f"{symbol1}_{symbol2}",
-                'symbol1': symbol1,
-                'symbol2': symbol2,
-                'symbol1_size': -1.0,  # 做空
-                'symbol2_size': hedge_ratio,  # 做多
-                'entry_prices': {symbol1: price1, symbol2: price2},
-                'entry_spread': current_spread,  # 记录开仓时的价差
-                'hedge_ratio': hedge_ratio,
-                'entry_time': timestamp,
-                'signal': signal
-            }
-        elif signal['action'] == 'LONG_SHORT':
-            # 做多价差：做多symbol1，做空symbol2
-            position = {
-                'pair': f"{symbol1}_{symbol2}",
-                'symbol1': symbol1,
-                'symbol2': symbol2,
-                'symbol1_size': 1.0,  # 做多
-                'symbol2_size': -hedge_ratio,  # 做空
-                'entry_prices': {symbol1: price1, symbol2: price2},
-                'entry_spread': current_spread,  # 记录开仓时的价差
-                'hedge_ratio': hedge_ratio,
-                'entry_time': timestamp,
-                'signal': signal
-            }
-        else:
+        # 使用Beta中性方法计算开仓数量
+        symbol1_size, symbol2_size, total_capital_used = self.calculate_position_size_beta_neutral(
+            available_capital, price1, price2, hedge_ratio, signal
+        )
+
+        if symbol1_size is None:
+            print(f"开仓失败: 可用资金不足或计算错误 (可用资金: {available_capital:.2f})")
             return None
+
+        # 创建持仓记录
+        position = {
+            'pair': f"{symbol1}_{symbol2}",
+            'symbol1': symbol1,
+            'symbol2': symbol2,
+            'symbol1_size': symbol1_size,
+            'symbol2_size': symbol2_size,
+            'entry_prices': {symbol1: price1, symbol2: price2},
+            'entry_spread': current_spread,  # 记录开仓时的价差
+            'hedge_ratio': hedge_ratio,
+            'entry_time': timestamp,
+            'signal': signal,
+            'capital_used': total_capital_used  # 记录使用的资金
+        }
 
         self.positions[pair_info['pair_name']] = position
 
@@ -843,7 +908,8 @@ class AdvancedCointegrationTrading:
             'hedge_ratio': hedge_ratio,
             'signal': signal,
             'z_score': signal.get('z_score', 0),
-            'entry_spread': current_spread
+            'entry_spread': current_spread,
+            'capital_used': total_capital_used
         }
         self.trades.append(trade)
 
@@ -851,7 +917,8 @@ class AdvancedCointegrationTrading:
         print(f"   信号: {signal['description']}")
         print(f"   价格: {symbol1}={price1:.2f}, {symbol2}={price2:.2f}")
         print(f"   价差: {current_spread:.6f}")
-        print(f"   仓位: {symbol1}={position['symbol1_size']:.2f}, {symbol2}={position['symbol2_size']:.2f}")
+        print(f"   仓位: {symbol1}={position['symbol1_size']:.6f}, {symbol2}={position['symbol2_size']:.6f}")
+        print(f"   使用资金: {total_capital_used:.2f} / {available_capital:.2f}")
 
         return position
 
@@ -1108,6 +1175,9 @@ class AdvancedCointegrationTrading:
         print(f"总数据点: {len(all_timestamps)}")
         print(f"选择的币对数量: {len(selected_pairs)}")
         print(f"策略参数:")
+        print(f"  初始资金: {initial_capital:,.2f}")
+        print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
+        print(f"  可用资金: {initial_capital * self.position_ratio:,.2f} (留{(1-self.position_ratio)*100:.1f}%作为安全垫)")
         print(f"  Z-score开仓阈值: {self.z_threshold}")
         print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
         print(f"  止盈百分比: {self.take_profit_pct * 100:.1f}%")
@@ -1170,7 +1240,9 @@ class AdvancedCointegrationTrading:
                     signal['z_score'] = current_z_score
 
                     if signal['action'] != 'HOLD':
-                        position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread)
+                        # 计算可用资金（根据当前资金和仓位比例）
+                        available_capital = capital * self.position_ratio
+                        position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread, available_capital)
                         if position:
                             results['trades'].append(self.trades[-1])
 
@@ -1297,7 +1369,8 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             z_exit_threshold=trading_params['z_exit_threshold'],
             take_profit_pct=trading_params['take_profit_pct'],
             stop_loss_pct=trading_params['stop_loss_pct'],
-            max_holding_hours=trading_params['max_holding_hours']
+            max_holding_hours=trading_params['max_holding_hours'],
+            position_ratio=trading_params['position_ratio']
         )
 
         results = trading_strategy.backtest_cointegration_trading(
