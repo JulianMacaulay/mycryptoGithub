@@ -1179,7 +1179,7 @@ class AdvancedCointegrationTrading:
         print(f"策略参数:")
         print(f"  初始资金: {initial_capital:,.2f}")
         print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
-        print(f"  杠杆: {self.leverage:.1f}%")
+        print(f"  杠杆: {self.leverage:.1f}倍")
         print(f"  可用资金: {initial_capital * self.position_ratio:,.2f} (留{(1-self.position_ratio)*100:.1f}%作为安全垫)")
         print(f"  Z-score开仓阈值: {self.z_threshold}")
         print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
@@ -1285,7 +1285,134 @@ class AdvancedCointegrationTrading:
         print(f"\n正在生成收益率曲线图...")
         self.plot_equity_curve(results['capital_curve'])
 
+        # 导出交易记录为CSV
+        print(f"\n正在导出交易记录...")
+        print(f"交易记录数量: {len(results['trades'])}")
+        if len(results['trades']) > 0:
+            csv_path = self.export_trades_to_csv(results['trades'])
+            if csv_path:
+                import os
+                full_path = os.path.abspath(csv_path)
+                print(f" 交易记录已成功导出!")
+                print(f"  文件路径: {full_path}")
+                print(f"  文件大小: {os.path.getsize(full_path) / 1024:.2f} KB")
+            else:
+                print(" 导出失败，请检查错误信息")
+        else:
+            print("没有交易记录可导出")
+
         return results
+
+    def export_trades_to_csv(self, trades, filename=None):
+        """
+        将交易记录导出为CSV文件
+        
+        Args:
+            trades: 交易记录列表
+            filename: 输出文件名（可选，默认自动生成）
+        
+        Returns:
+            str: 导出的CSV文件路径，如果失败返回None
+        """
+        if not trades:
+            print("  警告: 交易记录列表为空")
+            return None
+        
+        try:
+            import os
+            from datetime import datetime
+            
+            print(f"  处理 {len(trades)} 条交易记录...")
+            
+            # 准备数据列表
+            trade_data = []
+            
+            for i, trade in enumerate(trades):
+                # 基础信息
+                row = {
+                    '时间戳': trade.get('timestamp', ''),
+                    '币对': trade.get('pair', ''),
+                    '操作': trade.get('action', ''),
+                    '币种1': trade.get('symbol1', ''),
+                    '币种2': trade.get('symbol2', ''),
+                    '币种1数量': trade.get('symbol1_size', 0),
+                    '币种2数量': trade.get('symbol2_size', 0),
+                    '币种1价格': trade.get('symbol1_price', 0),
+                    '币种2价格': trade.get('symbol2_price', 0),
+                    '对冲比率': trade.get('hedge_ratio', 0),
+                }
+                
+                # 处理信号信息（可能是字典）
+                signal = trade.get('signal', {})
+                if isinstance(signal, dict):
+                    row['信号动作'] = signal.get('action', '')
+                    row['信号描述'] = signal.get('description', '')
+                    row['信号置信度'] = signal.get('confidence', 0)
+                else:
+                    row['信号动作'] = ''
+                    row['信号描述'] = str(signal)
+                    row['信号置信度'] = 0
+                
+                # 开仓特有信息
+                if trade.get('action') == 'OPEN':
+                    row['Z-score'] = trade.get('z_score', 0)
+                    row['开仓价差'] = trade.get('entry_spread', 0)
+                    row['使用资金'] = trade.get('capital_used', 0)
+                    row['盈亏'] = ''
+                    row['持仓时间(小时)'] = ''
+                
+                # 平仓特有信息
+                elif trade.get('action') == 'CLOSE':
+                    row['Z-score'] = ''
+                    row['开仓价差'] = ''
+                    row['使用资金'] = ''
+                    row['盈亏'] = trade.get('pnl', 0)
+                    row['持仓时间(小时)'] = trade.get('holding_hours', 0)
+                
+                else:
+                    row['Z-score'] = trade.get('z_score', '')
+                    row['开仓价差'] = trade.get('entry_spread', '')
+                    row['使用资金'] = trade.get('capital_used', '')
+                    row['盈亏'] = trade.get('pnl', '')
+                    row['持仓时间(小时)'] = trade.get('holding_hours', '')
+                
+                trade_data.append(row)
+            
+            # 创建DataFrame
+            df = pd.DataFrame(trade_data)
+            print(f"  已创建DataFrame，包含 {len(df)} 行，{len(df.columns)} 列")
+            
+            # 生成文件名（使用绝对路径）
+            if filename is None:
+                timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f'trades_export_{timestamp_str}.csv'
+            
+            # 确保文件名以.csv结尾
+            if not filename.endswith('.csv'):
+                filename += '.csv'
+            
+            # 获取当前工作目录的绝对路径
+            current_dir = os.getcwd()
+            full_path = os.path.join(current_dir, filename)
+            
+            # 导出为CSV
+            print(f"  正在保存文件到: {full_path}")
+            df.to_csv(full_path, index=False, encoding='utf-8-sig')
+            
+            # 验证文件是否创建成功
+            if os.path.exists(full_path):
+                file_size = os.path.getsize(full_path)
+                print(f"   文件保存成功，大小: {file_size} 字节")
+                return full_path
+            else:
+                print(f"   文件保存失败，文件不存在")
+                return None
+            
+        except Exception as e:
+            print(f"   导出交易记录失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 
 def test_rolling_window_cointegration_trading(csv_file_path):
