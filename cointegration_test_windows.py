@@ -425,10 +425,10 @@ def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_s
             window_results.append(coint_result)
 
             if coint_result['cointegration_found']:
-                print(f"  ✓ 协整检验通过 (P值: {coint_result['spread_adf']['p_value']:.6f})")
+                print(f"   协整检验通过 (P值: {coint_result['spread_adf']['p_value']:.6f})")
                 all_candidates.append(coint_result)
             else:
-                print(f"  ✗ 协整检验未通过")
+                print(f"   协整检验未通过")
 
         except Exception as e:
             print(f"  窗口检验出错: {str(e)}")
@@ -648,7 +648,8 @@ def configure_trading_parameters():
         'take_profit_pct': 0.15,
         'stop_loss_pct': 0.08,
         'max_holding_hours': 168,
-        'position_ratio': 0.5
+        'position_ratio': 0.5,
+        'leverage':5
     }
 
     print("当前默认参数:")
@@ -746,7 +747,7 @@ class AdvancedCointegrationTrading:
 
     def __init__(self, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
                  take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
-                 position_ratio=0.5):
+                 position_ratio=0.5,leverage=5):
         """
         初始化高级协整交易策略
 
@@ -766,6 +767,7 @@ class AdvancedCointegrationTrading:
         self.stop_loss_pct = stop_loss_pct
         self.max_holding_hours = max_holding_hours
         self.position_ratio = position_ratio
+        self.leverage = leverage
         self.positions = {}  # 当前持仓
         self.trades = []  # 交易记录
 
@@ -1177,6 +1179,7 @@ class AdvancedCointegrationTrading:
         print(f"策略参数:")
         print(f"  初始资金: {initial_capital:,.2f}")
         print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
+        print(f"  杠杆: {self.leverage:.1f}%")
         print(f"  可用资金: {initial_capital * self.position_ratio:,.2f} (留{(1-self.position_ratio)*100:.1f}%作为安全垫)")
         print(f"  Z-score开仓阈值: {self.z_threshold}")
         print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
@@ -1241,7 +1244,7 @@ class AdvancedCointegrationTrading:
 
                     if signal['action'] != 'HOLD':
                         # 计算可用资金（根据当前资金和仓位比例）
-                        available_capital = capital * self.position_ratio
+                        available_capital = capital * self.position_ratio * self.leverage
                         position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread, available_capital)
                         if position:
                             results['trades'].append(self.trades[-1])
@@ -1370,7 +1373,8 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             take_profit_pct=trading_params['take_profit_pct'],
             stop_loss_pct=trading_params['stop_loss_pct'],
             max_holding_hours=trading_params['max_holding_hours'],
-            position_ratio=trading_params['position_ratio']
+            position_ratio=trading_params['position_ratio'],
+            leverage = trading_params['leverage']
         )
 
         results = trading_strategy.backtest_cointegration_trading(
@@ -1427,7 +1431,7 @@ def main():
 
     if not csv_file_path:
         # 默认路径
-        csv_file_path = "segment_2_data_ccxt_20251106_195714.csv"
+        csv_file_path = "segment_2_data_ccxt_20251113_103652.csv"
         print(f"使用默认路径: {csv_file_path}")
 
     # 执行滚动窗口测试
