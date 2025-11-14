@@ -1016,8 +1016,8 @@ class AdvancedCointegrationTrading:
         open_fee = position.get('open_fee', 0)
         total_fee = open_fee + close_fee
         
-        # 计算净盈亏（扣除手续费后）
-        net_pnl = total_pnl - total_fee
+        # 计算净盈亏（只扣除平仓手续费，因为开仓手续费已经在开仓时从capital中扣除了）
+        net_pnl = total_pnl - close_fee
 
         # 条件1: Z-score回归到均值附近
         if abs(current_z_score) < self.z_exit_threshold:
@@ -1077,12 +1077,12 @@ class AdvancedCointegrationTrading:
         # 手续费 = (|symbol1_size| × price1 + |symbol2_size| × price2) × fee_rate
         close_fee = (abs(position['symbol1_size']) * price1 + abs(position['symbol2_size']) * price2) * self.trading_fee_rate
         
-        # 计算总手续费（开仓手续费 + 平仓手续费）
+        # 计算总手续费（开仓手续费 + 平仓手续费，用于记录和显示）
         open_fee = position.get('open_fee', 0)
         total_fee = open_fee + close_fee
         
-        # 扣除手续费后的净盈亏
-        net_pnl = total_pnl - total_fee
+        # 扣除手续费后的净盈亏（只扣除平仓手续费，因为开仓手续费已经在开仓时从capital中扣除了）
+        net_pnl = total_pnl - close_fee
         
         # 计算价差变化（用于显示）
         entry_spread = position['entry_spread']
