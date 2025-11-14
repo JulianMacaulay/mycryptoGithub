@@ -1181,7 +1181,9 @@ class AdvancedCointegrationTrading:
         print("=" * 60)
 
         # 初始化
-        capital = initial_capital
+        # 确定投入资金：capital = initial_capital * position_ratio
+        # position_ratio只在初始化时使用一次，之后不再使用
+        capital = initial_capital * self.position_ratio
         results = {
             'capital_curve': [],
             'trades': [],
@@ -1202,8 +1204,9 @@ class AdvancedCointegrationTrading:
         print(f"策略参数:")
         print(f"  初始资金: {initial_capital:,.2f}")
         print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
+        print(f"  投入资金: {capital:,.2f} (初始资金 × 仓位比例)")
         print(f"  杠杆: {self.leverage:.1f}倍")
-        print(f"  可用资金: {initial_capital * self.position_ratio:,.2f} (留{(1-self.position_ratio)*100:.1f}%作为安全垫)")
+        print(f"  可用资金: {capital * self.leverage:,.2f} (投入资金 × 杠杆)")
         print(f"  Z-score开仓阈值: {self.z_threshold}")
         print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
         print(f"  止盈百分比: {self.take_profit_pct * 100:.1f}%")
@@ -1266,8 +1269,9 @@ class AdvancedCointegrationTrading:
                     signal['z_score'] = current_z_score
 
                     if signal['action'] != 'HOLD':
-                        # 计算可用资金（根据当前资金和仓位比例）
-                        available_capital = capital * self.position_ratio * self.leverage
+                        # 计算可用资金（只乘以杠杆，不再乘以position_ratio）
+                        # position_ratio只在初始化时使用一次，之后capital已经包含了position_ratio的影响
+                        available_capital = capital * self.leverage
                         position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread, available_capital)
                         if position:
                             results['trades'].append(self.trades[-1])
@@ -1283,13 +1287,16 @@ class AdvancedCointegrationTrading:
         total_trades = len(results['trades'])
         profitable_trades = len([t for t in results['trades'] if t.get('pnl', 0) > 0])
 
-        final_return = (capital - initial_capital) / initial_capital * 100
+        # 计算收益率：基于投入资金（capital的初始值）
+        initial_invested_capital = initial_capital * self.position_ratio
+        final_return = (capital - initial_invested_capital) / initial_invested_capital * 100
 
         # 计算风险指标
         risk_metrics = self.calculate_risk_metrics(results['capital_curve'])
 
         print(f"\n回测结果:")
         print(f"  初始资金: {initial_capital:,.2f}")
+        print(f"  投入资金: {initial_capital * self.position_ratio:,.2f} (初始资金 × 仓位比例)")
         print(f"  最终资金: {capital:,.2f}")
         print(f"  总收益率: {final_return:.2f}%")
         print(f"  总交易次数: {total_trades / 2}")
