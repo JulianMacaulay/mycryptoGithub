@@ -669,7 +669,8 @@ def configure_trading_parameters():
         'stop_loss_pct': 0.08,
         'max_holding_hours': 168,
         'position_ratio': 0.5,
-        'leverage':5
+        'leverage': 5,
+        'trading_fee_rate': 0.000275  # 交易手续费率 0.0275%
     }
 
     print("当前默认参数:")
@@ -680,6 +681,8 @@ def configure_trading_parameters():
     print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
     print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
     print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1-default_params['position_ratio'])*100:.1f}%作为安全垫)")
+    print(f"  8. 杠杆: {default_params['leverage']}倍")
+    print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
 
     print("\n是否要修改参数？")
     print("输入 'y' 修改参数，直接回车使用默认参数")
@@ -748,6 +751,22 @@ def configure_trading_parameters():
             except ValueError:
                 print(f"输入无效，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
 
+        # 杠杆
+        leverage_input = input(f"杠杆 (默认: {default_params['leverage']}): ").strip()
+        if leverage_input:
+            try:
+                default_params['leverage'] = int(leverage_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['leverage']}")
+
+        # 交易手续费率
+        fee_rate_input = input(f"交易手续费率 (默认: {default_params['trading_fee_rate'] * 100:.4f}%): ").strip()
+        if fee_rate_input:
+            try:
+                default_params['trading_fee_rate'] = float(fee_rate_input) / 100
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
+
         print("\n修改后的参数:")
         print(f"  1. 回看期: {default_params['lookback_period']}")
         print(f"  2. Z-score开仓阈值: {default_params['z_threshold']}")
@@ -756,6 +775,8 @@ def configure_trading_parameters():
         print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
         print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
         print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1-default_params['position_ratio'])*100:.1f}%作为安全垫)")
+        print(f"  8. 杠杆: {default_params['leverage']}倍")
+        print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
 
     return default_params
 
@@ -767,7 +788,7 @@ class AdvancedCointegrationTrading:
 
     def __init__(self, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
                  take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
-                 position_ratio=0.5,leverage=5):
+                 position_ratio=0.5, leverage=5, trading_fee_rate=0.000275):
         """
         初始化高级协整交易策略
 
@@ -779,6 +800,8 @@ class AdvancedCointegrationTrading:
             stop_loss_pct: 止损百分比
             max_holding_hours: 最大持仓时间（小时）
             position_ratio: 仓位比例（默认0.5，即使用50%资金，留50%作为安全垫）
+            leverage: 杠杆倍数
+            trading_fee_rate: 交易手续费率（默认0.0275%，即0.000275）
         """
         self.lookback_period = lookback_period
         self.z_threshold = z_threshold
@@ -788,6 +811,7 @@ class AdvancedCointegrationTrading:
         self.max_holding_hours = max_holding_hours
         self.position_ratio = position_ratio
         self.leverage = leverage
+        self.trading_fee_rate = trading_fee_rate  # 交易手续费率（0.0275% = 0.000275）
         self.positions = {}  # 当前持仓
         self.trades = []  # 交易记录
 
@@ -899,6 +923,10 @@ class AdvancedCointegrationTrading:
             print(f"开仓失败: 可用资金不足或计算错误 (可用资金: {available_capital:.2f})")
             return None
 
+        # 计算开仓手续费（基于交易金额）
+        # 手续费 = (|symbol1_size| × price1 + |symbol2_size| × price2) × fee_rate
+        open_fee = total_capital_used * self.trading_fee_rate
+
         # 创建持仓记录
         position = {
             'pair': f"{symbol1}_{symbol2}",
@@ -911,7 +939,8 @@ class AdvancedCointegrationTrading:
             'hedge_ratio': hedge_ratio,
             'entry_time': timestamp,
             'signal': signal,
-            'capital_used': total_capital_used  # 记录使用的资金
+            'capital_used': total_capital_used,  # 记录使用的资金
+            'open_fee': open_fee  # 记录开仓手续费
         }
 
         self.positions[pair_info['pair_name']] = position
@@ -931,7 +960,8 @@ class AdvancedCointegrationTrading:
             'signal': signal,
             'z_score': signal.get('z_score', 0),
             'entry_spread': current_spread,
-            'capital_used': total_capital_used
+            'capital_used': total_capital_used,
+            'fee': open_fee  # 记录开仓手续费
         }
         self.trades.append(trade)
 
@@ -941,6 +971,7 @@ class AdvancedCointegrationTrading:
         print(f"   价差: {current_spread:.6f}")
         print(f"   仓位: {symbol1}={position['symbol1_size']:.6f}, {symbol2}={position['symbol2_size']:.6f}")
         print(f"   使用资金: {total_capital_used:.2f} / {available_capital:.2f}")
+        print(f"   开仓手续费: {open_fee:.4f}")
 
         return position
 
@@ -954,21 +985,39 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算当前盈亏（基于价差变化）
-        entry_spread = position['entry_spread']
-        spread_change = current_spread - entry_spread
-
-        # 根据交易方向计算盈亏
+        # 计算实际盈亏（基于持仓价值变化）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
+        
         if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
             # 做空价差，价差减少时盈利
-            total_pnl = -spread_change
+            # symbol1_size是负数（做空），price1下跌时(price1-entry_price1)为负，负数×负数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是正数（做多），price2上涨时(price2-entry_price2)为正，正数×正数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
         else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
             # 做多价差，价差增加时盈利
-            total_pnl = spread_change
+            # symbol1_size是正数（做多），price1上涨时(price1-entry_price1)为正，正数×正数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是负数（做空），price2下跌时(price2-entry_price2)为负，负数×负数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算投入资金（基于原始价格）
-        entry_value = abs(position['symbol1_size'] * position['entry_prices'][symbol1]) + \
-                      abs(position['symbol2_size'] * position['entry_prices'][symbol2])
+        entry_value = abs(position['symbol1_size'] * entry_price1) + \
+                      abs(position['symbol2_size'] * entry_price2)
+
+        # 计算手续费（用于止盈止损判断）
+        # 计算平仓手续费
+        close_fee = (abs(position['symbol1_size']) * price1 + abs(position['symbol2_size']) * price2) * self.trading_fee_rate
+        open_fee = position.get('open_fee', 0)
+        total_fee = open_fee + close_fee
+        
+        # 计算净盈亏（扣除手续费后）
+        net_pnl = total_pnl - total_fee
 
         # 条件1: Z-score回归到均值附近
         if abs(current_z_score) < self.z_exit_threshold:
@@ -979,16 +1028,16 @@ class AdvancedCointegrationTrading:
         if holding_hours > self.max_holding_hours:
             return True, f"持仓时间过长({holding_hours:.1f}小时)，强制平仓"
 
-        # 条件3: 止盈条件
+        # 条件3: 止盈条件（基于净盈亏）
         if entry_value > 0:
-            pnl_percentage = total_pnl / entry_value
-            if total_pnl > 0 and pnl_percentage > self.take_profit_pct:
+            pnl_percentage = net_pnl / entry_value
+            if net_pnl > 0 and pnl_percentage > self.take_profit_pct:
                 return True, f"止盈触发({pnl_percentage * 100:.1f}%)，平仓获利"
 
-        # 条件4: 止损条件
+        # 条件4: 止损条件（基于净盈亏）
         if entry_value > 0:
-            pnl_percentage = total_pnl / entry_value
-            if total_pnl < 0 and pnl_percentage < -self.stop_loss_pct:
+            pnl_percentage = net_pnl / entry_value
+            if net_pnl < 0 and pnl_percentage < -self.stop_loss_pct:
                 return True, f"止损触发({pnl_percentage * 100:.1f}%)，平仓止损"
 
         return False, ""
@@ -1003,17 +1052,41 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算最终盈亏（基于价差变化）
+        # 计算最终盈亏（基于持仓价值变化）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
+        
+        if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
+            # 做空价差，价差减少时盈利
+            # symbol1_size是负数（做空），price1下跌时(price1-entry_price1)为负，负数×负数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是正数（做多），price2上涨时(price2-entry_price2)为正，正数×正数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
+            # 做多价差，价差增加时盈利
+            # symbol1_size是正数（做多），price1上涨时(price1-entry_price1)为正，正数×正数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是负数（做空），price2下跌时(price2-entry_price2)为负，负数×负数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        
+        # 计算平仓手续费（基于平仓时的交易金额）
+        # 手续费 = (|symbol1_size| × price1 + |symbol2_size| × price2) × fee_rate
+        close_fee = (abs(position['symbol1_size']) * price1 + abs(position['symbol2_size']) * price2) * self.trading_fee_rate
+        
+        # 计算总手续费（开仓手续费 + 平仓手续费）
+        open_fee = position.get('open_fee', 0)
+        total_fee = open_fee + close_fee
+        
+        # 扣除手续费后的净盈亏
+        net_pnl = total_pnl - total_fee
+        
+        # 计算价差变化（用于显示）
         entry_spread = position['entry_spread']
         spread_change = current_spread - entry_spread
-
-        # 根据交易方向计算盈亏
-        if position['signal']['action'] == 'SHORT_LONG':
-            # 做空价差，价差减少时盈利
-            total_pnl = -spread_change
-        else:  # LONG_SHORT
-            # 做多价差，价差增加时盈利
-            total_pnl = spread_change
 
         # 记录平仓交易
         trade = {
@@ -1028,15 +1101,24 @@ class AdvancedCointegrationTrading:
             'symbol2_price': price2,
             'hedge_ratio': position['hedge_ratio'],
             'signal': {'action': 'CLOSE', 'description': reason},
-            'pnl': total_pnl,
+            'pnl': net_pnl,  # 净盈亏（已扣除手续费）
+            'gross_pnl': total_pnl,  # 毛盈亏（未扣除手续费）
+            'open_fee': open_fee,  # 开仓手续费
+            'close_fee': close_fee,  # 平仓手续费
+            'total_fee': total_fee,  # 总手续费
             'holding_hours': (timestamp - position['entry_time']).total_seconds() / 3600
         }
         self.trades.append(trade)
 
         print(f"平仓: {pair_name}")
         print(f"   平仓原因: {reason}")
-        print(f"   盈亏: {total_pnl:.2f}")
+        print(f"   毛盈亏: {total_pnl:.2f}")
+        print(f"   开仓手续费: {open_fee:.4f}")
+        print(f"   平仓手续费: {close_fee:.4f}")
+        print(f"   总手续费: {total_fee:.4f}")
+        print(f"   净盈亏: {net_pnl:.2f}")
         print(f"   持仓时间: {trade['holding_hours']:.1f}小时")
+        print(f"   开仓价格: {symbol1}={entry_price1:.2f}, {symbol2}={entry_price2:.2f}")
         print(f"   平仓价格: {symbol1}={price1:.2f}, {symbol2}={price2:.2f}")
         print(f"   价差变化: {entry_spread:.6f} -> {current_spread:.6f} (变化: {spread_change:.6f})")
 
@@ -1181,7 +1263,9 @@ class AdvancedCointegrationTrading:
             print("=" * 60)
 
         # 初始化
-        capital = initial_capital
+        # 确定投入资金：capital = initial_capital * position_ratio
+        # position_ratio只在初始化时使用一次，之后不再使用
+        capital = initial_capital * self.position_ratio
         results = {
             'capital_curve': [],
             'trades': [],
@@ -1203,8 +1287,10 @@ class AdvancedCointegrationTrading:
             print(f"策略参数:")
             print(f"  初始资金: {initial_capital:,.2f}")
             print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
+            print(f"  投入资金: {capital:,.2f} (初始资金 × 仓位比例)")
             print(f"  杠杆: {self.leverage:.1f}倍")
-            print(f"  可用资金: {initial_capital * self.position_ratio:,.2f} (留{(1-self.position_ratio)*100:.1f}%作为安全垫)")
+            print(f"  可用资金: {capital * self.leverage:,.2f} (投入资金 × 杠杆)")
+            print(f"  交易手续费率: {self.trading_fee_rate * 100:.4f}%")
             print(f"  Z-score开仓阈值: {self.z_threshold}")
             print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
             print(f"  止盈百分比: {self.take_profit_pct * 100:.1f}%")
@@ -1258,7 +1344,7 @@ class AdvancedCointegrationTrading:
                     if should_close:
                         trade = self.close_position(pair_info, current_prices, close_reason, timestamp, current_spread)
                         if trade:
-                            capital += trade['pnl']
+                            capital += trade['pnl']  # 净盈亏（已扣除手续费）
                             results['trades'].append(trade)
 
                 # 检查开仓条件（只有在没有持仓时才开仓）
@@ -1267,10 +1353,14 @@ class AdvancedCointegrationTrading:
                     signal['z_score'] = current_z_score
 
                     if signal['action'] != 'HOLD':
-                        # 计算可用资金（根据当前资金和仓位比例）
-                        available_capital = capital * self.position_ratio * self.leverage
+                        # 计算可用资金（只乘以杠杆，不再乘以position_ratio）
+                        # position_ratio只在初始化时使用一次，之后capital已经包含了position_ratio的影响
+                        available_capital = capital * self.leverage
                         position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread, available_capital)
                         if position:
+                            # 扣除开仓手续费
+                            open_fee = self.trades[-1].get('fee', 0)
+                            capital -= open_fee
                             results['trades'].append(self.trades[-1])
 
             # 记录资金曲线
@@ -1284,7 +1374,13 @@ class AdvancedCointegrationTrading:
         total_trades = len(results['trades'])
         profitable_trades = len([t for t in results['trades'] if t.get('pnl', 0) > 0])
 
-        final_return = (capital - initial_capital) / initial_capital * 100
+        # 计算总手续费
+        # 平仓时的total_fee已经包含了开仓手续费和平仓手续费，所以只需要统计平仓时的total_fee
+        total_fees = sum([t.get('total_fee', 0) for t in results['trades'] if t.get('action') == 'CLOSE'])
+
+        # 计算收益率：基于投入资金（capital的初始值）
+        initial_invested_capital = initial_capital * self.position_ratio
+        final_return = (capital - initial_invested_capital) / initial_invested_capital * 100
 
         # 计算风险指标
         risk_metrics = self.calculate_risk_metrics(results['capital_curve'])
@@ -1292,11 +1388,13 @@ class AdvancedCointegrationTrading:
         if not optimization_mode:
             print(f"\n回测结果:")
             print(f"  初始资金: {initial_capital:,.2f}")
+            print(f"  投入资金: {initial_invested_capital:,.2f} (初始资金 × 仓位比例)")
             print(f"  最终资金: {capital:,.2f}")
             print(f"  总收益率: {final_return:.2f}%")
             print(f"  总交易次数: {total_trades / 2}")
             print(f"  盈利交易: {profitable_trades}")
             print(f"  胜率: {profitable_trades / (total_trades / 2) * 100:.1f}%" if total_trades > 0 else "  胜率: 0%")
+            print(f"  总手续费: {total_fees:,.2f}")
 
             print(f"\n风险指标:")
             print(f"  最大回撤: {risk_metrics.get('max_drawdown', 0):,.2f}")
@@ -1384,6 +1482,7 @@ class AdvancedCointegrationTrading:
                     row['Z-score'] = trade.get('z_score', 0)
                     row['开仓价差'] = trade.get('entry_spread', 0)
                     row['使用资金'] = trade.get('capital_used', 0)
+                    row['手续费'] = trade.get('fee', 0)
                     row['盈亏'] = ''
                     row['持仓时间(小时)'] = ''
                 
@@ -1392,7 +1491,9 @@ class AdvancedCointegrationTrading:
                     row['Z-score'] = ''
                     row['开仓价差'] = ''
                     row['使用资金'] = ''
-                    row['盈亏'] = trade.get('pnl', 0)
+                    row['手续费'] = trade.get('total_fee', 0)
+                    row['毛盈亏'] = trade.get('gross_pnl', 0)
+                    row['盈亏'] = trade.get('pnl', 0)  # 净盈亏
                     row['持仓时间(小时)'] = trade.get('holding_hours', 0)
                 
                 else:
@@ -1527,7 +1628,8 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             stop_loss_pct=trading_params['stop_loss_pct'],
             max_holding_hours=trading_params['max_holding_hours'],
             position_ratio=trading_params['position_ratio'],
-            leverage = trading_params['leverage']
+            leverage=trading_params['leverage'],
+            trading_fee_rate=trading_params.get('trading_fee_rate', 0.000275)
         )
 
         results = trading_strategy.backtest_cointegration_trading(
@@ -1636,7 +1738,8 @@ class ParameterOptimizer:
                 stop_loss_pct=params['stop_loss_pct'],
                 max_holding_hours=params['max_holding_hours'],
                 position_ratio=params['position_ratio'],
-                leverage=params['leverage']
+                leverage=params['leverage'],
+                trading_fee_rate=params.get('trading_fee_rate', 0.000275)
             )
             
             # 执行回测（不显示图表和详细输出）
