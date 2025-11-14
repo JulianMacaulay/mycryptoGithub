@@ -934,21 +934,30 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算当前盈亏（基于价差变化）
-        entry_spread = position['entry_spread']
-        spread_change = current_spread - entry_spread
-
-        # 根据交易方向计算盈亏
+        # 计算实际盈亏（基于持仓价值变化）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
+        
         if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
             # 做空价差，价差减少时盈利
-            total_pnl = -spread_change
+            # symbol1_size是负数（做空），price1下跌时(price1-entry_price1)为负，负数×负数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是正数（做多），price2上涨时(price2-entry_price2)为正，正数×正数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
         else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
             # 做多价差，价差增加时盈利
-            total_pnl = spread_change
+            # symbol1_size是正数（做多），price1上涨时(price1-entry_price1)为正，正数×正数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是负数（做空），price2下跌时(price2-entry_price2)为负，负数×负数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算投入资金（基于原始价格）
-        entry_value = abs(position['symbol1_size'] * position['entry_prices'][symbol1]) + \
-                      abs(position['symbol2_size'] * position['entry_prices'][symbol2])
+        entry_value = abs(position['symbol1_size'] * entry_price1) + \
+                      abs(position['symbol2_size'] * entry_price2)
 
         # 条件1: Z-score回归到均值附近
         if abs(current_z_score) < self.z_exit_threshold:
@@ -983,17 +992,30 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算最终盈亏（基于价差变化）
+        # 计算最终盈亏（基于持仓价值变化）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
+        
+        if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
+            # 做空价差，价差减少时盈利
+            # symbol1_size是负数（做空），price1下跌时(price1-entry_price1)为负，负数×负数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是正数（做多），price2上涨时(price2-entry_price2)为正，正数×正数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
+            # 做多价差，价差增加时盈利
+            # symbol1_size是正数（做多），price1上涨时(price1-entry_price1)为正，正数×正数=正数（盈利）
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            # symbol2_size是负数（做空），price2下跌时(price2-entry_price2)为负，负数×负数=正数（盈利）
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        
+        # 计算价差变化（用于显示）
         entry_spread = position['entry_spread']
         spread_change = current_spread - entry_spread
-
-        # 根据交易方向计算盈亏
-        if position['signal']['action'] == 'SHORT_LONG':
-            # 做空价差，价差减少时盈利
-            total_pnl = -spread_change
-        else:  # LONG_SHORT
-            # 做多价差，价差增加时盈利
-            total_pnl = spread_change
 
         # 记录平仓交易
         trade = {
@@ -1017,6 +1039,7 @@ class AdvancedCointegrationTrading:
         print(f"   平仓原因: {reason}")
         print(f"   盈亏: {total_pnl:.2f}")
         print(f"   持仓时间: {trade['holding_hours']:.1f}小时")
+        print(f"   开仓价格: {symbol1}={entry_price1:.2f}, {symbol2}={entry_price2:.2f}")
         print(f"   平仓价格: {symbol1}={price1:.2f}, {symbol2}={price2:.2f}")
         print(f"   价差变化: {entry_spread:.6f} -> {current_spread:.6f} (变化: {spread_change:.6f})")
 
