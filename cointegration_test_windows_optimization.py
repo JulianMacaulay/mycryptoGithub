@@ -352,11 +352,11 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
             'spread': spread
         }
         if verbose:
-            print(f"\n✓ 协整检验通过！{symbol1} 和 {symbol2} 存在协整关系")
+            print(f"\n 协整检验通过！{symbol1} 和 {symbol2} 存在协整关系")
             print(f"  价差是平稳的（I(0)），ADF P值: {spread_adf['p_value']:.6f}")
     else:
         if verbose:
-            print(f"\n✗ 协整检验未通过")
+            print(f"\n 协整检验未通过")
             print(f"  价差不平稳，ADF P值: {spread_adf['p_value']:.6f if spread_adf else 'N/A'}")
 
     return results
@@ -1824,7 +1824,7 @@ class ParameterOptimizer:
                 if result['score'] > best_score:
                     best_score = result['score']
                     best_result = result
-                    print(f"  ✓ 找到更好的参数组合 #{i+1}: 得分={best_score:.4f}")
+                    print(f"   找到更好的参数组合 #{i+1}: 得分={best_score:.4f}")
             
             print(f"\n粗粒度搜索完成，最佳得分: {best_score:.4f}")
         
@@ -1871,7 +1871,7 @@ class ParameterOptimizer:
                 if result['score'] > best_score:
                     best_score = result['score']
                     best_result = result
-                    print(f"  ✓ 找到更好的参数组合 #{i+1}: 得分={best_score:.4f}")
+                    print(f"   找到更好的参数组合 #{i+1}: 得分={best_score:.4f}")
             
             print(f"\n细粒度搜索完成，最终最佳得分: {best_score:.4f}")
         
@@ -1881,10 +1881,10 @@ class ParameterOptimizer:
             stability = self.test_parameter_stability(best_result['params'])
             
             if stability['is_stable']:
-                print(f"✓ 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             else:
-                print(f"⚠ 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             
             best_result['stability'] = stability
@@ -1954,7 +1954,7 @@ class ParameterOptimizer:
             if result['score'] > best_score:
                 best_score = result['score']
                 best_result = result
-                print(f"  ✓ 迭代 {i+1}/{n_iter}: 找到更好的参数，得分={best_score:.4f}")
+                print(f"   迭代 {i+1}/{n_iter}: 找到更好的参数，得分={best_score:.4f}")
         
         # 稳定性测试
         if self.stability_test and best_result:
@@ -1962,10 +1962,10 @@ class ParameterOptimizer:
             stability = self.test_parameter_stability(best_result['params'])
             
             if stability['is_stable']:
-                print(f"✓ 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             else:
-                print(f"⚠ 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             
             best_result['stability'] = stability
@@ -2071,10 +2071,10 @@ class ParameterOptimizer:
             stability = self.test_parameter_stability(best_params)
             
             if stability['is_stable']:
-                print(f"✓ 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             else:
-                print(f"⚠ 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                print(f" 参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
                       f"下降比例={stability['score_drop_ratio']:.3f})")
             
             best_result['stability'] = stability
