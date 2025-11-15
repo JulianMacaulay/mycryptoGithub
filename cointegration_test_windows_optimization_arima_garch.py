@@ -64,6 +64,14 @@ except ImportError:
     GARCH_AVAILABLE = False
     print("警告: arch未安装，GARCH功能将不可用。可以使用: pip install arch")
 
+# 导入Z-score策略
+try:
+    from strategies import TraditionalZScoreStrategy, ArimaGarchZScoreStrategy, BaseZScoreStrategy
+    STRATEGIES_AVAILABLE = True
+except ImportError:
+    STRATEGIES_AVAILABLE = False
+    print("警告: 策略模块导入失败，将使用内置方法")
+
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -677,6 +685,98 @@ def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.5):
             return []
 
 
+def select_z_score_strategy():
+    """
+    选择Z-score计算策略
+    
+    Returns:
+        BaseZScoreStrategy: 选择的策略对象，如果失败返回None
+    """
+    if not STRATEGIES_AVAILABLE:
+        print("警告: 策略模块不可用，将使用传统方法")
+        return None
+    
+    print("\n" + "=" * 60)
+    print("选择Z-score计算策略")
+    print("=" * 60)
+    print("请选择Z-score计算策略:")
+    print("  1. 传统方法（均值和标准差）")
+    
+    # 检查ARIMA-GARCH是否可用
+    if ARIMA_AVAILABLE and GARCH_AVAILABLE:
+        print("  2. ARIMA-GARCH模型")
+        max_choice = 2
+    else:
+        print("  2. ARIMA-GARCH模型（不可用：缺少必要的库）")
+        max_choice = 1
+    
+    print("  0. 退出程序")
+    
+    while True:
+        try:
+            choice = input(f"请选择 (0-{max_choice}): ").strip()
+            
+            if choice == '0':
+                return None
+            
+            if choice == '1':
+                strategy = TraditionalZScoreStrategy()
+                print(f"已选择: {strategy.get_strategy_description()}")
+                return strategy
+            
+            if choice == '2' and ARIMA_AVAILABLE and GARCH_AVAILABLE:
+                # 询问ARIMA和GARCH参数
+                print("\n配置ARIMA-GARCH模型参数:")
+                print("  直接回车使用默认值: ARIMA(1,0,1), GARCH(1,1)")
+                
+                arima_input = input("ARIMA阶数 (p,d,q，格式如: 1,0,1): ").strip()
+                if arima_input:
+                    try:
+                        arima_parts = [int(x.strip()) for x in arima_input.split(',')]
+                        if len(arima_parts) == 3:
+                            arima_order = tuple(arima_parts)
+                        else:
+                            print("输入格式错误，使用默认值")
+                            arima_order = (1, 0, 1)
+                    except ValueError:
+                        print("输入格式错误，使用默认值")
+                        arima_order = (1, 0, 1)
+                else:
+                    arima_order = (1, 0, 1)
+                
+                garch_input = input("GARCH阶数 (p,q，格式如: 1,1): ").strip()
+                if garch_input:
+                    try:
+                        garch_parts = [int(x.strip()) for x in garch_input.split(',')]
+                        if len(garch_parts) == 2:
+                            garch_order = tuple(garch_parts)
+                        else:
+                            print("输入格式错误，使用默认值")
+                            garch_order = (1, 1)
+                    except ValueError:
+                        print("输入格式错误，使用默认值")
+                        garch_order = (1, 1)
+                else:
+                    garch_order = (1, 1)
+                
+                try:
+                    strategy = ArimaGarchZScoreStrategy(arima_order=arima_order, garch_order=garch_order)
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"ARIMA-GARCH策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+            
+            print(f"无效选择，请输入 0-{max_choice} 之间的数字")
+            
+        except KeyboardInterrupt:
+            print("\n用户取消选择")
+            return None
+        except Exception as e:
+            print(f"选择失败: {str(e)}，请重新选择")
+
+
 def configure_trading_parameters():
     """配置交易参数"""
     print("\n" + "=" * 60)
@@ -693,8 +793,7 @@ def configure_trading_parameters():
         'max_holding_hours': 168,
         'position_ratio': 0.5,
         'leverage': 5,
-        'trading_fee_rate': 0.000275,  # 交易手续费率 0.0275%
-        'use_arima_garch': False  # 新增：是否使用ARIMA-GARCH
+        'trading_fee_rate': 0.000275  # 交易手续费率 0.0275%
     }
 
     print("当前默认参数:")
@@ -708,7 +807,6 @@ def configure_trading_parameters():
         f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1 - default_params['position_ratio']) * 100:.1f}%作为安全垫)")
     print(f"  8. 杠杆: {default_params['leverage']}倍")
     print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
-    print(f"  10. 使用ARIMA-GARCH: {'是' if default_params['use_arima_garch'] else '否'}")
 
     print("\n是否要修改参数？")
     print("输入 'y' 修改参数，直接回车使用默认参数")
@@ -793,17 +891,6 @@ def configure_trading_parameters():
             except ValueError:
                 print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
 
-        # 使用ARIMA-GARCH
-        arima_garch_input = input(
-            f"使用ARIMA-GARCH (y/n, 默认: {'y' if default_params['use_arima_garch'] else 'n'}): ").strip().lower()
-        if arima_garch_input:
-            default_params['use_arima_garch'] = (arima_garch_input == 'y')
-        else:
-            # 如果用户没有输入，检查库是否可用
-            if not ARIMA_AVAILABLE or not GARCH_AVAILABLE:
-                print("警告: ARIMA或GARCH库不可用，将使用传统方法")
-                default_params['use_arima_garch'] = False
-
         print("\n修改后的参数:")
         print(f"  1. 回看期: {default_params['lookback_period']}")
         print(f"  2. Z-score开仓阈值: {default_params['z_threshold']}")
@@ -815,7 +902,6 @@ def configure_trading_parameters():
             f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1 - default_params['position_ratio']) * 100:.1f}%作为安全垫)")
         print(f"  8. 杠杆: {default_params['leverage']}倍")
         print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
-        print(f"  10. 使用ARIMA-GARCH: {'是' if default_params['use_arima_garch'] else '否'}")
 
     return default_params
 
@@ -823,12 +909,12 @@ def configure_trading_parameters():
 # ==================== 高级交易流程代码 ====================
 
 class AdvancedCointegrationTrading:
-    """高级协整交易策略类（支持ARIMA-GARCH）"""
+    """高级协整交易策略类（支持策略模式）"""
 
     def __init__(self, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
                  take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
                  position_ratio=0.5, leverage=5, trading_fee_rate=0.000275,
-                 use_arima_garch=False, arima_order=(1, 0, 1), garch_order=(1, 1)):
+                 z_score_strategy=None, use_arima_garch=False, arima_order=(1, 0, 1), garch_order=(1, 1)):
         """
         初始化高级协整交易策略
 
@@ -842,9 +928,10 @@ class AdvancedCointegrationTrading:
             position_ratio: 仓位比例（默认0.5，即使用50%资金，留50%作为安全垫）
             leverage: 杠杆倍数
             trading_fee_rate: 交易手续费率（默认0.0275%，即0.000275）
-            use_arima_garch: 是否使用ARIMA-GARCH模型
-            arima_order: ARIMA模型阶数 (p, d, q)
-            garch_order: GARCH模型阶数 (p, q)
+            z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例）
+            use_arima_garch: 是否使用ARIMA-GARCH模型（向后兼容，如果提供了z_score_strategy则忽略此参数）
+            arima_order: ARIMA模型阶数 (p, d, q)（向后兼容）
+            garch_order: GARCH模型阶数 (p, q)（向后兼容）
         """
         self.lookback_period = lookback_period
         self.z_threshold = z_threshold
@@ -855,14 +942,32 @@ class AdvancedCointegrationTrading:
         self.position_ratio = position_ratio
         self.leverage = leverage
         self.trading_fee_rate = trading_fee_rate  # 交易手续费率（0.0275% = 0.000275）
-        self.use_arima_garch = use_arima_garch and ARIMA_AVAILABLE and GARCH_AVAILABLE
-        self.arima_order = arima_order
-        self.garch_order = garch_order
         self.positions = {}  # 当前持仓
         self.trades = []  # 交易记录
 
-        # 存储ARIMA-GARCH模型（用于缓存）
-        self._arima_garch_models = {}
+        # 设置Z-score策略
+        if z_score_strategy is not None:
+            # 使用提供的策略对象
+            self.z_score_strategy = z_score_strategy
+            self.use_arima_garch = isinstance(z_score_strategy, ArimaGarchZScoreStrategy) if STRATEGIES_AVAILABLE else False
+        elif use_arima_garch and STRATEGIES_AVAILABLE and ARIMA_AVAILABLE and GARCH_AVAILABLE:
+            # 向后兼容：使用ARIMA-GARCH策略
+            try:
+                self.z_score_strategy = ArimaGarchZScoreStrategy(arima_order=arima_order, garch_order=garch_order)
+                self.use_arima_garch = True
+            except Exception as e:
+                print(f"警告: ARIMA-GARCH策略初始化失败: {str(e)}，使用传统策略")
+                self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+                self.use_arima_garch = False
+        else:
+            # 使用传统策略
+            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+            self.use_arima_garch = False
+        
+        # 向后兼容：保留旧属性
+        self.arima_order = arima_order
+        self.garch_order = garch_order
+        self._arima_garch_models = {}  # 保留以兼容旧代码
 
     def calculate_current_spread(self, price1, price2, hedge_ratio):
         """计算当前价差（原序列）"""
@@ -915,7 +1020,7 @@ class AdvancedCointegrationTrading:
 
     def calculate_z_score(self, current_spread, historical_spreads):
         """
-        计算当前Z-score（传统方法或ARIMA-GARCH方法）
+        计算当前Z-score（使用策略对象）
 
         Args:
             current_spread: 当前价差
@@ -924,13 +1029,18 @@ class AdvancedCointegrationTrading:
         Returns:
             float: Z-score值
         """
+        # 如果使用了策略对象，调用策略的方法
+        if self.z_score_strategy is not None:
+            return self.z_score_strategy.calculate_z_score(current_spread, historical_spreads)
+        
+        # 向后兼容：如果没有策略对象，使用旧方法
         if self.use_arima_garch:
             return self.calculate_z_score_with_arima_garch(current_spread, historical_spreads)
         else:
             return self.calculate_z_score_traditional(current_spread, historical_spreads)
 
     def calculate_z_score_traditional(self, current_spread, historical_spreads):
-        """计算当前Z-score（传统方法：使用均值和标准差）"""
+        """计算当前Z-score（传统方法：使用均值和标准差）- 向后兼容方法"""
         if len(historical_spreads) < 2:
             return 0
 
@@ -1756,8 +1866,8 @@ def test_rolling_window_cointegration_trading(csv_file_path):
         print("未选择任何币对，无法进行交易")
         return
 
-    # 5. 循环测试币对
-    print("\n5. 币对测试循环")
+    # 5. 策略选择和回测循环
+    print("\n5. 策略选择和回测循环")
     test_count = 0
 
     while True:
@@ -1766,9 +1876,9 @@ def test_rolling_window_cointegration_trading(csv_file_path):
         print(f"第 {test_count} 次测试")
         print(f"{'=' * 80}")
 
-        continue_choice = input("是否继续测试？(y/n): ").strip().lower()
-
-        if continue_choice != 'y':
+        # 选择Z-score计算策略
+        z_score_strategy = select_z_score_strategy()
+        if z_score_strategy is None:
             print("测试结束，退出程序")
             break
 
@@ -1788,6 +1898,7 @@ def test_rolling_window_cointegration_trading(csv_file_path):
 
         # 8. 执行交易回测
         print(f"\n第 {test_count} 次测试 - 执行交易回测")
+        print(f"使用的策略: {z_score_strategy.get_strategy_description()}")
         trading_strategy = AdvancedCointegrationTrading(
             lookback_period=trading_params['lookback_period'],
             z_threshold=trading_params['z_threshold'],
@@ -1798,7 +1909,7 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             position_ratio=trading_params['position_ratio'],
             leverage=trading_params['leverage'],
             trading_fee_rate=trading_params.get('trading_fee_rate', 0.000275),
-            use_arima_garch=trading_params.get('use_arima_garch', False)
+            z_score_strategy=z_score_strategy  # 使用策略对象
         )
 
         results = trading_strategy.backtest_cointegration_trading(
@@ -1832,6 +1943,16 @@ def test_rolling_window_cointegration_trading(csv_file_path):
 
         print(f"\n第 {test_count} 次测试完成")
         print("=" * 80)
+        
+        # 询问是否继续
+        print("\n请选择下一步操作:")
+        print("  1. 继续测试（重新选择策略）")
+        print("  0. 退出程序")
+        continue_choice = input("请选择 (0/1): ").strip()
+        
+        if continue_choice != '1':
+            print("测试结束，退出程序")
+            break
 
     print("\n" + "=" * 80)
     print("滚动窗口协整分析+交易测试完成")
@@ -1852,7 +1973,7 @@ class ParameterOptimizer:
     """
     
     def __init__(self, data, selected_pairs, initial_capital=10000, 
-                 objective='sharpe_ratio', stability_test=True):
+                 objective='sharpe_ratio', stability_test=True, z_score_strategy=None):
         """
         初始化参数优化器
         
@@ -1862,6 +1983,7 @@ class ParameterOptimizer:
             initial_capital: 初始资金
             objective: 优化目标 ('sharpe_ratio', 'return', 'return_drawdown_ratio')
             stability_test: 是否进行稳定性测试（过拟合检测）
+            z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例）
         """
         self.data = data
         self.selected_pairs = selected_pairs
@@ -1869,7 +1991,7 @@ class ParameterOptimizer:
         self.objective = objective
         self.stability_test = stability_test
         
-        # 定义参数搜索空间（注意：use_arima_garch不在优化范围内，需要单独设置）
+        # 定义参数搜索空间（注意：z_score_strategy不在优化范围内，需要单独设置）
         self.param_space = {
             'lookback_period': {'type': 'int', 'coarse': [30, 60, 90, 120], 'fine_step': 10},
             'z_threshold': {'type': 'float', 'coarse': [1.0, 1.5, 2.0, 2.5, 3.0], 'fine_step': 0.1},
@@ -1885,11 +2007,28 @@ class ParameterOptimizer:
         self.evaluation_history = []
         self.best_params = None
         self.best_score = float('-inf')
-        self.use_arima_garch = False  # 优化器级别的ARIMA-GARCH开关
         
+        # 设置Z-score策略
+        if z_score_strategy is not None:
+            self.z_score_strategy = z_score_strategy
+        else:
+            # 默认使用传统策略
+            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+        
+    def set_z_score_strategy(self, z_score_strategy):
+        """设置Z-score计算策略"""
+        self.z_score_strategy = z_score_strategy
+    
     def set_use_arima_garch(self, use_arima_garch):
-        """设置是否使用ARIMA-GARCH"""
-        self.use_arima_garch = use_arima_garch and ARIMA_AVAILABLE and GARCH_AVAILABLE
+        """设置是否使用ARIMA-GARCH（向后兼容方法）"""
+        if use_arima_garch and STRATEGIES_AVAILABLE and ARIMA_AVAILABLE and GARCH_AVAILABLE:
+            try:
+                self.z_score_strategy = ArimaGarchZScoreStrategy()
+            except Exception as e:
+                print(f"警告: ARIMA-GARCH策略初始化失败: {str(e)}，使用传统策略")
+                self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+        else:
+            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
         
     def evaluate_params(self, params: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
         """
@@ -1903,7 +2042,7 @@ class ParameterOptimizer:
             评估结果字典
         """
         try:
-            # 创建策略实例
+            # 创建策略实例（使用策略对象）
             strategy = AdvancedCointegrationTrading(
                 lookback_period=params['lookback_period'],
                 z_threshold=params['z_threshold'],
@@ -1914,7 +2053,7 @@ class ParameterOptimizer:
                 position_ratio=params['position_ratio'],
                 leverage=params['leverage'],
                 trading_fee_rate=params.get('trading_fee_rate', 0.000275),
-                use_arima_garch=self.use_arima_garch
+                z_score_strategy=self.z_score_strategy  # 使用策略对象
             )
             
             # 执行回测（不显示图表和详细输出）
@@ -2069,8 +2208,8 @@ class ParameterOptimizer:
         """
         print("\n" + "=" * 80)
         print("开始网格搜索优化")
-        if self.use_arima_garch:
-            print("（使用ARIMA-GARCH模型）")
+        if self.z_score_strategy:
+            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
         print("=" * 80)
         
         best_result = None
@@ -2192,8 +2331,8 @@ class ParameterOptimizer:
         """
         print("\n" + "=" * 80)
         print("开始随机搜索优化")
-        if self.use_arima_garch:
-            print("（使用ARIMA-GARCH模型）")
+        if self.z_score_strategy:
+            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
         print("=" * 80)
         print(f"迭代次数: {n_iter}")
         
@@ -2279,8 +2418,8 @@ class ParameterOptimizer:
         
         print("\n" + "=" * 80)
         print("开始贝叶斯优化")
-        if self.use_arima_garch:
-            print("（使用ARIMA-GARCH模型）")
+        if self.z_score_strategy:
+            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
         print("=" * 80)
         print(f"评估次数: {n_calls}")
         
@@ -2486,14 +2625,12 @@ def test_parameter_optimization(csv_file_path):
         print("未选择任何币对，无法进行优化")
         return
     
-    # 5. 选择是否使用ARIMA-GARCH
-    print("\n5. 选择是否使用ARIMA-GARCH")
-    if ARIMA_AVAILABLE and GARCH_AVAILABLE:
-        use_arima_garch_input = input("是否使用ARIMA-GARCH模型？(y/n, 默认n): ").strip().lower()
-        use_arima_garch = (use_arima_garch_input == 'y')
-    else:
-        print("警告: ARIMA或GARCH库不可用，将使用传统方法")
-        use_arima_garch = False
+    # 5. 选择Z-score计算策略
+    print("\n5. 选择Z-score计算策略")
+    z_score_strategy = select_z_score_strategy()
+    if z_score_strategy is None:
+        print("未选择策略，退出优化")
+        return
     
     # 6. 选择优化方法
     print("\n6. 选择优化方法")
@@ -2530,15 +2667,16 @@ def test_parameter_optimization(csv_file_path):
     objective = objective_map.get(objective_choice, 'sharpe_ratio')
     
     # 8. 创建优化器
-    print(f"\n8. 创建优化器 (方法={method}, 目标={objective}, ARIMA-GARCH={'是' if use_arima_garch else '否'})")
+    strategy_name = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
+    print(f"\n8. 创建优化器 (方法={method}, 目标={objective}, 策略={strategy_name})")
     optimizer = ParameterOptimizer(
         data=data,
         selected_pairs=selected_pairs,
         initial_capital=10000,
         objective=objective,
-        stability_test=True
+        stability_test=True,
+        z_score_strategy=z_score_strategy  # 传入策略对象
     )
-    optimizer.set_use_arima_garch(use_arima_garch)
     
     # 9. 执行优化
     print(f"\n9. 执行优化...")
@@ -2567,7 +2705,8 @@ def test_parameter_optimization(csv_file_path):
     print(f"\n最佳参数:")
     for param_name, param_value in result['best_params'].items():
         print(f"  {param_name}: {param_value}")
-    print(f"  使用ARIMA-GARCH: {'是' if use_arima_garch else '否'}")
+    strategy_desc = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
+    print(f"  使用的策略: {strategy_desc}")
     
     print(f"\n最佳得分: {result['best_score']:.4f}")
     if result['best_result']:
