@@ -2049,9 +2049,9 @@ class ParameterOptimizer:
                 z_exit_threshold=params['z_exit_threshold'],
                 take_profit_pct=params['take_profit_pct'],
                 stop_loss_pct=params['stop_loss_pct'],
-                max_holding_hours=params['max_holding_hours'],
-                position_ratio=params['position_ratio'],
-                leverage=params['leverage'],
+                max_holding_hours=params.get('max_holding_hours',168),
+                position_ratio=params.get('position_ratio',0.5),
+                leverage=params.get('leverage',5),
                 trading_fee_rate=params.get('trading_fee_rate', 0.000275),
                 z_score_strategy=self.z_score_strategy  # 使用策略对象
             )
