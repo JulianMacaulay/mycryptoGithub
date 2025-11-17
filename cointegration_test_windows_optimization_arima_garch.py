@@ -1439,9 +1439,41 @@ class AdvancedCointegrationTrading:
         avg_loss = abs(np.mean([t['pnl'] for t in losing_trades])) if losing_trades else 0
         profit_loss_ratio = avg_profit / avg_loss if avg_loss > 0 else float('inf')
 
-        # 计算夏普比率
+        # 自动检测数据频率并计算年化系数
+        periods_per_year = 252  # 默认日线
+        if len(capital_curve) >= 2:
+            try:
+                # 获取时间戳
+                timestamps = [point['timestamp'] for point in capital_curve]
+                # 计算前10个时间间隔的平均值（如果数据点少于10个，则使用全部）
+                sample_size = min(10, len(timestamps) - 1)
+                time_diffs = []
+                for i in range(1, sample_size + 1):
+                    if isinstance(timestamps[i], pd.Timestamp) and isinstance(timestamps[i-1], pd.Timestamp):
+                        diff = (timestamps[i] - timestamps[i-1]).total_seconds() / 3600  # 转换为小时
+                        time_diffs.append(diff)
+                
+                if time_diffs:
+                    avg_hours_per_point = np.mean(time_diffs)
+                    
+                    # 根据平均时间间隔判断数据频率
+                    if avg_hours_per_point < 0.1:  # 小于6分钟，可能是分钟线
+                        periods_per_year = 252 * 24 * 60  # 分钟线（假设1分钟）
+                    elif avg_hours_per_point < 2:  # 小于2小时，可能是小时线
+                        periods_per_year = 252 * 24  # 小时线
+                    elif avg_hours_per_point < 12:  # 小于12小时，可能是4小时线
+                        periods_per_year = 252 * 6  # 4小时线
+                    elif avg_hours_per_point < 24:  # 小于24小时，可能是日线
+                        periods_per_year = 252  # 日线
+                    else:  # 大于24小时，可能是周线或更长
+                        periods_per_year = 52  # 周线
+            except Exception as e:
+                # 如果检测失败，使用默认值（日线）
+                periods_per_year = 252
+
+        # 计算夏普比率（使用自动检测的年化系数）
         if len(returns) > 0 and np.std(returns) > 0:
-            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)  # 年化
+            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(periods_per_year)
         else:
             sharpe_ratio = 0
 
@@ -1998,9 +2030,9 @@ class ParameterOptimizer:
             'z_exit_threshold': {'type': 'float', 'coarse': [0.3, 0.5, 0.7, 0.9], 'fine_step': 0.1},
             'take_profit_pct': {'type': 'float', 'coarse': [0.05, 0.10, 0.15, 0.20, 0.25], 'fine_step': 0.02},
             'stop_loss_pct': {'type': 'float', 'coarse': [0.05, 0.08, 0.10, 0.12, 0.15], 'fine_step': 0.01},
-            'max_holding_hours': {'type': 'int', 'coarse': [72, 120, 168, 240], 'fine_step': 24},
-            'position_ratio': {'type': 'float', 'coarse': [0.3, 0.5, 0.7, 0.9], 'fine_step': 0.1},
-            'leverage': {'type': 'int', 'coarse': [1, 3, 5, 10], 'fine_step': 1}
+            # 'max_holding_hours': {'type': 'int', 'coarse': [72, 120, 168, 240], 'fine_step': 24},
+            # 'position_ratio': {'type': 'float', 'coarse': [0.3, 0.5, 0.7, 0.9], 'fine_step': 0.1},
+            # 'leverage': {'type': 'int', 'coarse': [1, 3, 5, 10], 'fine_step': 1}
         }
         
         # 存储所有评估结果
@@ -2067,9 +2099,11 @@ class ParameterOptimizer:
             # 计算风险指标
             risk_metrics = strategy.calculate_risk_metrics(results['capital_curve'])
             
-            # 计算最终收益
+            # 计算最终收益（使用投入资金作为基准，与回测结果保持一致）
             final_capital = results['capital_curve'][-1]['capital'] if results['capital_curve'] else self.initial_capital
-            total_return = (final_capital - self.initial_capital) / self.initial_capital
+            position_ratio = params.get('position_ratio', 0.5)
+            initial_invested_capital = self.initial_capital * position_ratio
+            total_return = (final_capital - initial_invested_capital) / initial_invested_capital
             
             # 根据目标函数计算得分
             if self.objective == 'sharpe_ratio':
