@@ -417,8 +417,13 @@ def enhanced_find_cointegrated_pairs(data, max_diff_order=2):
     return all_candidates
 
 
-def configure_trading_parameters():
-    """配置交易参数"""
+def configure_trading_parameters(backtest_mode='original'):
+    """
+    配置交易参数
+    
+    Args:
+        backtest_mode: 回测模式，'original' 或 'with_fees'
+    """
     print("\n" + "=" * 60)
     print("交易参数配置")
     print("=" * 60)
@@ -443,9 +448,15 @@ def configure_trading_parameters():
     print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
     print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
     print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
-    print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}%")
-    print(f"  8. 杠杆: {default_params['leverage']}倍")
-    print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+    
+    # 根据回测模式显示不同的参数
+    if backtest_mode == 'original':
+        print(f"  7. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+        print("\n注意: 原版模式使用固定仓位（symbol1=±1.0），不需要配置仓位比例和杠杆")
+    else:
+        print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}%")
+        print(f"  8. 杠杆: {default_params['leverage']}倍")
+        print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
 
     print("\n是否要修改参数？")
     print("输入 'y' 修改参数，直接回车使用默认参数")
@@ -503,29 +514,37 @@ def configure_trading_parameters():
             except ValueError:
                 print(f"输入无效，使用默认值: {default_params['max_holding_hours']}")
 
-        # 仓位比例
-        position_ratio_input = input(f"仓位比例 (默认: {default_params['position_ratio'] * 100:.1f}%): ").strip()
-        if position_ratio_input:
-            try:
-                default_params['position_ratio'] = float(position_ratio_input) / 100
-            except ValueError:
-                print(f"输入无效，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
+        # 根据回测模式配置不同的参数
+        if backtest_mode == 'original':
+            # 原版模式：只配置手续费率
+            fee_rate_input = input(f"交易手续费率 (默认: {default_params['trading_fee_rate'] * 100:.4f}%): ").strip()
+            if fee_rate_input:
+                try:
+                    default_params['trading_fee_rate'] = float(fee_rate_input) / 100
+                except ValueError:
+                    print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
+        else:
+            # 新版模式：配置仓位比例、杠杆和手续费率
+            position_ratio_input = input(f"仓位比例 (默认: {default_params['position_ratio'] * 100:.1f}%): ").strip()
+            if position_ratio_input:
+                try:
+                    default_params['position_ratio'] = float(position_ratio_input) / 100
+                except ValueError:
+                    print(f"输入无效，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
 
-        # 杠杆
-        leverage_input = input(f"杠杆倍数 (默认: {default_params['leverage']}): ").strip()
-        if leverage_input:
-            try:
-                default_params['leverage'] = int(leverage_input)
-            except ValueError:
-                print(f"输入无效，使用默认值: {default_params['leverage']}")
+            leverage_input = input(f"杠杆倍数 (默认: {default_params['leverage']}): ").strip()
+            if leverage_input:
+                try:
+                    default_params['leverage'] = int(leverage_input)
+                except ValueError:
+                    print(f"输入无效，使用默认值: {default_params['leverage']}")
 
-        # 交易手续费率
-        fee_rate_input = input(f"交易手续费率 (默认: {default_params['trading_fee_rate'] * 100:.4f}%): ").strip()
-        if fee_rate_input:
-            try:
-                default_params['trading_fee_rate'] = float(fee_rate_input) / 100
-            except ValueError:
-                print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
+            fee_rate_input = input(f"交易手续费率 (默认: {default_params['trading_fee_rate'] * 100:.4f}%): ").strip()
+            if fee_rate_input:
+                try:
+                    default_params['trading_fee_rate'] = float(fee_rate_input) / 100
+                except ValueError:
+                    print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
 
         print("\n修改后的参数:")
         print(f"  1. 回看期: {default_params['lookback_period']}")
@@ -534,9 +553,14 @@ def configure_trading_parameters():
         print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
         print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
         print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
-        print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}%")
-        print(f"  8. 杠杆: {default_params['leverage']}倍")
-        print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+        
+        # 根据回测模式显示不同的参数
+        if backtest_mode == 'original':
+            print(f"  7. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+        else:
+            print(f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}%")
+            print(f"  8. 杠杆: {default_params['leverage']}倍")
+            print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
 
     return default_params
 
@@ -847,7 +871,10 @@ class AdvancedCointegrationTrading:
         entry_price1 = position['entry_prices'][symbol1]
         entry_price2 = position['entry_prices'][symbol2]
         
-        # 根据回测模式选择盈亏计算方式
+        # 获取价差类型（用于判断盈亏计算方式）
+        diff_order = position.get('signal', {}).get('diff_order', 0)
+        
+        # 根据回测模式和价差类型选择盈亏计算方式
         if self.backtest_mode == 'original':
             # 原版模式：基于价差变化计算盈亏
             entry_spread = position['entry_spread']
@@ -859,17 +886,29 @@ class AdvancedCointegrationTrading:
                 # 做多价差，价差增加时盈利
                 total_pnl = spread_change
         else:
-            # 新版模式：基于持仓价值变化计算盈亏
-            if position['signal']['action'] == 'SHORT_LONG':
-                # 做空symbol1，做多symbol2
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
-            else:  # LONG_SHORT
-                # 做多symbol1，做空symbol2
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
+            # 新版模式：根据价差类型选择盈亏计算方式
+            if diff_order > 0:
+                # 如果使用差分价差，基于价差变化计算盈亏（与原版模式一致）
+                entry_spread = position['entry_spread']
+                spread_change = current_spread - entry_spread
+                if position['signal']['action'] == 'SHORT_LONG':
+                    # 做空价差，价差减少时盈利
+                    total_pnl = -spread_change
+                else:  # LONG_SHORT
+                    # 做多价差，价差增加时盈利
+                    total_pnl = spread_change
+            else:
+                # 如果使用原始价差，基于持仓价值变化计算盈亏
+                if position['signal']['action'] == 'SHORT_LONG':
+                    # 做空symbol1，做多symbol2
+                    pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                    pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                    total_pnl = pnl_symbol1 + pnl_symbol2
+                else:  # LONG_SHORT
+                    # 做多symbol1，做空symbol2
+                    pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                    pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                    total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算投入资金（基于原始价格）
         entry_value = abs(position['symbol1_size'] * entry_price1) + \
@@ -920,7 +959,10 @@ class AdvancedCointegrationTrading:
         entry_price1 = position['entry_prices'][symbol1]
         entry_price2 = position['entry_prices'][symbol2]
 
-        # 根据回测模式选择盈亏计算方式
+        # 获取价差类型（用于判断盈亏计算方式）
+        diff_order = position.get('signal', {}).get('diff_order', 0)
+        
+        # 根据回测模式和价差类型选择盈亏计算方式
         if self.backtest_mode == 'original':
             # 原版模式：基于价差变化计算盈亏
             entry_spread = position['entry_spread']
@@ -932,15 +974,27 @@ class AdvancedCointegrationTrading:
                 # 做多价差，价差增加时盈利
                 total_pnl = spread_change
         else:
-            # 新版模式：基于持仓价值变化计算盈亏
-            if position['signal']['action'] == 'SHORT_LONG':
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
-            else:  # LONG_SHORT
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
+            # 新版模式：根据价差类型选择盈亏计算方式
+            if diff_order > 0:
+                # 如果使用差分价差，基于价差变化计算盈亏（与原版模式一致）
+                entry_spread = position['entry_spread']
+                spread_change = current_spread - entry_spread
+                if position['signal']['action'] == 'SHORT_LONG':
+                    # 做空价差，价差减少时盈利
+                    total_pnl = -spread_change
+                else:  # LONG_SHORT
+                    # 做多价差，价差增加时盈利
+                    total_pnl = spread_change
+            else:
+                # 如果使用原始价差，基于持仓价值变化计算盈亏
+                if position['signal']['action'] == 'SHORT_LONG':
+                    pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                    pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                    total_pnl = pnl_symbol1 + pnl_symbol2
+                else:  # LONG_SHORT
+                    pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                    pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                    total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算平仓手续费（两种模式都计算）
         close_fee = (abs(position['symbol1_size']) * price1 + abs(
@@ -1485,7 +1539,7 @@ def test_advanced_cointegration_trading(csv_file_path):
 
         # 6. 配置交易参数
         print(f"\n第 {test_count} 次测试 - 配置交易参数")
-        trading_params = configure_trading_parameters()
+        trading_params = configure_trading_parameters(backtest_mode=backtest_mode)
 
         # 7. 执行交易回测
         print(f"\n第 {test_count} 次测试 - 执行交易回测")
