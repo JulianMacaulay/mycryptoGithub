@@ -7,7 +7,7 @@
 主要差异：
 1. 使用 position_ratio 和 leverage 进行资金管理
 2. 使用动态仓位计算（基于可用资金）
-3. 基于持仓价值变化计算盈亏（而非价差变化）
+3. 统一使用基于持仓价值变化计算盈亏（无论原版模式还是新版模式，无论是否使用差分价差）
 4. 包含手续费计算和扣除
 """
 
@@ -638,8 +638,9 @@ class AdvancedCointegrationTrading:
             leverage: 杠杆倍数
             trading_fee_rate: 交易手续费率（默认0.0275%，即0.000275）
             backtest_mode: 回测模式
-                - 'original': 原版模式（固定仓位±1.0，基于价差变化计算盈亏）
+                - 'original': 原版模式（固定仓位±1.0，基于持仓价值变化计算盈亏）
                 - 'with_fees': 新版模式（动态仓位，基于持仓价值变化计算盈亏）
+                注意：两种模式都统一使用基于持仓价值变化计算盈亏，无论是否使用差分价差
         """
         self.lookback_period = lookback_period
         self.z_threshold = z_threshold
@@ -847,29 +848,18 @@ class AdvancedCointegrationTrading:
         entry_price1 = position['entry_prices'][symbol1]
         entry_price2 = position['entry_prices'][symbol2]
         
-        # 根据回测模式选择盈亏计算方式
-        if self.backtest_mode == 'original':
-            # 原版模式：基于价差变化计算盈亏
-            entry_spread = position['entry_spread']
-            spread_change = current_spread - entry_spread
-            if position['signal']['action'] == 'SHORT_LONG':
-                # 做空价差，价差减少时盈利
-                total_pnl = -spread_change
-            else:  # LONG_SHORT
-                # 做多价差，价差增加时盈利
-                total_pnl = spread_change
-        else:
-            # 新版模式：基于持仓价值变化计算盈亏
-            if position['signal']['action'] == 'SHORT_LONG':
-                # 做空symbol1，做多symbol2
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
-            else:  # LONG_SHORT
-                # 做多symbol1，做空symbol2
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
+        # 统一使用基于持仓价值变化计算盈亏（无论原版模式还是新版模式，无论是否使用差分价差）
+        # 因为实际交易的是价格本身，盈亏来自价格变化，而不是价差变化
+        if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算投入资金（基于原始价格）
         entry_value = abs(position['symbol1_size'] * entry_price1) + \
@@ -920,27 +910,18 @@ class AdvancedCointegrationTrading:
         entry_price1 = position['entry_prices'][symbol1]
         entry_price2 = position['entry_prices'][symbol2]
 
-        # 根据回测模式选择盈亏计算方式
-        if self.backtest_mode == 'original':
-            # 原版模式：基于价差变化计算盈亏
-            entry_spread = position['entry_spread']
-            spread_change = current_spread - entry_spread
-            if position['signal']['action'] == 'SHORT_LONG':
-                # 做空价差，价差减少时盈利
-                total_pnl = -spread_change
-            else:  # LONG_SHORT
-                # 做多价差，价差增加时盈利
-                total_pnl = spread_change
-        else:
-            # 新版模式：基于持仓价值变化计算盈亏
-            if position['signal']['action'] == 'SHORT_LONG':
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
-            else:  # LONG_SHORT
-                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
-                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
-                total_pnl = pnl_symbol1 + pnl_symbol2
+        # 统一使用基于持仓价值变化计算盈亏（无论原版模式还是新版模式，无论是否使用差分价差）
+        # 因为实际交易的是价格本身，盈亏来自价格变化，而不是价差变化
+        if position['signal']['action'] == 'SHORT_LONG':
+            # 做空symbol1，做多symbol2
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
+        else:  # LONG_SHORT
+            # 做多symbol1，做空symbol2
+            pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+            pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+            total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算平仓手续费（两种模式都计算）
         close_fee = (abs(position['symbol1_size']) * price1 + abs(
