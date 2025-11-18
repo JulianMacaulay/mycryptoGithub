@@ -622,7 +622,8 @@ class AdvancedCointegrationTrading:
 
     def __init__(self, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
                  take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
-                 position_ratio=0.5, leverage=5, trading_fee_rate=0.000275):
+                 position_ratio=0.5, leverage=5, trading_fee_rate=0.000275,
+                 backtest_mode='original'):
         """
         初始化高级协整交易策略
 
@@ -636,6 +637,9 @@ class AdvancedCointegrationTrading:
             position_ratio: 仓位比例（默认0.5，即使用50%资金，留50%作为安全垫）
             leverage: 杠杆倍数
             trading_fee_rate: 交易手续费率（默认0.0275%，即0.000275）
+            backtest_mode: 回测模式
+                - 'original': 原版模式（固定仓位±1.0，基于价差变化计算盈亏）
+                - 'with_fees': 新版模式（动态仓位，基于持仓价值变化计算盈亏）
         """
         self.lookback_period = lookback_period
         self.z_threshold = z_threshold
@@ -646,6 +650,7 @@ class AdvancedCointegrationTrading:
         self.position_ratio = position_ratio
         self.leverage = leverage
         self.trading_fee_rate = trading_fee_rate
+        self.backtest_mode = backtest_mode  # 'original' 或 'with_fees'
         self.positions = {}  # 当前持仓
         self.trades = []  # 交易记录
 
@@ -735,7 +740,7 @@ class AdvancedCointegrationTrading:
                 'diff_order': diff_order
             }
 
-    def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread, available_capital):
+    def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread, available_capital=None):
         """
         执行交易（基于可用资金计算仓位）
 
@@ -745,23 +750,39 @@ class AdvancedCointegrationTrading:
             signal: 交易信号
             timestamp: 时间戳
             current_spread: 当前价差
-            available_capital: 可用资金
+            available_capital: 可用资金（原版模式不需要）
         """
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         hedge_ratio = pair_info['hedge_ratio']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 使用Beta中性方法计算开仓数量
-        symbol1_size, symbol2_size, total_capital_used = self.calculate_position_size_beta_neutral(
-            available_capital, price1, price2, hedge_ratio, signal
-        )
-
-        if symbol1_size is None:
-            print(f"开仓失败: 可用资金不足或计算错误 (可用资金: {available_capital:.2f})")
-            return None
-
-        # 计算开仓手续费（基于交易金额）
-        open_fee = total_capital_used * self.trading_fee_rate
+        # 根据回测模式选择仓位计算方式
+        if self.backtest_mode == 'original':
+            # 原版模式：固定仓位
+            if signal['action'] == 'SHORT_LONG':
+                symbol1_size = -1.0  # 做空
+                symbol2_size = hedge_ratio  # 做多
+            elif signal['action'] == 'LONG_SHORT':
+                symbol1_size = 1.0  # 做多
+                symbol2_size = -hedge_ratio  # 做空
+            else:
+                return None
+            total_capital_used = abs(symbol1_size) * price1 + abs(symbol2_size) * price2
+            # 原版模式也计算手续费（基于固定仓位的交易金额）
+            open_fee = total_capital_used * self.trading_fee_rate
+        else:
+            # 新版模式：动态仓位
+            if available_capital is None:
+                print(f"开仓失败: 新版模式需要可用资金参数")
+                return None
+            symbol1_size, symbol2_size, total_capital_used = self.calculate_position_size_beta_neutral(
+                available_capital, price1, price2, hedge_ratio, signal
+            )
+            if symbol1_size is None:
+                print(f"开仓失败: 可用资金不足或计算错误 (可用资金: {available_capital:.2f})")
+                return None
+            # 计算开仓手续费（基于交易金额）
+            open_fee = total_capital_used * self.trading_fee_rate
 
         # 创建持仓记录
         position = {
@@ -807,7 +828,7 @@ class AdvancedCointegrationTrading:
         print(f"   价格: {symbol1}={price1:.2f}, {symbol2}={price2:.2f}")
         print(f"   价差: {current_spread:.6f}")
         print(f"   仓位: {symbol1}={position['symbol1_size']:.6f}, {symbol2}={position['symbol2_size']:.6f}")
-        print(f"   使用资金: {total_capital_used:.2f} / {available_capital:.2f}")
+        print(f"   使用资金: {total_capital_used} / {available_capital}")
         print(f"   开仓手续费: {open_fee:.4f}")
 
         return position
@@ -822,35 +843,43 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算实际盈亏（基于价差变化，与固定仓位模式等价）
-        # 原版使用：total_pnl = -spread_change 或 total_pnl = spread_change（绝对金额）
-        # 新版需要：total_pnl = position_size_multiplier * spread_change（保持等价）
-        entry_spread = position['entry_spread']
-        spread_change = current_spread - entry_spread
+        # 获取开仓价格（两种模式都需要）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
         
-        # 计算仓位倍数（相对于固定仓位±1.0的倍数）
-        # 固定仓位模式下：symbol1_size = ±1.0
-        # 动态仓位模式下：symbol1_size = ±symbol1_size_abs
-        # 仓位倍数 = abs(symbol1_size) / 1.0 = abs(symbol1_size)
-        position_size_multiplier = abs(position['symbol1_size'])
-        
-        # 根据交易方向计算盈亏（与固定仓位模式等价）
-        if position['signal']['action'] == 'SHORT_LONG':
-            # 做空价差，价差减少时盈利
-            total_pnl = -spread_change * position_size_multiplier
-        else:  # LONG_SHORT
-            # 做多价差，价差增加时盈利
-            total_pnl = spread_change * position_size_multiplier
+        # 根据回测模式选择盈亏计算方式
+        if self.backtest_mode == 'original':
+            # 原版模式：基于价差变化计算盈亏
+            entry_spread = position['entry_spread']
+            spread_change = current_spread - entry_spread
+            if position['signal']['action'] == 'SHORT_LONG':
+                # 做空价差，价差减少时盈利
+                total_pnl = -spread_change
+            else:  # LONG_SHORT
+                # 做多价差，价差增加时盈利
+                total_pnl = spread_change
+        else:
+            # 新版模式：基于持仓价值变化计算盈亏
+            if position['signal']['action'] == 'SHORT_LONG':
+                # 做空symbol1，做多symbol2
+                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                total_pnl = pnl_symbol1 + pnl_symbol2
+            else:  # LONG_SHORT
+                # 做多symbol1，做空symbol2
+                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                total_pnl = pnl_symbol1 + pnl_symbol2
 
         # 计算投入资金（基于原始价格）
         entry_value = abs(position['symbol1_size'] * entry_price1) + \
                       abs(position['symbol2_size'] * entry_price2)
 
         # 计算手续费（用于止盈止损判断）
+        # 两种模式都计算手续费
         close_fee = (abs(position['symbol1_size']) * price1 + abs(
             position['symbol2_size']) * price2) * self.trading_fee_rate
         open_fee = position.get('open_fee', 0)
-
         # 计算净盈亏（只扣除平仓手续费，因为开仓手续费已经在开仓时从capital中扣除了）
         net_pnl = total_pnl - close_fee
 
@@ -887,22 +916,33 @@ class AdvancedCointegrationTrading:
         symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
         price1, price2 = current_prices[symbol1], current_prices[symbol2]
 
-        # 计算最终盈亏（基于价差变化，与固定仓位模式等价）
-        entry_spread = position['entry_spread']
-        spread_change = current_spread - entry_spread
-        
-        # 计算仓位倍数（相对于固定仓位±1.0的倍数）
-        position_size_multiplier = abs(position['symbol1_size'])
-        
-        # 根据交易方向计算盈亏（与固定仓位模式等价）
-        if position['signal']['action'] == 'SHORT_LONG':
-            # 做空价差，价差减少时盈利
-            total_pnl = -spread_change * position_size_multiplier
-        else:  # LONG_SHORT
-            # 做多价差，价差增加时盈利
-            total_pnl = spread_change * position_size_multiplier
+        # 获取开仓价格（两种模式都需要，用于显示）
+        entry_price1 = position['entry_prices'][symbol1]
+        entry_price2 = position['entry_prices'][symbol2]
 
-        # 计算平仓手续费
+        # 根据回测模式选择盈亏计算方式
+        if self.backtest_mode == 'original':
+            # 原版模式：基于价差变化计算盈亏
+            entry_spread = position['entry_spread']
+            spread_change = current_spread - entry_spread
+            if position['signal']['action'] == 'SHORT_LONG':
+                # 做空价差，价差减少时盈利
+                total_pnl = -spread_change
+            else:  # LONG_SHORT
+                # 做多价差，价差增加时盈利
+                total_pnl = spread_change
+        else:
+            # 新版模式：基于持仓价值变化计算盈亏
+            if position['signal']['action'] == 'SHORT_LONG':
+                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                total_pnl = pnl_symbol1 + pnl_symbol2
+            else:  # LONG_SHORT
+                pnl_symbol1 = position['symbol1_size'] * (price1 - entry_price1)
+                pnl_symbol2 = position['symbol2_size'] * (price2 - entry_price2)
+                total_pnl = pnl_symbol1 + pnl_symbol2
+
+        # 计算平仓手续费（两种模式都计算）
         close_fee = (abs(position['symbol1_size']) * price1 + abs(
             position['symbol2_size']) * price2) * self.trading_fee_rate
 
@@ -910,7 +950,7 @@ class AdvancedCointegrationTrading:
         open_fee = position.get('open_fee', 0)
         total_fee = open_fee + close_fee
 
-        # 扣除手续费后的净盈亏
+        # 扣除手续费后的净盈亏（只扣除平仓手续费，因为开仓手续费已经在开仓时从capital中扣除了）
         net_pnl = total_pnl - close_fee
 
         # 计算价差变化（用于显示）
@@ -1089,13 +1129,18 @@ class AdvancedCointegrationTrading:
 
     def backtest_cointegration_trading(self, data, selected_pairs, initial_capital=10000):
         """回测协整交易策略（带手续费和动态仓位）"""
+        mode_name = "原版模式（固定仓位）" if self.backtest_mode == 'original' else "新版模式（动态仓位+手续费）"
         print("\n" + "=" * 60)
-        print("开始高级协整交易回测（带手续费和动态仓位）")
+        print(f"开始高级协整交易回测 - {mode_name}")
         print("=" * 60)
 
         # 初始化
-        # 确定投入资金：capital = initial_capital * position_ratio
-        capital = initial_capital * self.position_ratio
+        if self.backtest_mode == 'original':
+            # 原版模式：使用全部初始资金
+            capital = initial_capital
+        else:
+            # 新版模式：确定投入资金：capital = initial_capital * position_ratio
+            capital = initial_capital * self.position_ratio
         results = {
             'capital_curve': [],
             'trades': [],
@@ -1114,12 +1159,18 @@ class AdvancedCointegrationTrading:
         print(f"总数据点: {len(all_timestamps)}")
         print(f"选择的币对数量: {len(selected_pairs)}")
         print(f"策略参数:")
+        print(f"  回测模式: {mode_name}")
         print(f"  初始资金: {initial_capital:,.2f}")
-        print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
-        print(f"  投入资金: {capital:,.2f} (初始资金 × 仓位比例)")
-        print(f"  杠杆: {self.leverage:.1f}倍")
-        print(f"  可用资金: {capital * self.leverage:,.2f} (投入资金 × 杠杆)")
-        print(f"  交易手续费率: {self.trading_fee_rate * 100:.4f}%")
+        if self.backtest_mode == 'original':
+            print(f"  投入资金: {capital:,.2f} (使用全部初始资金)")
+            print(f"  仓位: 固定仓位（symbol1=±1.0）")
+            print(f"  交易手续费率: {self.trading_fee_rate * 100:.4f}%")
+        else:
+            print(f"  仓位比例: {self.position_ratio * 100:.1f}%")
+            print(f"  投入资金: {capital:,.2f} (初始资金 × 仓位比例)")
+            print(f"  杠杆: {self.leverage:.1f}倍")
+            print(f"  可用资金: {capital * self.leverage:,.2f} (投入资金 × 杠杆)")
+            print(f"  交易手续费率: {self.trading_fee_rate * 100:.4f}%")
         print(f"  Z-score开仓阈值: {self.z_threshold}")
         print(f"  Z-score平仓阈值: {self.z_exit_threshold}")
         print(f"  止盈百分比: {self.take_profit_pct * 100:.1f}%")
@@ -1266,14 +1317,23 @@ class AdvancedCointegrationTrading:
                     signal['z_score'] = current_z_score
 
                     if signal['action'] != 'HOLD':
-                        # 计算可用资金（只乘以杠杆，不再乘以position_ratio）
-                        available_capital = capital * self.leverage
-                        position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread,
-                                                      available_capital)
+                        if self.backtest_mode == 'original':
+                            # 原版模式：不需要可用资金参数
+                            position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread)
+                            if position:
+                                # 扣除开仓手续费（原版模式也扣除）
+                                open_fee = self.trades[-1].get('fee', 0)
+                                capital -= open_fee
+                        else:
+                            # 新版模式：计算可用资金（只乘以杠杆，不再乘以position_ratio）
+                            available_capital = capital * self.leverage
+                            position = self.execute_trade(pair_info, current_prices, signal, timestamp, current_spread,
+                                                          available_capital)
+                            if position:
+                                # 扣除开仓手续费
+                                open_fee = self.trades[-1].get('fee', 0)
+                                capital -= open_fee
                         if position:
-                            # 扣除开仓手续费
-                            open_fee = self.trades[-1].get('fee', 0)
-                            capital -= open_fee
                             results['trades'].append(self.trades[-1])
 
             # 记录资金曲线
@@ -1290,16 +1350,23 @@ class AdvancedCointegrationTrading:
         # 计算总手续费
         total_fees = sum([t.get('total_fee', 0) for t in results['trades'] if t.get('action') == 'CLOSE'])
 
-        # 计算收益率：基于投入资金（capital的初始值）
-        initial_invested_capital = initial_capital * self.position_ratio
+        # 计算收益率：基于投入资金
+        if self.backtest_mode == 'original':
+            initial_invested_capital = initial_capital
+        else:
+            initial_invested_capital = initial_capital * self.position_ratio
         final_return = (capital - initial_invested_capital) / initial_invested_capital * 100
 
         # 计算风险指标
         risk_metrics = self.calculate_risk_metrics(results['capital_curve'])
 
         print(f"\n回测结果:")
+        print(f"  回测模式: {mode_name}")
         print(f"  初始资金: {initial_capital:,.2f}")
-        print(f"  投入资金: {initial_invested_capital:,.2f} (初始资金 × 仓位比例)")
+        if self.backtest_mode == 'original':
+            print(f"  投入资金: {initial_invested_capital:,.2f} (使用全部初始资金)")
+        else:
+            print(f"  投入资金: {initial_invested_capital:,.2f} (初始资金 × 仓位比例)")
         print(f"  最终资金: {capital:,.2f}")
         print(f"  总收益率: {final_return:.2f}%")
         print(f"  总交易次数: {total_trades / 2}")
@@ -1389,11 +1456,38 @@ def test_advanced_cointegration_trading(csv_file_path):
             diff_type = '原始价差' if pair['diff_order'] == 0 else f"{pair['diff_order']}阶差分"
             print(f"  协整类型: {diff_type}")
 
-        # 5. 配置交易参数
+        # 5. 选择回测模式
+        print(f"\n第 {test_count} 次测试 - 选择回测模式")
+        print("=" * 60)
+        print("请选择回测模式:")
+        print("  1. 原版模式（test_cointegration_trading_advanced.py）")
+        print("     - 固定仓位（symbol1=±1.0）")
+        print("     - 基于价差变化计算盈亏")
+        print("     - 包含手续费")
+        print("  2. 新版模式（test_cointegration_trading_advanced_with_fees.py）")
+        print("     - 动态仓位（基于可用资金和杠杆）")
+        print("     - 基于持仓价值变化计算盈亏")
+        print("     - 包含手续费")
+        print("=" * 60)
+        
+        while True:
+            mode_choice = input("请选择回测模式 (1/2): ").strip()
+            if mode_choice == '1':
+                backtest_mode = 'original'
+                print("已选择：原版模式（固定仓位）")
+                break
+            elif mode_choice == '2':
+                backtest_mode = 'with_fees'
+                print("已选择：新版模式（动态仓位+手续费）")
+                break
+            else:
+                print("输入无效，请输入 1 或 2")
+
+        # 6. 配置交易参数
         print(f"\n第 {test_count} 次测试 - 配置交易参数")
         trading_params = configure_trading_parameters()
 
-        # 6. 执行交易回测
+        # 7. 执行交易回测
         print(f"\n第 {test_count} 次测试 - 执行交易回测")
         trading_strategy = AdvancedCointegrationTrading(
             lookback_period=trading_params['lookback_period'],
@@ -1404,7 +1498,8 @@ def test_advanced_cointegration_trading(csv_file_path):
             max_holding_hours=trading_params['max_holding_hours'],
             position_ratio=trading_params['position_ratio'],
             leverage=trading_params['leverage'],
-            trading_fee_rate=trading_params['trading_fee_rate']
+            trading_fee_rate=trading_params['trading_fee_rate'],
+            backtest_mode=backtest_mode
         )
 
         results = trading_strategy.backtest_cointegration_trading(
@@ -1413,7 +1508,7 @@ def test_advanced_cointegration_trading(csv_file_path):
             initial_capital=10000
         )
 
-        # 7. 显示交易详情
+        # 8. 显示交易详情
         print(f"\n第 {test_count} 次测试 - 交易详情")
         if results['trades']:
             print(f"总交易次数: {len(results['trades'])}")
