@@ -684,16 +684,18 @@ def configure_rolling_window_parameters():
     return default_params
 
 
-def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.3):
+def display_rolling_window_candidates(summaries, data, diff_order=0, min_cointegration_ratio=0.3):
     """
     显示滚动窗口协整对候选列表
 
     Args:
         summaries: 滚动窗口检验结果汇总列表
+        data: 原始数据字典（用于重新计算整体数据的对冲比率）
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
         min_cointegration_ratio: 最小协整比例阈值（只显示协整比例>=此值的币对）
 
     Returns:
-        list: 用户选择的币对列表
+        list: 用户选择的币对列表（包含基于整个数据集计算的对冲比率）
     """
     # 过滤：只显示协整比例>=阈值的币对
     filtered_summaries = [s for s in summaries if s['cointegration_ratio'] >= min_cointegration_ratio]
@@ -718,14 +720,34 @@ def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.3):
         print(f"   协整窗口数: {coint_windows}")
         print(f"   协整比例: {coint_ratio * 100:.1f}%")
 
-        # 显示最佳窗口的信息（P值最小的窗口）
-        if summary['all_candidates']:
-            best_window = min(summary['all_candidates'],
-                              key=lambda x: x['spread_adf']['p_value'] if x['spread_adf'] else 1.0)
-            print(f"   最佳窗口:")
-            print(f"     时间范围: {best_window['window_start_time']} 到 {best_window['window_end_time']}")
-            print(f"     对冲比率: {best_window['hedge_ratio']:.6f}")
-            print(f"     价差ADF P值: {best_window['spread_adf']['p_value']:.6f}")
+        # 使用整个数据集重新计算对冲比率
+        symbol1 = summary['symbol1']
+        symbol2 = summary['symbol2']
+        if symbol1 in data and symbol2 in data:
+            price1 = data[symbol1]
+            price2 = data[symbol2]
+            
+            if diff_order == 0:
+                # 原始价差：使用原始价格计算对冲比率
+                overall_hedge_ratio = calculate_hedge_ratio(price1, price2)
+            else:
+                # 一阶差分价差：使用一阶差分价格计算对冲比率
+                diff_price1 = price1.diff().dropna()
+                diff_price2 = price2.diff().dropna()
+                overall_hedge_ratio = calculate_hedge_ratio(diff_price1, diff_price2)
+            
+            print(f"   整体数据对冲比率: {overall_hedge_ratio:.6f} (基于整个数据集计算)")
+            
+            # 显示最佳窗口的信息（P值最小的窗口，仅用于参考）
+            if summary['all_candidates']:
+                best_window = min(summary['all_candidates'],
+                                  key=lambda x: x['spread_adf']['p_value'] if x['spread_adf'] else 1.0)
+                print(f"   最佳窗口参考信息:")
+                print(f"     时间范围: {best_window['window_start_time']} 到 {best_window['window_end_time']}")
+                print(f"     窗口对冲比率: {best_window['hedge_ratio']:.6f} (仅供参考)")
+                print(f"     价差ADF P值: {best_window['spread_adf']['p_value']:.6f}")
+        else:
+            print(f"   警告: 无法找到 {symbol1} 或 {symbol2} 的数据")
 
     print("\n" + "=" * 80)
     print("请选择要使用的币对（输入序号，用逗号分隔，如: 1,3,5）")
@@ -744,12 +766,50 @@ def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.3):
             valid_selection = []
             for idx in selected_indices:
                 if 0 <= idx < len(filtered_summaries):
-                    # 使用最佳窗口的结果作为交易参数
                     summary = filtered_summaries[idx]
                     if summary['all_candidates']:
-                        best_window = min(summary['all_candidates'],
-                                          key=lambda x: x['spread_adf']['p_value'] if x['spread_adf'] else 1.0)
-                        valid_selection.append(best_window)
+                        symbol1 = summary['symbol1']
+                        symbol2 = summary['symbol2']
+                        
+                        if symbol1 in data and symbol2 in data:
+                            price1 = data[symbol1]
+                            price2 = data[symbol2]
+                            
+                            # 使用整个数据集重新计算对冲比率
+                            if diff_order == 0:
+                                # 原始价差：使用原始价格计算对冲比率
+                                overall_hedge_ratio = calculate_hedge_ratio(price1, price2)
+                            else:
+                                # 一阶差分价差：使用一阶差分价格计算对冲比率
+                                diff_price1 = price1.diff().dropna()
+                                diff_price2 = price2.diff().dropna()
+                                overall_hedge_ratio = calculate_hedge_ratio(diff_price1, diff_price2)
+                            
+                            # 使用整个数据集重新进行协整检验（用于获取价差和ADF结果）
+                            coint_result = enhanced_cointegration_test(
+                                price1, price2, symbol1, symbol2, 
+                                verbose=False, diff_order=diff_order
+                            )
+                            
+                            # 构建币对信息（使用整体数据的对冲比率和协整结果）
+                            pair_info = {
+                                'pair_name': summary['pair_name'],
+                                'symbol1': symbol1,
+                                'symbol2': symbol2,
+                                'hedge_ratio': overall_hedge_ratio,  # 使用整体数据的对冲比率
+                                'spread': coint_result.get('spread'),
+                                'spread_adf': coint_result.get('spread_adf'),
+                                'cointegration_found': coint_result.get('cointegration_found', False),
+                                'diff_order': diff_order,
+                                # 保留一些窗口信息用于显示
+                                'cointegration_ratio': summary['cointegration_ratio'],
+                                'total_windows': summary['total_windows'],
+                                'cointegration_windows': summary['cointegration_windows']
+                            }
+                            
+                            valid_selection.append(pair_info)
+                        else:
+                            print(f"序号 {idx + 1} 无法找到数据，跳过")
                     else:
                         print(f"序号 {idx + 1} 没有协整窗口，跳过")
                 else:
@@ -758,8 +818,9 @@ def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.3):
             if valid_selection:
                 print(f"\n已选择 {len(valid_selection)} 个币对:")
                 for selected in valid_selection:
-                    print(
-                        f"   - {selected['pair_name']} (窗口: {selected['window_start_time']} 到 {selected['window_end_time']})")
+                    diff_type = '原始价差' if selected.get('diff_order', 0) == 0 else '一阶差分价差'
+                    print(f"   - {selected['pair_name']} (对冲比率: {selected['hedge_ratio']:.6f}, 价差类型: {diff_type})")
+                    print(f"     协整比例: {selected.get('cointegration_ratio', 0) * 100:.1f}%")
                 return valid_selection
             else:
                 print("没有有效的选择，请重新输入")
@@ -2015,12 +2076,12 @@ def test_rolling_window_cointegration_trading(csv_file_path):
 
     # 5. 显示并选择协整对
     print("\n5. 选择协整对")
-    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.3)
-    
-    # 为每个选中的币对添加diff_order信息
-    for pair in selected_pairs:
-        if 'diff_order' not in pair:
-            pair['diff_order'] = diff_order
+    selected_pairs = display_rolling_window_candidates(
+        all_summaries, 
+        data,  # 传递原始数据用于重新计算对冲比率
+        diff_order,  # 传递价差类型
+        min_cointegration_ratio=0.3
+    )
 
     if not selected_pairs:
         print("未选择任何币对，无法进行交易")
@@ -2048,12 +2109,12 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             diff_order = pair.get('diff_order', 0)
             diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
             print(f"\n币对: {pair['pair_name']}")
-            print(f"  窗口时间范围: {pair['window_start_time']} 到 {pair['window_end_time']}")
-            print(
-                f"  积分阶数: {pair['symbol1']}=I({pair['price1_order']}), {pair['symbol2']}=I({pair['price2_order']})")
             print(f"  价差类型: {diff_type}")
-            print(f"  对冲比率: {pair['hedge_ratio']:.6f}")
-            print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
+            print(f"  对冲比率: {pair['hedge_ratio']:.6f} (基于整个数据集计算)")
+            if pair.get('spread_adf'):
+                print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
+            if 'cointegration_ratio' in pair:
+                print(f"  协整比例: {pair['cointegration_ratio'] * 100:.1f}%")
 
         # 8. 配置交易参数
         print(f"\n第 {test_count} 次测试 - 配置交易参数")
@@ -2789,12 +2850,12 @@ def test_parameter_optimization(csv_file_path):
     
     # 5. 选择协整对
     print("\n5. 选择协整对")
-    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.3)
-    
-    # 为每个选中的币对添加diff_order信息
-    for pair in selected_pairs:
-        if 'diff_order' not in pair:
-            pair['diff_order'] = diff_order
+    selected_pairs = display_rolling_window_candidates(
+        all_summaries, 
+        data,  # 传递原始数据用于重新计算对冲比率
+        diff_order,  # 传递价差类型
+        min_cointegration_ratio=0.3
+    )
     
     if not selected_pairs:
         print("未选择任何币对，无法进行优化")
@@ -2847,11 +2908,12 @@ def test_parameter_optimization(csv_file_path):
         diff_order = pair.get('diff_order', 0)
         diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
         print(f"\n币对: {pair['pair_name']}")
-        print(f"  窗口时间范围: {pair['window_start_time']} 到 {pair['window_end_time']}")
-        print(f"  积分阶数: {pair['symbol1']}=I({pair['price1_order']}), {pair['symbol2']}=I({pair['price2_order']})")
         print(f"  价差类型: {diff_type}")
-        print(f"  对冲比率: {pair['hedge_ratio']:.6f}")
-        print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
+        print(f"  对冲比率: {pair['hedge_ratio']:.6f} (基于整个数据集计算)")
+        if pair.get('spread_adf'):
+            print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
+        if 'cointegration_ratio' in pair:
+            print(f"  协整比例: {pair['cointegration_ratio'] * 100:.1f}%")
     
     # 10. 创建优化器
     strategy_name = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
