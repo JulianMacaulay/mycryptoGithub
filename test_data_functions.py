@@ -228,7 +228,8 @@ def test_multiple_symbols_ccxt():
             }
         })
         
-        symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'AVAX/USDT', 'SOL/USDT', 'AAVE/USDT', 'LTC/USDT']
+        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'AVAXUSDT', 'SOLUSDT', 'AAVEUSDT', 'LTCUSDT', 'TONUSDT', 'UNIUSDT', 'SUSHIUSDT', 'OPUSDT', 'ARBUSDT', 'COMPUSDT']
+
         all_data = {}
         
         for symbol in symbols:
