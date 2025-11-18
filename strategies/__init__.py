@@ -9,6 +9,7 @@ from .base_zscore_strategy import BaseZScoreStrategy
 from .traditional_zscore_strategy import TraditionalZScoreStrategy
 from .arima_garch_zscore_strategy import ArimaGarchZScoreStrategy
 from .ecm_zscore_strategy import EcmZScoreStrategy
+from .kalman_filter_zscore_strategy import KalmanFilterZScoreStrategy
 
 __all__ = [
     'BaseStrategy',
@@ -16,6 +17,7 @@ __all__ = [
     'BaseZScoreStrategy',
     'TraditionalZScoreStrategy',
     'ArimaGarchZScoreStrategy',
-    'EcmZScoreStrategy'
+    'EcmZScoreStrategy',
+    'KalmanFilterZScoreStrategy'
 ]
 
