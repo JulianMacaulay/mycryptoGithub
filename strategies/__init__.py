@@ -8,12 +8,14 @@ from .turtle_strategy import TurtleStrategy
 from .base_zscore_strategy import BaseZScoreStrategy
 from .traditional_zscore_strategy import TraditionalZScoreStrategy
 from .arima_garch_zscore_strategy import ArimaGarchZScoreStrategy
+from .ecm_zscore_strategy import EcmZScoreStrategy
 
 __all__ = [
     'BaseStrategy',
     'TurtleStrategy',
     'BaseZScoreStrategy',
     'TraditionalZScoreStrategy',
-    'ArimaGarchZScoreStrategy'
+    'ArimaGarchZScoreStrategy',
+    'EcmZScoreStrategy'
 ]
 
