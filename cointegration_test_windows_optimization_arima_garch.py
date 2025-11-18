@@ -252,7 +252,7 @@ def determine_integration_order(series, max_order=2):
 
 # ==================== 正确的协整检验代码 ====================
 
-def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
+def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True, diff_order=0):
     """
     正确的协整检验（Engle-Granger方法）
 
@@ -261,9 +261,11 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
     2. 如果原序列不平稳，检验它们的一阶差分是否平稳
     3. 只有当两个原序列都是I(1)时，才能进行协整检验
     4. 先计算最优对冲比率（OLS）
-    5. 计算原序列的价差（price1 - β*price2）
-    6. 检验原价差的平稳性
-    7. 如果原价差平稳，才是真正的协整
+    5. 根据diff_order计算价差：
+       - diff_order=0: 计算原序列的价差（price1 - β*price2）
+       - diff_order=1: 计算一阶差分价差（diff1 - β*diff2）
+    6. 检验价差的平稳性
+    7. 如果价差平稳，才是真正的协整
 
     Args:
         price1: 第一个价格序列
@@ -271,6 +273,7 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
         symbol1: 第一个币种名称
         symbol2: 第二个币种名称
         verbose: 是否打印详细信息
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
 
     Returns:
         dict: 检验结果
@@ -289,7 +292,8 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
         'spread': None,
         'spread_adf': None,
         'cointegration_found': False,
-        'best_test': None
+        'best_test': None,
+        'diff_order': diff_order  # 记录使用的价差类型
     }
 
     # 步骤1: 检验price1的积分阶数
@@ -345,32 +349,65 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
     if verbose:
         print(f"\n✓ {symbol1} 和 {symbol2} 都是 I(1)，可以进行协整检验")
 
-    # 步骤5: 计算最优对冲比率（OLS回归）
-    if verbose:
-        print(f"\n--- 步骤3: 计算最优对冲比率（OLS回归） ---")
-    hedge_ratio = calculate_hedge_ratio(price1, price2)
-    results['hedge_ratio'] = hedge_ratio
-
-    # 步骤6: 计算原序列的价差（残差）
-    if verbose:
-        print(f"\n--- 步骤4: 计算原序列价差（残差） ---")
+    # 步骤5: 根据diff_order计算对冲比率和价差
     min_length = min(len(price1), len(price2))
     price1_aligned = price1.iloc[:min_length]
     price2_aligned = price2.iloc[:min_length]
-
-    spread = price1_aligned - hedge_ratio * price2_aligned
-    results['spread'] = spread
-
-    if verbose:
-        print(f"价差统计:")
-        print(f"  均值: {spread.mean():.6f}")
-        print(f"  标准差: {spread.std():.6f}")
-        print(f"  最小值: {spread.min():.6f}")
-        print(f"  最大值: {spread.max():.6f}")
-
-    # 步骤7: 检验原价差的平稳性（协整检验）
-    if verbose:
-        print(f"\n--- 步骤5: 检验原价差的平稳性（协整检验） ---")
+    
+    if diff_order == 0:
+        # 原始价差：使用原始价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算最优对冲比率（OLS回归，原始价格） ---")
+        hedge_ratio = calculate_hedge_ratio(price1_aligned, price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+        
+        if verbose:
+            print(f"\n--- 步骤4: 计算原始价差（残差） ---")
+        spread = price1_aligned - hedge_ratio * price2_aligned
+        results['spread'] = spread
+        
+        if verbose:
+            print(f"价差统计:")
+            print(f"  均值: {spread.mean():.6f}")
+            print(f"  标准差: {spread.std():.6f}")
+            print(f"  最小值: {spread.min():.6f}")
+            print(f"  最大值: {spread.max():.6f}")
+        
+        # 步骤6: 检验原始价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤5: 检验原始价差的平稳性（协整检验） ---")
+    else:
+        # 一阶差分价差：使用一阶差分价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算一阶差分价格 ---")
+        diff_price1 = price1_aligned.diff().dropna()
+        diff_price2 = price2_aligned.diff().dropna()
+        
+        # 确保两个差分序列长度一致
+        min_diff_length = min(len(diff_price1), len(diff_price2))
+        diff_price1_aligned = diff_price1.iloc[:min_diff_length]
+        diff_price2_aligned = diff_price2.iloc[:min_diff_length]
+        
+        if verbose:
+            print(f"\n--- 步骤4: 计算最优对冲比率（OLS回归，一阶差分价格） ---")
+        hedge_ratio = calculate_hedge_ratio(diff_price1_aligned, diff_price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+        
+        if verbose:
+            print(f"\n--- 步骤5: 计算一阶差分价差 ---")
+        spread = diff_price1_aligned - hedge_ratio * diff_price2_aligned
+        results['spread'] = spread
+        
+        if verbose:
+            print(f"价差统计:")
+            print(f"  均值: {spread.mean():.6f}")
+            print(f"  标准差: {spread.std():.6f}")
+            print(f"  最小值: {spread.min():.6f}")
+            print(f"  最大值: {spread.max():.6f}")
+        
+        # 步骤6: 检验一阶差分价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤6: 检验一阶差分价差的平稳性（协整检验） ---")
     spread_adf = advanced_adf_test(spread, verbose=verbose)
     results['spread_adf'] = spread_adf
 
@@ -395,7 +432,7 @@ def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True):
 
 # ==================== 滚动窗口协整检验代码 ====================
 
-def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_size=500, step_size=100):
+def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_size=500, step_size=100, diff_order=0):
     """
     滚动窗口协整检验
 
@@ -406,6 +443,7 @@ def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_s
         symbol2: 第二个币种名称
         window_size: 窗口大小（数据条数）
         step_size: 步长（每次移动的数据条数）
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
 
     Returns:
         dict: 滚动窗口检验结果
@@ -462,7 +500,8 @@ def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_s
                 window_price2,
                 symbol1,
                 symbol2,
-                verbose=False  # 窗口检验时不打印详细信息
+                verbose=False,  # 窗口检验时不打印详细信息
+                diff_order=diff_order  # 传递价差类型
             )
 
             # 添加窗口信息
@@ -505,7 +544,7 @@ def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_s
     return summary
 
 
-def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100):
+def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100, diff_order=0):
     """
     滚动窗口寻找协整对
 
@@ -513,6 +552,7 @@ def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100)
         data: 包含各币对数据的字典
         window_size: 窗口大小（数据条数）
         step_size: 步长（每次移动的数据条数）
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
 
     Returns:
         list: 协整对汇总结果列表
@@ -522,6 +562,8 @@ def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100)
     print("=" * 80)
     print(f"窗口大小: {window_size}")
     print(f"步长: {step_size}")
+    diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
+    print(f"价差类型: {diff_type}")
 
     symbols = list(data.keys())
     all_summaries = []
@@ -540,7 +582,8 @@ def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100)
                     symbol1,
                     symbol2,
                     window_size=window_size,
-                    step_size=step_size
+                    step_size=step_size,
+                    diff_order=diff_order  # 传递价差类型
                 )
 
                 all_summaries.append(summary)
@@ -549,6 +592,49 @@ def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100)
                 print(f"分析 {symbol1}/{symbol2} 时出错: {str(e)}")
 
     return all_summaries
+
+
+def select_spread_type():
+    """
+    选择价差类型
+    
+    Returns:
+        int: 0=原始价差, 1=一阶差分价差
+    """
+    print("\n" + "=" * 60)
+    print("选择价差类型")
+    print("=" * 60)
+    print("请选择用于协整检验和回测的价差类型:")
+    print("  0. 原始价差（原始价格计算的价差）")
+    print("  1. 一阶差分价差（一阶差分价格计算的价差）")
+    print("\n注意：")
+    print("  - 如果选择原始价差，对冲比率从原始价格计算得出")
+    print("  - 如果选择一阶差分价差，对冲比率从一阶差分价格计算得出")
+    
+    while True:
+        try:
+            choice = input("请选择 (0/1，默认0): ").strip()
+            if not choice:
+                diff_order = 0
+                break
+            elif choice == '0':
+                diff_order = 0
+                break
+            elif choice == '1':
+                diff_order = 1
+                break
+            else:
+                print("无效选择，请输入 0 或 1")
+        except KeyboardInterrupt:
+            print("\n用户取消选择，使用默认值：原始价差")
+            diff_order = 0
+            break
+        except Exception as e:
+            print(f"输入错误: {str(e)}，请重新输入")
+    
+    diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
+    print(f"\n已选择: {diff_type}")
+    return diff_order
 
 
 def configure_rolling_window_parameters():
@@ -598,7 +684,7 @@ def configure_rolling_window_parameters():
     return default_params
 
 
-def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.5):
+def display_rolling_window_candidates(summaries, min_cointegration_ratio=0.3):
     """
     显示滚动窗口协整对候选列表
 
@@ -1622,26 +1708,58 @@ class AdvancedCointegrationTrading:
                 if symbol1 not in current_prices or symbol2 not in current_prices:
                     continue
 
-                # 计算原序列的价差（协整检验通过的是原序列价差）
-                current_spread = self.calculate_current_spread(
-                    current_prices[symbol1],
-                    current_prices[symbol2],
-                    pair_info['hedge_ratio']
-                )
-
-                # 获取历史价差数据（原序列）
-                historical_spreads = []
-                for j in range(max(0, i - self.lookback_period), i):
-                    if j < len(all_timestamps):
-                        hist_timestamp = all_timestamps[j]
-                        if (hist_timestamp in data[symbol1].index and
-                                hist_timestamp in data[symbol2].index):
-                            hist_spread = self.calculate_current_spread(
-                                data[symbol1].loc[hist_timestamp],
-                                data[symbol2].loc[hist_timestamp],
-                                pair_info['hedge_ratio']
-                            )
-                            historical_spreads.append(hist_spread)
+                # 根据diff_order计算价差
+                diff_order = pair_info.get('diff_order', 0)
+                
+                if diff_order == 0:
+                    # 原始价差
+                    current_spread = self.calculate_current_spread(
+                        current_prices[symbol1],
+                        current_prices[symbol2],
+                        pair_info['hedge_ratio']
+                    )
+                    
+                    # 获取历史原始价差数据
+                    historical_spreads = []
+                    for j in range(max(0, i - self.lookback_period), i):
+                        if j < len(all_timestamps):
+                            hist_timestamp = all_timestamps[j]
+                            if (hist_timestamp in data[symbol1].index and
+                                    hist_timestamp in data[symbol2].index):
+                                hist_spread = self.calculate_current_spread(
+                                    data[symbol1].loc[hist_timestamp],
+                                    data[symbol2].loc[hist_timestamp],
+                                    pair_info['hedge_ratio']
+                                )
+                                historical_spreads.append(hist_spread)
+                else:
+                    # 一阶差分价差
+                    if i > 0:  # 确保有前一个时间点
+                        prev_timestamp = all_timestamps[i-1]
+                        if (prev_timestamp in data[symbol1].index and 
+                            prev_timestamp in data[symbol2].index):
+                            current_diff1 = current_prices[symbol1] - data[symbol1].loc[prev_timestamp]
+                            current_diff2 = current_prices[symbol2] - data[symbol2].loc[prev_timestamp]
+                            current_spread = current_diff1 - pair_info['hedge_ratio'] * current_diff2
+                        else:
+                            current_spread = 0
+                    else:
+                        current_spread = 0
+                    
+                    # 获取历史一阶差分价差数据
+                    historical_spreads = []
+                    for j in range(max(1, i - self.lookback_period), i):
+                        if j < len(all_timestamps):
+                            hist_timestamp = all_timestamps[j]
+                            prev_hist_timestamp = all_timestamps[j-1]
+                            if (hist_timestamp in data[symbol1].index and 
+                                hist_timestamp in data[symbol2].index and
+                                prev_hist_timestamp in data[symbol1].index and 
+                                prev_hist_timestamp in data[symbol2].index):
+                                hist_diff1 = data[symbol1].loc[hist_timestamp] - data[symbol1].loc[prev_hist_timestamp]
+                                hist_diff2 = data[symbol2].loc[hist_timestamp] - data[symbol2].loc[prev_hist_timestamp]
+                                hist_spread = hist_diff1 - pair_info['hedge_ratio'] * hist_diff2
+                                historical_spreads.append(hist_spread)
 
                 current_z_score = self.calculate_z_score(current_spread, historical_spreads)
 
@@ -1872,16 +1990,21 @@ def test_rolling_window_cointegration_trading(csv_file_path):
 
     print(f"成功加载 {len(data)} 个币对的数据")
 
-    # 2. 配置滚动窗口参数
-    print("\n2. 配置滚动窗口参数")
+    # 2. 选择价差类型
+    print("\n2. 选择价差类型")
+    diff_order = select_spread_type()
+
+    # 3. 配置滚动窗口参数
+    print("\n3. 配置滚动窗口参数")
     window_params = configure_rolling_window_parameters()
 
-    # 3. 滚动窗口寻找协整对
-    print("\n3. 滚动窗口寻找协整对")
+    # 4. 滚动窗口寻找协整对
+    print("\n4. 滚动窗口寻找协整对")
     all_summaries = rolling_window_find_cointegrated_pairs(
         data,
         window_size=window_params['window_size'],
-        step_size=window_params['step_size']
+        step_size=window_params['step_size'],
+        diff_order=diff_order  # 传递价差类型
     )
 
     if not all_summaries:
@@ -1890,16 +2013,21 @@ def test_rolling_window_cointegration_trading(csv_file_path):
 
     print(f"\n找到 {len(all_summaries)} 个币对的滚动窗口检验结果")
 
-    # 4. 显示并选择协整对
-    print("\n4. 选择协整对")
-    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.5)
+    # 5. 显示并选择协整对
+    print("\n5. 选择协整对")
+    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.3)
+    
+    # 为每个选中的币对添加diff_order信息
+    for pair in selected_pairs:
+        if 'diff_order' not in pair:
+            pair['diff_order'] = diff_order
 
     if not selected_pairs:
         print("未选择任何币对，无法进行交易")
         return
 
-    # 5. 策略选择和回测循环
-    print("\n5. 策略选择和回测循环")
+    # 6. 策略选择和回测循环
+    print("\n6. 策略选择和回测循环")
     test_count = 0
 
     while True:
@@ -1914,21 +2042,24 @@ def test_rolling_window_cointegration_trading(csv_file_path):
             print("测试结束，退出程序")
             break
 
-        # 6. 显示选择的币对详情
+        # 7. 显示选择的币对详情
         print(f"\n第 {test_count} 次测试 - 选择的币对详情")
         for pair in selected_pairs:
+            diff_order = pair.get('diff_order', 0)
+            diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
             print(f"\n币对: {pair['pair_name']}")
             print(f"  窗口时间范围: {pair['window_start_time']} 到 {pair['window_end_time']}")
             print(
                 f"  积分阶数: {pair['symbol1']}=I({pair['price1_order']}), {pair['symbol2']}=I({pair['price2_order']})")
+            print(f"  价差类型: {diff_type}")
             print(f"  对冲比率: {pair['hedge_ratio']:.6f}")
             print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
 
-        # 7. 配置交易参数
+        # 8. 配置交易参数
         print(f"\n第 {test_count} 次测试 - 配置交易参数")
         trading_params = configure_trading_parameters()
 
-        # 8. 执行交易回测
+        # 9. 执行交易回测
         print(f"\n第 {test_count} 次测试 - 执行交易回测")
         print(f"使用的策略: {z_score_strategy.get_strategy_description()}")
         trading_strategy = AdvancedCointegrationTrading(
@@ -2635,39 +2766,49 @@ def test_parameter_optimization(csv_file_path):
         print("数据加载失败")
         return
     
-    # 2. 配置滚动窗口参数
-    print("\n2. 配置滚动窗口参数")
+    # 2. 选择价差类型
+    print("\n2. 选择价差类型")
+    diff_order = select_spread_type()
+    
+    # 3. 配置滚动窗口参数
+    print("\n3. 配置滚动窗口参数")
     window_params = configure_rolling_window_parameters()
     
-    # 3. 滚动窗口寻找协整对
-    print("\n3. 滚动窗口寻找协整对")
+    # 4. 滚动窗口寻找协整对
+    print("\n4. 滚动窗口寻找协整对")
     all_summaries = rolling_window_find_cointegrated_pairs(
         data,
         window_size=window_params['window_size'],
-        step_size=window_params['step_size']
+        step_size=window_params['step_size'],
+        diff_order=diff_order  # 传递价差类型
     )
     
     if not all_summaries:
         print("未找到任何协整对，无法进行优化")
         return
     
-    # 4. 选择协整对
-    print("\n4. 选择协整对")
-    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.5)
+    # 5. 选择协整对
+    print("\n5. 选择协整对")
+    selected_pairs = display_rolling_window_candidates(all_summaries, min_cointegration_ratio=0.3)
+    
+    # 为每个选中的币对添加diff_order信息
+    for pair in selected_pairs:
+        if 'diff_order' not in pair:
+            pair['diff_order'] = diff_order
     
     if not selected_pairs:
         print("未选择任何币对，无法进行优化")
         return
     
-    # 5. 选择Z-score计算策略
-    print("\n5. 选择Z-score计算策略")
+    # 6. 选择Z-score计算策略
+    print("\n6. 选择Z-score计算策略")
     z_score_strategy = select_z_score_strategy()
     if z_score_strategy is None:
         print("未选择策略，退出优化")
         return
     
-    # 6. 选择优化方法
-    print("\n6. 选择优化方法")
+    # 7. 选择优化方法
+    print("\n7. 选择优化方法")
     print("可选方法:")
     print("  1. 网格搜索（粗粒度+细粒度）")
     print("  2. 随机搜索")
@@ -2683,8 +2824,8 @@ def test_parameter_optimization(csv_file_path):
     
     method = method_map.get(method_choice, 'grid_search')
     
-    # 7. 选择优化目标
-    print("\n7. 选择优化目标")
+    # 8. 选择优化目标
+    print("\n8. 选择优化目标")
     print("可选目标:")
     print("  1. 夏普比率 (sharpe_ratio)")
     print("  2. 总收益率 (return)")
@@ -2700,9 +2841,22 @@ def test_parameter_optimization(csv_file_path):
     
     objective = objective_map.get(objective_choice, 'sharpe_ratio')
     
-    # 8. 创建优化器
+    # 9. 显示选择的币对详情
+    print(f"\n9. 选择的币对详情")
+    for pair in selected_pairs:
+        diff_order = pair.get('diff_order', 0)
+        diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
+        print(f"\n币对: {pair['pair_name']}")
+        print(f"  窗口时间范围: {pair['window_start_time']} 到 {pair['window_end_time']}")
+        print(f"  积分阶数: {pair['symbol1']}=I({pair['price1_order']}), {pair['symbol2']}=I({pair['price2_order']})")
+        print(f"  价差类型: {diff_type}")
+        print(f"  对冲比率: {pair['hedge_ratio']:.6f}")
+        print(f"  价差ADF P值: {pair['spread_adf']['p_value']:.6f}")
+    
+    # 10. 创建优化器
     strategy_name = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
-    print(f"\n8. 创建优化器 (方法={method}, 目标={objective}, 策略={strategy_name})")
+    diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
+    print(f"\n10. 创建优化器 (方法={method}, 目标={objective}, 策略={strategy_name}, 价差类型={diff_type})")
     optimizer = ParameterOptimizer(
         data=data,
         selected_pairs=selected_pairs,
@@ -2712,8 +2866,8 @@ def test_parameter_optimization(csv_file_path):
         z_score_strategy=z_score_strategy  # 传入策略对象
     )
     
-    # 9. 执行优化
-    print(f"\n9. 执行优化...")
+    # 11. 执行优化
+    print(f"\n11. 执行优化...")
     if method == 'grid_search':
         result = optimizer.optimize(method='grid_search', 
                                    coarse_first=True,
@@ -2727,7 +2881,7 @@ def test_parameter_optimization(csv_file_path):
         n_calls = int(n_calls) if n_calls else 50
         result = optimizer.optimize(method='bayesian_optimization', n_calls=n_calls)
     
-    # 10. 显示结果
+    # 12. 显示结果
     print("\n" + "=" * 80)
     print("优化结果")
     print("=" * 80)
@@ -2740,7 +2894,9 @@ def test_parameter_optimization(csv_file_path):
     for param_name, param_value in result['best_params'].items():
         print(f"  {param_name}: {param_value}")
     strategy_desc = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
+    diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
     print(f"  使用的策略: {strategy_desc}")
+    print(f"  价差类型: {diff_type}")
     
     print(f"\n最佳得分: {result['best_score']:.4f}")
     if result['best_result']:
