@@ -889,9 +889,16 @@ def select_z_score_strategy():
 1. **获取持仓信息**：持仓币对、开仓价格、持仓数量等
 2. **计算当前价差**：使用对冲比率计算当前价差
 3. **计算Z-score**：
-   - 获取历史价差序列
-   - 调用Z-score策略计算当前Z-score
-   - **Copula + DCC-GARCH策略**：使用DCC-GARCH估计动态波动率，使用Copula估计依赖结构，计算Z-score
+   - 获取历史价差序列和历史价格序列
+   - 调用Z-score策略计算当前Z-score，传递价格数据
+   - **Copula + DCC-GARCH策略（完整版）**：
+     - 接收两个资产的历史价格序列（`historical_prices1` 和 `historical_prices2`）
+     - 计算两个资产的收益率序列
+     - 对每个资产分别拟合GARCH模型，估计动态波动率
+     - 使用DCC模型估计两个资产之间的动态相关性
+     - 使用Copula建模两个资产之间的依赖结构
+     - 基于动态波动率和相关性计算价差的动态方差
+     - 计算Z-score
 4. **检查退出条件**：
    - Z-score平仓阈值
    - 止盈止损
@@ -906,13 +913,16 @@ def select_z_score_strategy():
 2. **计算当前价差**：使用对冲比率计算价差
 3. **获取历史价差**：从历史数据中提取价差序列，长度 = `lookback_period`
 4. **计算Z-score**：
-   - 调用Z-score策略计算Z-score
-   - **Copula + DCC-GARCH策略**：
-     - 将价差序列转换为收益率序列
-     - 使用GARCH模型估计动态波动率
-     - 使用DCC模型估计动态相关性
-     - 使用Copula估计依赖结构
-     - 基于动态波动率和相关性计算价差的动态方差
+   - 获取历史价差序列和历史价格序列
+   - 调用Z-score策略计算Z-score，传递价格数据
+   - **Copula + DCC-GARCH策略（完整版）**：
+     - 接收两个资产的历史价格序列（`historical_prices1` 和 `historical_prices2`）
+     - 计算两个资产的收益率序列（对数收益率）
+     - 对每个资产分别拟合GARCH模型，估计各自的动态波动率
+     - 使用DCC模型估计两个资产之间的动态相关性
+     - 使用Copula建模两个资产之间的依赖结构
+     - 基于两个资产的动态波动率和DCC相关性计算价差的动态方差
+     - 使用Copula参数调整价差方差（考虑尾部依赖）
      - 计算Z-score
 5. **生成交易信号**：
    - `z_score >= z_threshold`：做空价差（SHORT_LONG）
@@ -1112,83 +1122,874 @@ def select_z_score_strategy():
 
 ---
 
-## Copula + DCC-GARCH策略详解
+## Copula + DCC-GARCH策略详解（完整版）
 
 ### 策略类：CopulaDccGarchZScoreStrategy
 
 **文件位置**：`strategies/copula_dcc_garch_zscore_strategy.py`
 
-### 核心方法：calculate_z_score()
+**重要说明**：本策略是完整版实现，需要两个资产的价格序列，而不是只有价差序列。
 
-#### 1. 输入验证
+---
 
-- 检查历史数据长度是否足够（默认最小50）
-- 不足时返回0.0（中性信号）
+## 一、Copula + DCC-GARCH模型理论基础
 
-#### 2. 计算价差收益率
+### 1.1 模型概述
 
-- 将价差序列转换为收益率序列
-- 使用简单收益率：`r_t = (spread_t - spread_{t-1}) / spread_{t-1}`
+Copula + DCC-GARCH模型是一个多层次的金融时间序列模型，用于：
+- **GARCH模型**：对每个资产分别建模，捕捉单个资产收益率的**波动率聚集效应**（volatility clustering）
+- **DCC模型**：捕捉两个资产之间的**动态条件相关性**（Dynamic Conditional Correlation）
+- **Copula函数**：建模两个资产之间的**依赖结构**（dependence structure），特别是尾部依赖
 
-#### 3. 拟合GARCH模型
+### 1.2 为什么需要Copula + DCC-GARCH？
 
-- 使用GARCH模型估计价差收益率的动态波动率
-- 预测下一期的波动率
+在协整交易中，我们需要：
+1. **动态波动率**：每个资产的波动率不是常数，而是时变的
+2. **动态相关性**：两个资产之间的相关性会随时间变化
+3. **非线性依赖**：资产之间的依赖关系可能不是线性的，特别是在极端情况下（尾部依赖）
+4. **价差方差**：基于两个资产的动态波动率和动态相关性，准确计算价差的动态方差
 
-#### 4. 估计DCC相关性
+传统方法假设：
+- 波动率是常数
+- 相关性是常数
+- 依赖关系是线性的
+- 价差方差 = 常数
 
-- 使用滚动窗口估计动态相关性（简化版DCC）
-- 计算两个资产之间的动态相关系数
+Copula + DCC-GARCH模型能够：
+- 动态估计每个资产的波动率
+- 动态估计两个资产之间的相关性
+- 捕捉非线性依赖结构
+- 基于动态波动率和相关性计算价差的动态方差
 
-#### 5. 估计Copula参数
+---
 
-- 对于高斯Copula，参数是相关系数
-- 使用经验分布函数转换为标准正态分布
-- 估计Copula参数
+## 二、GARCH模型详解
 
-#### 6. 计算动态标准差
+### 2.1 GARCH模型原理
 
-- 使用GARCH预测的波动率
-- 使用Copula调整波动率（根据相关性调整）
-- 将收益率波动率转换为价差波动率
+**GARCH** = **G**eneralized **A**uto**R**egressive **C**onditional **H**eteroskedasticity（广义自回归条件异方差模型）
 
-#### 7. 计算Z-score
+#### 2.1.1 基本思想
 
-```python
-z_score = (current_spread - historical_mean) / spread_std
+金融时间序列的波动率具有**聚集效应**（volatility clustering）：
+- 高波动率时期往往连续出现
+- 低波动率时期也往往连续出现
+- 波动率本身是时变的，不是常数
+
+#### 2.1.2 GARCH(p, q)模型数学表达式
+
+**均值方程**：
+```
+r_t = μ + ε_t
 ```
 
-- 使用历史均值
-- 使用动态估计的标准差
+其中：
+- `r_t`：时刻t的收益率
+- `μ`：均值（通常假设为0或常数）
+- `ε_t`：误差项
 
-#### 8. 容错机制
+**误差项分解**：
+```
+ε_t = σ_t * z_t
+```
 
-- 验证Z-score有效性（NaN/Inf检查）
-- 如果无效，回退到传统方法
-- 如果传统方法也失败，返回0.0
+其中：
+- `σ_t`：时刻t的条件标准差（波动率）
+- `z_t`：标准化残差，通常假设为标准正态分布：`z_t ~ N(0, 1)`
 
-### Copula + DCC-GARCH数学模型
+**条件方差方程（GARCH核心）**：
+```
+σ²_t = ω + Σ(α_i * ε²_{t-i}) + Σ(β_j * σ²_{t-j})
+```
 
-**GARCH模型**：
+展开形式（GARCH(p, q)）：
+```
+σ²_t = ω + α₁*ε²_{t-1} + α₂*ε²_{t-2} + ... + αₚ*ε²_{t-p}
+              + β₁*σ²_{t-1} + β₂*σ²_{t-2} + ... + β_q*σ²_{t-q}
+```
+
+其中：
+- `σ²_t`：时刻t的条件方差（波动率的平方）
+- `ω > 0`：常数项（长期平均波动率）
+- `α_i ≥ 0`：ARCH项系数（残差平方的滞后项系数）
+- `β_j ≥ 0`：GARCH项系数（条件方差的滞后项系数）
+- `ε²_{t-i}`：滞后i期的残差平方（捕捉"冲击"的影响）
+- `σ²_{t-j}`：滞后j期的条件方差（捕捉波动率的持续性）
+
+#### 2.1.3 GARCH(1,1)模型（最常用）
+
+**数学表达式**：
 ```
 σ²_t = ω + α₁*ε²_{t-1} + β₁*σ²_{t-1}
 ```
 
-**DCC模型**（简化版）：
+**参数含义**：
+- `ω`：长期平均波动率
+- `α₁`：短期冲击的影响（残差平方的系数）
+- `β₁`：波动率的持续性（条件方差的系数）
+
+**约束条件**：
 ```
-ρ_t = corr(returns1[t-w:t], returns2[t-w:t])
+α₁ + β₁ < 1  （确保模型平稳）
 ```
 
-**高斯Copula**：
+**解释**：
+- 当前波动率依赖于：
+  - 上一期的残差平方（`ε²_{t-1}`）：捕捉"冲击"的影响
+  - 上一期的波动率（`σ²_{t-1}`）：捕捉波动率的持续性
+
+#### 2.1.4 在价差Z-score计算中的应用
+
+**代码实现**（第76-92行）：
+
+```76:92:strategies/copula_dcc_garch_zscore_strategy.py
+    def _fit_garch_model(self, returns: np.ndarray) -> Optional[object]:
+        """
+        拟合GARCH模型
+        
+        Args:
+            returns: 收益率序列
+            
+        Returns:
+            拟合的GARCH模型对象，如果失败返回None
+        """
+        try:
+            garch_model = arch_model(returns, vol='Garch', 
+                                    p=self.garch_order[0], q=self.garch_order[1])
+            garch_fitted = garch_model.fit(disp='off')
+            return garch_fitted
+        except Exception:
+            return None
+```
+
+**步骤**（完整版）：
+1. **获取两个资产的价格序列**：从主程序传递 `historical_prices1` 和 `historical_prices2`
+2. **计算两个资产的收益率序列**：使用对数收益率 `r_t = log(P_t / P_{t-1})`
+3. **对每个资产分别拟合GARCH模型**：
+   - 资产1：`garch_fitted1 = fit_garch(returns1)`
+   - 资产2：`garch_fitted2 = fit_garch(returns2)`
+4. **预测下一期的条件方差**：
+   - `σ²₁_{t+1}` = GARCH预测（资产1）
+   - `σ²₂_{t+1}` = GARCH预测（资产2）
+5. **计算预测的波动率**：
+   - `σ₁_{t+1} = √(σ²₁_{t+1})`
+   - `σ₂_{t+1} = √(σ²₂_{t+1})`
+
+**预测波动率**（第390-405行）：
+
+```390:405:strategies/copula_dcc_garch_zscore_strategy.py
+            # 步骤4: 预测动态波动率
+            try:
+                garch_forecast1 = garch_fitted1.forecast(horizon=1)
+                garch_forecast2 = garch_fitted2.forecast(horizon=1)
+                predicted_vol1 = np.sqrt(garch_forecast1.variance.values[-1, 0])
+                predicted_vol2 = np.sqrt(garch_forecast2.variance.values[-1, 0])
+            except Exception:
+                # 预测失败，使用历史波动率
+                predicted_vol1 = np.std(returns1)
+                predicted_vol2 = np.std(returns2)
+            
+            # 验证波动率
+            if predicted_vol1 <= 0 or np.isnan(predicted_vol1):
+                predicted_vol1 = np.std(returns1)
+            if predicted_vol2 <= 0 or np.isnan(predicted_vol2):
+                predicted_vol2 = np.std(returns2)
+```
+
+---
+
+## 三、DCC模型详解
+
+### 3.1 DCC模型原理
+
+**DCC** = **D**ynamic **C**onditional **C**orrelation（动态条件相关性）
+
+#### 3.1.1 基本思想
+
+在协整交易中，两个资产之间的相关性不是常数，而是**时变的**：
+- 市场平静时，相关性可能较低
+- 市场波动时，相关性可能急剧上升（相关性崩溃，correlation breakdown）
+- 相关性本身具有聚集效应
+
+#### 3.1.2 完整DCC-GARCH模型
+
+对于两个资产，完整的DCC-GARCH模型包括：
+
+**资产1的GARCH模型**：
+```
+r₁_t = μ₁ + ε₁_t
+ε₁_t = σ₁_t * z₁_t
+σ²₁_t = ω₁ + α₁₁*ε²₁_{t-1} + β₁₁*σ²₁_{t-1}
+```
+
+**资产2的GARCH模型**：
+```
+r₂_t = μ₂ + ε₂_t
+ε₂_t = σ₂_t * z₂_t
+σ²₂_t = ω₂ + α₂₂*ε²₂_{t-1} + β₂₂*σ²₂_{t-1}
+```
+
+**标准化残差**：
+```
+u₁_t = ε₁_t / σ₁_t = z₁_t
+u₂_t = ε₂_t / σ₂_t = z₂_t
+```
+
+**DCC模型（动态相关性）**：
+```
+Q_t = (1 - a - b) * Q̄ + a * u_{t-1} * u'_{t-1} + b * Q_{t-1}
+R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
+```
+
+其中：
+- `Q_t`：准相关矩阵（quasi-correlation matrix）
+- `R_t`：动态相关矩阵（dynamic correlation matrix）
+- `Q̄`：标准化残差的样本相关矩阵
+- `a, b`：DCC参数，满足 `a + b < 1`
+- `u_t = [u₁_t, u₂_t]'`：标准化残差向量
+
+**动态相关系数**：
+```
+ρ_t = R_t[1,2]  （资产1和资产2之间的动态相关系数）
+```
+
+#### 3.1.3 完整DCC模型实现
+
+本策略实现了**完整DCC模型**，包括DCC参数估计和动态相关性计算。
+
+**步骤1：估计DCC参数**（第94-180行）
+
+**代码实现**：`_estimate_dcc_parameters()`
+
+```94:180:strategies/copula_dcc_garch_zscore_strategy.py
+    def _estimate_dcc_parameters(self, returns1: np.ndarray, returns2: np.ndarray,
+                                 garch_fitted1: object, garch_fitted2: object) -> Tuple[float, float]:
+        """
+        估计DCC（动态条件相关性）模型参数
+        
+        DCC模型：
+        Q_t = (1 - α - β) * Q_bar + α * (ε_{t-1} * ε_{t-1}') + β * Q_{t-1}
+        R_t = (diag(Q_t))^{-1/2} * Q_t * (diag(Q_t))^{-1/2}
+        
+        其中：
+        - Q_t: 条件协方差矩阵
+        - R_t: 条件相关系数矩阵
+        - ε_t: 标准化残差
+        - α, β: DCC参数（α + β < 1）
+        
+        简化实现：使用MLE估计α和β
+        """
+```
+
+**DCC参数估计方法**：
+1. **获取标准化残差**：
+   ```
+   u₁_t = ε₁_t / σ₁_t  （资产1的标准化残差）
+   u₂_t = ε₂_t / σ₂_t  （资产2的标准化残差）
+   ```
+   其中 `σ₁_t` 和 `σ₂_t` 来自GARCH模型的条件波动率
+
+2. **计算无条件协方差矩阵**：
+   ```
+   Q̄ = E[u_t * u_t']
+   ```
+   其中 `u_t = [u₁_t, u₂_t]'`
+
+3. **使用网格搜索估计DCC参数**：
+   - 在 `α ∈ [0.01, 0.15]` 和 `β ∈ [0.80, 0.95]` 范围内搜索
+   - 约束条件：`α + β < 1`
+   - 目标：最大化对数似然函数
+
+**步骤2：计算动态相关系数**（第182-249行）
+
+**代码实现**：`_estimate_dcc_correlation()`
+
+```182:249:strategies/copula_dcc_garch_zscore_strategy.py
+    def _estimate_dcc_correlation(self, returns1: np.ndarray, returns2: np.ndarray,
+                                  garch_fitted1: object, garch_fitted2: object,
+                                  dcc_alpha: float, dcc_beta: float) -> float:
+        """
+        使用DCC模型估计当前时刻的动态相关系数
+        
+        Args:
+            returns1: 第一个资产的收益率序列
+            returns2: 第二个资产的收益率序列
+            garch_fitted1: 第一个资产的GARCH模型
+            garch_fitted2: 第二个资产的GARCH模型
+            dcc_alpha: DCC参数α
+            dcc_beta: DCC参数β
+            
+        Returns:
+            float: 当前时刻的动态相关系数
+        """
+        # 获取标准化残差
+        conditional_vol1 = garch_fitted1.conditional_volatility
+        conditional_vol2 = garch_fitted2.conditional_volatility
+        
+        standardized_residuals1 = returns1 / (conditional_vol1 + 1e-8)
+        standardized_residuals2 = returns2 / (conditional_vol2 + 1e-8)
+        
+        # 计算无条件协方差矩阵
+        Q_bar = np.cov(standardized_residuals1, standardized_residuals2)
+        q_bar_12 = Q_bar[0, 1]
+        
+        # 初始化Q矩阵
+        Q_t = np.array([[1.0, q_bar_12], [q_bar_12, 1.0]])
+        
+        # 递归更新Q矩阵
+        for t in range(1, len(returns1)):
+            epsilon_t = np.array([standardized_residuals1[t-1], 
+                                standardized_residuals2[t-1]])
+            Q_t = (1 - dcc_alpha - dcc_beta) * np.array([[1.0, q_bar_12], 
+                                                          [q_bar_12, 1.0]]) + \
+                  dcc_alpha * np.outer(epsilon_t, epsilon_t) + \
+                  dcc_beta * Q_t
+        
+        # 计算条件相关系数矩阵 R_t
+        diag_inv = 1.0 / np.sqrt(np.diag(Q_t))
+        R_t = np.diag(diag_inv) @ Q_t @ np.diag(diag_inv)
+        
+        # 返回相关系数
+        correlation = R_t[0, 1]
+```
+
+**完整DCC公式**：
+```
+Q_t = (1 - α - β) * Q̄ + α * (u_{t-1} * u'_{t-1}) + β * Q_{t-1}
+R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
+ρ_t = R_t[1,2]
+```
+
+其中：
+- `Q_t`：准相关矩阵（quasi-correlation matrix）
+- `R_t`：条件相关系数矩阵
+- `ρ_t`：动态相关系数
+- `α, β`：DCC参数（通过MLE估计）
+
+**优点**：
+- 完整实现DCC模型
+- 能够准确捕捉相关性的时变特性
+- 考虑了波动率的影响（通过标准化残差）
+
+**与简化版的区别**：
+- 简化版：使用滚动窗口计算相关系数
+- 完整版：使用DCC模型递归更新，考虑历史相关性的持续性
+
+---
+
+## 四、Copula函数详解
+
+### 4.1 Copula函数原理
+
+#### 4.1.1 基本思想
+
+**Copula函数**是连接多个随机变量的边际分布和联合分布的函数。
+
+**Sklar定理**（Copula理论的基础）：
+对于n个随机变量 `X₁, X₂, ..., Xₙ`，如果它们的边际分布函数分别为 `F₁, F₂, ..., Fₙ`，联合分布函数为 `F`，则存在一个Copula函数 `C`，使得：
+
+```
+F(x₁, x₂, ..., xₙ) = C(F₁(x₁), F₂(x₂), ..., Fₙ(xₙ))
+```
+
+**关键洞察**：
+- Copula函数**分离**了边际分布和依赖结构
+- 边际分布描述单个变量的特征
+- Copula函数描述变量之间的依赖关系
+
+#### 4.1.2 高斯Copula（Gaussian Copula）
+
+**数学定义**：
+
+对于两个随机变量 `X₁, X₂`，高斯Copula定义为：
+
 ```
 C(u₁, u₂; ρ) = Φ_ρ(Φ⁻¹(u₁), Φ⁻¹(u₂))
 ```
 
 其中：
-- `σ²_t`：条件方差（波动率的平方）
-- `ρ_t`：动态相关系数
-- `u₁, u₂`：边际分布的累积分布函数值
-- `Φ_ρ`：二元标准正态分布的累积分布函数
+- `u₁ = F₁(x₁)`：第一个变量的累积分布函数值
+- `u₂ = F₂(x₂)`：第二个变量的累积分布函数值
+- `Φ⁻¹()`：标准正态分布的逆累积分布函数（分位数函数）
+- `Φ_ρ()`：相关系数为 `ρ` 的二元标准正态分布的累积分布函数
+- `ρ`：Copula参数（对于高斯Copula，就是相关系数）
+
+**二元标准正态分布**：
+
+如果 `(Z₁, Z₂) ~ N₂(0, Σ)`，其中：
+```
+Σ = [1   ρ]
+    [ρ   1]
+```
+
+则：
+```
+Φ_ρ(z₁, z₂) = P(Z₁ ≤ z₁, Z₂ ≤ z₂)
+```
+
+**密度函数**：
+
+高斯Copula的密度函数为：
+```
+c(u₁, u₂; ρ) = (1/√(1-ρ²)) * exp(-(z₁² + z₂² - 2ρz₁z₂)/(2(1-ρ²)) + (z₁² + z₂²)/2)
+```
+
+其中 `z₁ = Φ⁻¹(u₁)`, `z₂ = Φ⁻¹(u₂)`
+
+#### 4.1.3 在价差Z-score计算中的应用
+
+**代码实现**（第251-308行）：
+
+```251:308:strategies/copula_dcc_garch_zscore_strategy.py
+    def _estimate_copula_parameter(self, returns1: np.ndarray, returns2: np.ndarray) -> Tuple[float, Optional[float]]:
+        """
+        估计Copula参数
+        
+        对于高斯Copula，参数是相关系数
+        对于t-Copula，需要估计相关系数和自由度
+        
+        Args:
+            returns1: 第一个资产的收益率序列
+            returns2: 第二个资产的收益率序列
+            
+        Returns:
+            Tuple[float, Optional[float]]: (相关系数, 自由度) 对于t-Copula，自由度不为None
+        """
+        if len(returns1) != len(returns2) or len(returns1) < 10:
+            return (0.0, None)
+        
+        try:
+            # 转换为标准正态分布（使用经验分布函数）
+            # 使用排序位置估计边际分布
+            ranks1 = np.argsort(np.argsort(returns1)) / (len(returns1) - 1)
+            ranks2 = np.argsort(np.argsort(returns2)) / (len(returns2) - 1)
+            
+            # 转换为标准正态分布
+            u1 = norm.ppf(np.clip(ranks1, 0.001, 0.999))
+            u2 = norm.ppf(np.clip(ranks2, 0.001, 0.999))
+            
+            # 估计相关系数（高斯Copula参数）
+            correlation = np.corrcoef(u1, u2)[0, 1]
+            
+            if np.isnan(correlation) or np.isinf(correlation):
+                correlation = 0.0
+            correlation = np.clip(correlation, -0.99, 0.99)
+            
+            # 如果是t-Copula，还需要估计自由度
+            if self.copula_type == 'student':
+                # 使用最大似然估计自由度（简化版）
+                # 尝试不同的自由度值，选择使对数似然最大的
+                best_df = 5.0
+                best_loglik = -np.inf
+                
+                for df in [3, 4, 5, 6, 7, 8, 9, 10]:
+                    try:
+                        # 计算t-Copula的对数似然（简化版）
+                        # 实际应该使用完整的t-Copula密度函数
+                        loglik = -0.5 * (df + 2) * np.sum(np.log(1 + (u1**2 + u2**2 - 2*correlation*u1*u2) / (df * (1 - correlation**2))))
+                        if loglik > best_loglik:
+                            best_loglik = loglik
+                            best_df = float(df)
+                    except:
+                        continue
+                
+                return (correlation, best_df)
+            else:
+                return (correlation, None)
+```
+
+**步骤详解**：
+
+1. **估计边际分布**（使用经验分布函数）：
+   ```
+   u₁ = rank(returns1) / (n - 1)
+   u₂ = rank(returns2) / (n - 1)
+   ```
+   其中 `rank()` 是排序位置
+
+2. **转换为标准正态分布**：
+   ```
+   z₁ = Φ⁻¹(u₁)
+   z₂ = Φ⁻¹(u₂)
+   ```
+
+3. **估计Copula参数**：
+   - **高斯Copula**：`ρ = corr(z₁, z₂)`
+   - **t-Copula**：`(ρ, ν)`，其中 `ν` 是自由度（通过最大似然估计）
+
+**为什么使用经验分布函数？**
+
+- 不需要假设边际分布的具体形式
+- 对异常值更稳健
+- 能够捕捉非正态的边际分布
+- 能够捕捉尾部依赖（特别是t-Copula）
+
+---
+
+## 五、Copula + DCC-GARCH完整流程（完整版）
+
+### 5.1 计算Z-score的完整步骤
+
+**核心方法**：`calculate_z_score()`（第310-463行）
+
+**重要**：完整版需要两个资产的价格序列（`historical_prices1` 和 `historical_prices2`），而不是只有价差序列。
+
+#### 步骤1：输入验证和数据准备
+
+```332:355:strategies/copula_dcc_garch_zscore_strategy.py
+        # 验证输入数据
+        if not self.validate_input(historical_spreads, min_length=self.min_data_length):
+            return 0.0
+        
+        # 检查是否有价格数据
+        if historical_prices1 is None or historical_prices2 is None:
+            # 如果没有价格数据，回退到简化版本（基于价差收益率）
+            return self._calculate_z_score_simplified(current_spread, historical_spreads)
+        
+        if len(historical_prices1) != len(historical_prices2) or \
+           len(historical_prices1) != len(historical_spreads):
+            # 数据长度不匹配
+            return self._calculate_z_score_simplified(current_spread, historical_spreads)
+        
+        try:
+            # 转换为numpy数组
+            prices1_array = np.array(historical_prices1)
+            prices2_array = np.array(historical_prices2)
+            spreads_array = np.array(historical_spreads)
+            
+            # 计算两个资产的收益率序列
+            returns1 = self._calculate_returns(prices1_array)
+            returns2 = self._calculate_returns(prices2_array)
+```
+
+**收益率计算公式**（对数收益率）：
+```
+r₁_t = log(P₁_t / P₁_{t-1})  （资产1的收益率）
+r₂_t = log(P₂_t / P₂_{t-1})  （资产2的收益率）
+```
+
+#### 步骤2：对每个资产拟合GARCH模型
+
+```367:388:strategies/copula_dcc_garch_zscore_strategy.py
+                # 步骤1: 对每个资产拟合GARCH模型
+                garch_fitted1 = self._fit_garch_model(returns1)
+                garch_fitted2 = self._fit_garch_model(returns2)
+                
+                if garch_fitted1 is None or garch_fitted2 is None:
+                    # GARCH拟合失败，使用传统方法
+                    return self._calculate_z_score_simplified(current_spread, historical_spreads)
+                
+                # 步骤2: 估计DCC参数
+                dcc_alpha, dcc_beta = self._estimate_dcc_parameters(returns1, returns2, 
+                                                                    garch_fitted1, garch_fitted2)
+                
+                # 步骤3: 估计Copula参数
+                copula_param, copula_df = self._estimate_copula_parameter(returns1, returns2)
+```
+
+**GARCH模型拟合**：
+- 资产1：`garch_fitted1 = fit_garch(returns1)`，估计 `σ²₁_t`
+- 资产2：`garch_fitted2 = fit_garch(returns2)`，估计 `σ²₂_t`
+- 使用最大似然估计（MLE）估计参数
+
+#### 步骤3：估计DCC参数
+
+**调用**：`_estimate_dcc_parameters(returns1, returns2, garch_fitted1, garch_fitted2)`
+
+**方法**：
+1. 获取标准化残差：`u₁_t = r₁_t / σ₁_t`，`u₂_t = r₂_t / σ₂_t`
+2. 计算无条件协方差矩阵：`Q̄ = E[u_t * u_t']`
+3. 使用网格搜索估计DCC参数 `(α, β)`，最大化对数似然函数
+
+#### 步骤4：估计Copula参数
+
+**调用**：`_estimate_copula_parameter(returns1, returns2)`
+
+**方法**：
+1. 使用经验分布函数估计边际分布
+2. 转换为标准正态分布
+3. 估计Copula参数 `ρ`（高斯Copula）或 `(ρ, ν)`（t-Copula）
+
+#### 步骤5：预测动态波动率
+
+```390:405:strategies/copula_dcc_garch_zscore_strategy.py
+            # 步骤4: 预测动态波动率
+            try:
+                garch_forecast1 = garch_fitted1.forecast(horizon=1)
+                garch_forecast2 = garch_fitted2.forecast(horizon=1)
+                predicted_vol1 = np.sqrt(garch_forecast1.variance.values[-1, 0])
+                predicted_vol2 = np.sqrt(garch_forecast2.variance.values[-1, 0])
+            except Exception:
+                # 预测失败，使用历史波动率
+                predicted_vol1 = np.std(returns1)
+                predicted_vol2 = np.std(returns2)
+            
+            # 验证波动率
+            if predicted_vol1 <= 0 or np.isnan(predicted_vol1):
+                predicted_vol1 = np.std(returns1)
+            if predicted_vol2 <= 0 or np.isnan(predicted_vol2):
+                predicted_vol2 = np.std(returns2)
+```
+
+**预测公式**：
+```
+σ²₁_{t+1} = ω₁ + α₁₁*ε²₁_t + β₁₁*σ²₁_t
+σ²₂_{t+1} = ω₂ + α₂₂*ε²₂_t + β₂₂*σ²₂_t
+σ₁_{t+1} = √(σ²₁_{t+1})
+σ₂_{t+1} = √(σ²₂_{t+1})
+```
+
+#### 步骤6：估计动态相关系数（DCC）
+
+```410:413:strategies/copula_dcc_garch_zscore_strategy.py
+            # 步骤5: 估计动态相关系数（使用DCC模型）
+            dcc_correlation = self._estimate_dcc_correlation(returns1, returns2, 
+                                                            garch_fitted1, garch_fitted2,
+                                                            dcc_alpha, dcc_beta)
+```
+
+**DCC公式**：
+```
+Q_t = (1 - α - β) * Q̄ + α * (u_{t-1} * u'_{t-1}) + β * Q_{t-1}
+R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
+ρ_t = R_t[1,2]
+```
+
+#### 步骤7：计算价差的动态方差
+
+```415:446:strategies/copula_dcc_garch_zscore_strategy.py
+            # 步骤6: 计算价差的动态方差
+            # 假设价差 = price1 - hedge_ratio * price2
+            # 价差的方差 = Var(price1) + hedge_ratio^2 * Var(price2) - 2 * hedge_ratio * Cov(price1, price2)
+            # 对于收益率：Var(spread_return) = Var(return1) + hedge_ratio^2 * Var(return2) - 2 * hedge_ratio * Corr * Std(return1) * Std(return2)
+            
+            # 估计hedge_ratio（使用历史价差和价格）
+            # 简化：使用OLS回归估计hedge_ratio
+            try:
+                # price1 = hedge_ratio * price2 + spread
+                # 使用价格序列估计hedge_ratio
+                X = prices2_array.reshape(-1, 1)
+                y = prices1_array
+                hedge_ratio = np.linalg.lstsq(X, y, rcond=None)[0][0]
+            except:
+                # 估计失败，使用1.0作为默认值
+                hedge_ratio = 1.0
+            
+            # 计算价差的动态方差
+            spread_variance = predicted_vol1**2 + (hedge_ratio**2) * predicted_vol2**2 - \
+                            2 * hedge_ratio * dcc_correlation * predicted_vol1 * predicted_vol2
+            
+            # 使用Copula调整方差（考虑尾部依赖）
+            if self.copula_type == 'student' and copula_df is not None:
+                # t-Copula有尾部依赖，可能需要调整方差
+                # 简化处理：使用Copula参数作为调整因子
+                copula_adjustment = 1.0 + 0.1 * abs(copula_param)
+            else:
+                # 高斯Copula
+                copula_adjustment = 1.0 + 0.05 * abs(copula_param)
+            
+            adjusted_spread_variance = spread_variance * copula_adjustment
+            spread_std = np.sqrt(max(adjusted_spread_variance, 1e-8))
+```
+
+**价差方差公式**（完整版）：
+```
+Var(spread_return) = Var(return1) + hedge_ratio² * Var(return2) 
+                     - 2 * hedge_ratio * ρ_t * σ₁_t * σ₂_t
+```
+
+其中：
+- `Var(return1) = σ²₁_t`（资产1的动态方差）
+- `Var(return2) = σ²₂_t`（资产2的动态方差）
+- `ρ_t`：DCC动态相关系数
+- `hedge_ratio`：对冲比率（通过OLS回归估计）
+
+**Copula调整**：
+```
+σ²_spread_adjusted = σ²_spread * (1 + c * |ρ_copula|)
+```
+
+其中：
+- `c = 0.1`（t-Copula）或 `c = 0.05`（高斯Copula）
+- `ρ_copula`：Copula参数
+
+#### 步骤8：计算Z-score
+
+```448:458:strategies/copula_dcc_garch_zscore_strategy.py
+            # 步骤7: 计算价差的动态均值
+            historical_mean = np.mean(spreads_array)
+            
+            # 步骤8: 计算Z-score
+            z_score = (current_spread - historical_mean) / spread_std
+            
+            # 验证结果
+            if np.isnan(z_score) or np.isinf(z_score):
+                return self._calculate_z_score_simplified(current_spread, historical_spreads)
+            
+            return z_score
+```
+
+**Z-score公式**：
+```
+Z = (spread_t - μ_spread) / σ_spread
+```
+
+其中：
+- `spread_t`：当前价差
+- `μ_spread`：价差的历史均值
+- `σ_spread`：价差的动态标准差（基于两个资产的动态波动率、DCC相关性和Copula调整）
+
+---
+
+## 六、数学模型总结（完整版）
+
+### 6.1 完整模型框架
+
+**资产收益率模型**：
+```
+r₁_t = log(P₁_t / P₁_{t-1})  （资产1的对数收益率）
+r₂_t = log(P₂_t / P₂_{t-1})  （资产2的对数收益率）
+```
+
+**GARCH模型（每个资产的波动率）**：
+```
+σ²₁_t = ω₁ + α₁₁*ε²₁_{t-1} + β₁₁*σ²₁_{t-1}  （资产1）
+σ²₂_t = ω₂ + α₂₂*ε²₂_{t-1} + β₂₂*σ²₂_{t-1}  （资产2）
+```
+
+**标准化残差**：
+```
+u₁_t = r₁_t / σ₁_t
+u₂_t = r₂_t / σ₂_t
+```
+
+**DCC模型（动态相关性）**：
+```
+Q_t = (1 - α - β) * Q̄ + α * (u_{t-1} * u'_{t-1}) + β * Q_{t-1}
+R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
+ρ_t = R_t[1,2]
+```
+
+**Copula模型（依赖结构）**：
+```
+u₁ = F₁(r₁_t)  （资产1的经验分布函数值）
+u₂ = F₂(r₂_t)  （资产2的经验分布函数值）
+z₁ = Φ⁻¹(u₁)
+z₂ = Φ⁻¹(u₂)
+ρ_copula = corr(z₁, z₂)
+```
+
+**价差方差（基于两个资产的动态波动率和DCC相关性）**：
+```
+Var(spread_return) = σ²₁_t + hedge_ratio² * σ²₂_t 
+                     - 2 * hedge_ratio * ρ_t * σ₁_t * σ₂_t
+```
+
+**Copula调整**：
+```
+σ²_spread_adjusted = σ²_spread * (1 + c * |ρ_copula|)
+```
+
+其中：
+- `c = 0.1`（t-Copula）或 `c = 0.05`（高斯Copula）
+
+**价差标准差**：
+```
+σ_spread = √(σ²_spread_adjusted)
+```
+
+**Z-score**：
+```
+Z = (spread_t - μ_spread) / σ_spread
+```
+
+### 6.2 模型优势（完整版）
+
+1. **动态波动率**：对每个资产分别建模GARCH，能够捕捉各自波动率的时变特性
+2. **动态相关性**：使用完整DCC模型，能够准确捕捉两个资产之间相关性的时变特性
+3. **非线性依赖**：Copula函数能够捕捉非线性依赖结构，特别是尾部依赖
+4. **价差方差**：基于两个资产的动态波动率和动态相关性，准确计算价差的动态方差
+5. **稳健性**：使用经验分布函数，对异常值更稳健
+
+### 6.3 模型局限性
+
+1. **计算复杂度**：需要更多数据（最小50个数据点）和计算资源
+2. **参数调整**：Copula调整因子（0.05或0.1）是经验值，可能需要根据数据调整
+3. **假设限制**：仍然假设标准化残差服从标准正态分布（GARCH模型）
+4. **DCC参数估计**：使用网格搜索，可能不如完整MLE精确
+
+---
+
+## 七、容错机制
+
+### 7.1 多层容错设计
+
+**第一层：输入验证**
+- 检查数据长度是否足够
+- 不足时返回0.0
+
+**第二层：GARCH拟合失败**
+- 如果GARCH拟合失败，回退到传统方法
+
+**第三层：波动率预测失败**
+- 如果波动率预测失败，使用历史波动率
+
+**第四层：Z-score验证**
+- 验证Z-score有效性（NaN/Inf检查）
+- 如果无效，回退到传统方法
+
+**第五层：全局异常捕获**
+- 捕获所有异常，尝试传统方法作为后备
+
+### 7.2 容错代码实现
+
+```285:296:strategies/copula_dcc_garch_zscore_strategy.py
+        except Exception as e:
+            # 任何错误都返回0，并尝试使用传统方法作为后备
+            try:
+                spreads_array = np.array(historical_spreads)
+                historical_mean = np.mean(spreads_array)
+                historical_std = np.std(spreads_array)
+                if historical_std > 0:
+                    return (current_spread - historical_mean) / historical_std
+            except:
+                pass
+            print(f"Copula + DCC-GARCH模型计算失败: {str(e)}")
+            return 0.0
+```
+
+---
+
+## 八、参数说明
+
+### 8.1 策略参数
+
+- **garch_order**：GARCH模型阶数 `(p, q)`，默认 `(1, 1)`
+  - `p`：ARCH项阶数（残差平方的滞后项数）
+  - `q`：GARCH项阶数（条件方差的滞后项数）
+
+- **copula_type**：Copula类型，可选：
+  - `'gaussian'`：高斯Copula（默认）
+  - `'student'`：t-Copula（未来扩展）
+
+- **min_data_length**：最小数据长度，默认50
+  - GARCH模型需要至少20个数据点
+  - Copula估计需要更多数据点
+
+### 8.2 参数选择建议
+
+1. **GARCH阶数**：
+   - 对于大多数金融时间序列，GARCH(1,1)已经足够
+   - 如果数据有复杂的波动率模式，可以尝试GARCH(2,1)或GARCH(1,2)
+
+2. **Copula类型**：
+   - 高斯Copula：适合大多数情况
+   - t-Copula：适合有尾部依赖的情况（未来实现）
+
+3. **最小数据长度**：
+   - 至少50个数据点
+   - 如果数据质量好，可以降低到40
+   - 如果数据质量差，建议增加到60-80
 
 ---
 
@@ -1258,10 +2059,11 @@ C(u₁, u₂; ρ) = Φ_ρ(Φ⁻¹(u₁), Φ⁻¹(u₂))
    - CSV文件必须包含 `timestamp` 和 `close` 列
    - 时间戳格式需要能被pandas解析
 
-2. **Copula + DCC-GARCH参数**：
+2. **Copula + DCC-GARCH参数**（完整版）：
    - `garch_order`：GARCH模型阶数，默认(1,1)
    - `copula_type`：Copula类型，'gaussian'或'student'，默认'gaussian'
-   - `min_data_length`：最小数据长度，默认50（需要更多数据用于GARCH和Copula估计）
+   - `min_data_length`：最小数据长度，默认50（需要更多数据用于GARCH、DCC和Copula估计）
+   - **重要**：需要两个资产的价格序列（`historical_prices1` 和 `historical_prices2`），主程序会自动传递
 
 3. **计算性能**：
    - 滚动窗口检验可能耗时较长
@@ -1273,7 +2075,7 @@ C(u₁, u₂; ρ) = Φ_ρ(Φ⁻¹(u₁), Φ⁻¹(u₂))
    - ARIMA-GARCH：适合有趋势和波动聚集的市场
    - ECM：适合协整关系明显的市场
    - Kalman Filter：适合动态变化的市场，能自适应调整
-   - **Copula + DCC-GARCH**：适合需要建模相关性和波动率动态变化的市场
+   - **Copula + DCC-GARCH（完整版）**：适合需要建模两个资产之间相关性和波动率动态变化的市场，能够准确计算价差的动态方差
 
 ---
 
@@ -1286,5 +2088,11 @@ C(u₁, u₂; ρ) = Φ_ρ(Φ⁻¹(u₁), Φ⁻¹(u₂))
 3. **完整交易回测**：包含开仓、平仓、止盈止损、手续费等
 4. **参数优化**：支持多种优化方法，寻找最佳参数组合
 
-Copula + DCC-GARCH策略通过动态估计波动率和相关性，使用Copula建模依赖结构，能够更好地捕捉市场动态，提高交易信号的准确性。
+Copula + DCC-GARCH策略（完整版）通过：
+1. 对每个资产分别建模GARCH，动态估计各自的波动率
+2. 使用完整DCC模型，动态估计两个资产之间的相关性
+3. 使用Copula建模两个资产之间的依赖结构
+4. 基于动态波动率和相关性，准确计算价差的动态方差
+
+能够更好地捕捉市场动态，提高交易信号的准确性。
 

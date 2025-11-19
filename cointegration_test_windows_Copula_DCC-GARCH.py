@@ -1349,20 +1349,24 @@ class AdvancedCointegrationTrading:
 
         return symbol1_size, symbol2_size, total_capital_used
 
-    def calculate_z_score(self, current_spread, historical_spreads):
+    def calculate_z_score(self, current_spread, historical_spreads, 
+                         historical_prices1=None, historical_prices2=None):
         """
         计算当前Z-score（使用策略对象）
 
         Args:
             current_spread: 当前价差
             historical_spreads: 历史价差序列
+            historical_prices1: 第一个资产的历史价格序列（可选）
+            historical_prices2: 第二个资产的历史价格序列（可选）
 
         Returns:
             float: Z-score值
         """
         # 如果使用了策略对象，调用策略的方法
         if self.z_score_strategy is not None:
-            return self.z_score_strategy.calculate_z_score(current_spread, historical_spreads)
+            return self.z_score_strategy.calculate_z_score(current_spread, historical_spreads,
+                                                          historical_prices1, historical_prices2)
 
         # 向后兼容：如果没有策略对象，使用旧方法
         if self.use_arima_garch:
@@ -1980,6 +1984,8 @@ class AdvancedCointegrationTrading:
 
                     # 获取历史原始价差数据
                     historical_spreads = []
+                    historical_prices1 = []
+                    historical_prices2 = []
                     for j in range(max(0, i - self.lookback_period), i):
                         if j < len(all_timestamps):
                             hist_timestamp = all_timestamps[j]
@@ -1991,6 +1997,8 @@ class AdvancedCointegrationTrading:
                                     pair_info['hedge_ratio']
                                 )
                                 historical_spreads.append(hist_spread)
+                                historical_prices1.append(data[symbol1].loc[hist_timestamp])
+                                historical_prices2.append(data[symbol2].loc[hist_timestamp])
                 else:
                     # 一阶差分价差
                     if i > 0:  # 确保有前一个时间点
@@ -2007,6 +2015,8 @@ class AdvancedCointegrationTrading:
 
                     # 获取历史一阶差分价差数据
                     historical_spreads = []
+                    historical_prices1 = []
+                    historical_prices2 = []
                     for j in range(max(1, i - self.lookback_period), i):
                         if j < len(all_timestamps):
                             hist_timestamp = all_timestamps[j]
@@ -2019,8 +2029,11 @@ class AdvancedCointegrationTrading:
                                 hist_diff2 = data[symbol2].loc[hist_timestamp] - data[symbol2].loc[prev_hist_timestamp]
                                 hist_spread = hist_diff1 - pair_info['hedge_ratio'] * hist_diff2
                                 historical_spreads.append(hist_spread)
+                                historical_prices1.append(data[symbol1].loc[hist_timestamp])
+                                historical_prices2.append(data[symbol2].loc[hist_timestamp])
 
-                current_z_score = self.calculate_z_score(current_spread, historical_spreads)
+                current_z_score = self.calculate_z_score(current_spread, historical_spreads,
+                                                        historical_prices1, historical_prices2)
 
                 # 检查平仓条件
                 if pair_info['pair_name'] in self.positions:

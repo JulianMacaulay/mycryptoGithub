@@ -22,13 +22,16 @@ class BaseZScoreStrategy(ABC):
         self.params = kwargs
     
     @abstractmethod
-    def calculate_z_score(self, current_spread: float, historical_spreads: List[float]) -> float:
+    def calculate_z_score(self, current_spread: float, historical_spreads: List[float], 
+                         historical_prices1: List[float] = None, historical_prices2: List[float] = None) -> float:
         """
         计算当前Z-score
         
         Args:
             current_spread: 当前价差
             historical_spreads: 历史价差序列
+            historical_prices1: 第一个资产的历史价格序列（可选，某些策略需要）
+            historical_prices2: 第二个资产的历史价格序列（可选，某些策略需要）
             
         Returns:
             float: Z-score值
@@ -57,4 +60,5 @@ class BaseZScoreStrategy(ABC):
         if not historical_spreads or len(historical_spreads) < min_length:
             return False
         return True
+
 
