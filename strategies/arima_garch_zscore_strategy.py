@@ -49,7 +49,8 @@ class ArimaGarchZScoreStrategy(BaseZScoreStrategy):
         self._arima_garch_models = {}
         self._max_cache_size = 10
     
-    def calculate_z_score(self, current_spread: float, historical_spreads: List[float]) -> float:
+    def calculate_z_score(self, current_spread: float, historical_spreads: List[float],
+                         historical_prices1: List[float] = None, historical_prices2: List[float] = None) -> float:
         """
         使用ARIMA-GARCH模型计算Z-score
         
@@ -145,4 +146,5 @@ class ArimaGarchZScoreStrategy(BaseZScoreStrategy):
     def clear_cache(self):
         """清除模型缓存"""
         self._arima_garch_models.clear()
+
 

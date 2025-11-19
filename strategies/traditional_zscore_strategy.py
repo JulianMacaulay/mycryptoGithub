@@ -21,7 +21,8 @@ class TraditionalZScoreStrategy(BaseZScoreStrategy):
         super().__init__(**kwargs)
         self.name = "传统方法"
     
-    def calculate_z_score(self, current_spread: float, historical_spreads: List[float]) -> float:
+    def calculate_z_score(self, current_spread: float, historical_spreads: List[float],
+                         historical_prices1: List[float] = None, historical_prices2: List[float] = None) -> float:
         """
         计算当前Z-score（传统方法：使用均值和标准差）
         
@@ -52,4 +53,5 @@ class TraditionalZScoreStrategy(BaseZScoreStrategy):
     def get_strategy_description(self) -> str:
         """获取策略描述"""
         return "传统方法（均值和标准差）"
+
 
