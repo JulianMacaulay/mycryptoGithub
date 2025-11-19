@@ -358,7 +358,7 @@ z_score = (current_spread - mean) / std
 - 使用GARCH模型预测波动率
 - `z_score = (current_spread - predicted_mean) / predicted_volatility`
 
-**ECM方法**：
+**ECM方法**（详见下方"ECM误差修正模型详解"部分）：
 - 计算长期均值（均衡值）
 - 计算误差修正项 ECM = spread_{t-1} - mean
 - 使用OLS回归估计误差修正系数
@@ -857,6 +857,7 @@ BTCUSDT/ETHUSDT 交易记录:
 - 使用误差修正模型预测均值回归
 - 基于协整关系的长期均衡和短期偏离
 - 特别适合协整交易，因为ECM模型专门描述协整关系的均值回归特性
+- **详细原理和公式见下方"ECM误差修正模型详解"部分**
 
 ### 4. 盈亏计算（统一方法）
 
@@ -960,9 +961,677 @@ python cointegration_test_windows_ECM.py
 
 ---
 
+---
+
+## ECM误差修正模型详解
+
+### 一、ECM模型理论基础
+
+#### 1.1 协整关系与误差修正
+
+**协整关系**：
+如果两个非平稳时间序列 `X_t` 和 `Y_t` 都是 I(1)（一阶单整），但它们的线性组合 `Z_t = X_t - βY_t` 是平稳的（I(0)），则称 `X_t` 和 `Y_t` 是协整的。
+
+**长期均衡关系**：
+对于协整的序列，存在长期均衡关系：
+```
+X_t = α + βY_t + ε_t
+```
+其中 `ε_t` 是平稳的误差项，表示短期偏离。
+
+**误差修正机制**：
+当价差偏离长期均衡时，存在一种"误差修正"机制，使价差回归到均衡值。这就是误差修正模型（ECM）的核心思想。
+
+#### 1.2 为什么需要ECM模型？
+
+在协整交易中：
+- **传统方法**：假设价差的均值是常数，使用历史均值计算Z-score
+- **问题**：价差可能偏离均值，传统方法无法捕捉均值回归的动态过程
+- **ECM模型**：专门描述协整关系的均值回归特性，能够预测价差如何回归到均衡值
+
+#### 1.3 ECM模型的基本形式
+
+**一阶ECM模型**（最常用）：
+```
+Δspread_t = α + β*ECM_{t-1} + ε_t
+```
+
+其中：
+- `Δspread_t = spread_t - spread_{t-1}`：价差的一阶差分（变化量）
+- `ECM_{t-1} = spread_{t-1} - μ`：误差修正项（前一期的偏离）
+- `μ`：长期均值（均衡值）
+- `β`：误差修正系数（通常为负，表示均值回归）
+- `α`：常数项
+- `ε_t`：误差项
+
+**误差修正系数的含义**：
+- `β < 0`：表示均值回归，偏离越大，回归速度越快
+- `β = 0`：表示没有均值回归
+- `β > 0`：表示发散（不常见，可能表示协整关系破裂）
+
+---
+
+### 二、ECM模型的数学推导
+
+#### 2.1 从协整关系推导ECM模型
+
+**协整关系**：
+```
+spread_t = μ + ε_t
+```
+其中 `ε_t` 是平稳的误差项。
+
+**误差修正项**：
+```
+ECM_t = spread_t - μ = ε_t
+```
+
+**一阶差分**：
+```
+Δspread_t = spread_t - spread_{t-1}
+          = (μ + ε_t) - (μ + ε_{t-1})
+          = ε_t - ε_{t-1}
+```
+
+**误差修正模型**：
+由于 `ε_t` 是平稳的，可以表示为：
+```
+ε_t = ρ*ε_{t-1} + u_t
+```
+其中 `|ρ| < 1`（平稳性要求），`u_t` 是白噪声。
+
+因此：
+```
+Δspread_t = ε_t - ε_{t-1}
+          = (ρ*ε_{t-1} + u_t) - ε_{t-1}
+          = (ρ - 1)*ε_{t-1} + u_t
+          = (ρ - 1)*ECM_{t-1} + u_t
+```
+
+**ECM模型**：
+```
+Δspread_t = α + β*ECM_{t-1} + ε_t
+```
+其中 `β = ρ - 1 < 0`（因为 `|ρ| < 1`），表示均值回归。
+
+#### 2.2 ECM模型的参数估计
+
+**使用OLS回归估计参数**：
+
+**回归方程**：
+```
+Δspread_t = α + β*ECM_{t-1} + ε_t
+```
+
+**数据准备**：
+- 因变量：`y = [Δspread_1, Δspread_2, ..., Δspread_T]`
+- 自变量：`X = [1, ECM_0], [1, ECM_1], ..., [1, ECM_{T-1}]`
+
+**OLS估计**：
+```
+[α, β]' = (X'X)^{-1}X'y
+```
+
+**参数解释**：
+- `α`：常数项，表示价差的平均变化
+- `β`：误差修正系数，表示均值回归的速度
+  - `β` 越接近 -1，回归速度越快
+  - `β` 越接近 0，回归速度越慢
+
+#### 2.3 使用ECM模型预测
+
+**预测价差变化**：
+```
+Δspread_t_predicted = α + β*ECM_{t-1}
+```
+
+**预测价差均值**：
+```
+spread_t_predicted = spread_{t-1} + Δspread_t_predicted
+                   = spread_{t-1} + α + β*ECM_{t-1}
+                   = spread_{t-1} + α + β*(spread_{t-1} - μ)
+                   = spread_{t-1} + α + β*spread_{t-1} - β*μ
+                   = (1 + β)*spread_{t-1} + α - β*μ
+```
+
+**简化形式**（忽略常数项，关注均值回归）：
+```
+spread_t_predicted ≈ μ - β*ECM_{t-1}
+                   = μ - β*(spread_{t-1} - μ)
+                   = μ - β*spread_{t-1} + β*μ
+                   = (1 + β)*μ - β*spread_{t-1}
+```
+
+**当 `β < 0` 时**：
+- 如果 `spread_{t-1} > μ`（价差高于均值），则 `ECM_{t-1} > 0`，`β*ECM_{t-1} < 0`
+- 因此 `spread_t_predicted < spread_{t-1}`，价差下降，回归均值
+- 如果 `spread_{t-1} < μ`（价差低于均值），则 `ECM_{t-1} < 0`，`β*ECM_{t-1} > 0`
+- 因此 `spread_t_predicted > spread_{t-1}`，价差上升，回归均值
+
+---
+
+### 三、代码实现详解
+
+**代码位置**：`strategies/ecm_zscore_strategy.py`
+
+#### 3.1 初始化
+
+```23:43:strategies/ecm_zscore_strategy.py
+    def __init__(self, ecm_lag: int = 1, min_data_length: int = 30, **kwargs):
+        """
+        初始化ECM策略
+        
+        Args:
+            ecm_lag: 误差修正项的滞后阶数（默认1，即使用前一期）
+            min_data_length: 最小数据长度要求
+            **kwargs: 其他策略参数
+        """
+        super().__init__(ecm_lag=ecm_lag, min_data_length=min_data_length, **kwargs)
+        self.name = "ECM误差修正模型"
+        self.ecm_lag = ecm_lag
+        self.min_data_length = min_data_length
+        
+        # 检查库是否可用
+        if not STATSMODELS_AVAILABLE:
+            raise ImportError("statsmodels库不可用，无法使用ECM策略")
+        
+        # 存储模型参数缓存
+        self._ecm_params_cache = {}
+        self._max_cache_size = 10
+```
+
+**参数说明**：
+- **ecm_lag**：误差修正项的滞后阶数，默认1（使用前一期）
+- **min_data_length**：最小数据长度，默认30
+- **缓存机制**：缓存ECM系数，避免重复计算
+
+#### 3.2 计算长期均值
+
+```79:80:strategies/ecm_zscore_strategy.py
+            # 计算长期均值（均衡值）
+            long_term_mean = np.mean(spreads_array)
+```
+
+**公式**：
+```
+μ = (1/T) * Σ_{t=1}^T spread_t
+```
+
+**说明**：使用历史价差的均值作为长期均衡值。
+
+#### 3.3 计算误差修正项
+
+```96:97:strategies/ecm_zscore_strategy.py
+                # 计算误差修正项序列
+                ecm_terms = spreads_array[:-1] - long_term_mean  # ECM_{t-1}
+```
+
+**公式**：
+```
+ECM_{t-1} = spread_{t-1} - μ
+```
+
+**说明**：计算每个时刻的误差修正项（偏离长期均值的程度）。
+
+#### 3.4 计算价差的一阶差分
+
+```99:100:strategies/ecm_zscore_strategy.py
+                # 计算价差的一阶差分
+                diff_spreads = np.diff(spreads_array)  # Δspread_t
+```
+
+**公式**：
+```
+Δspread_t = spread_t - spread_{t-1}
+```
+
+**说明**：计算价差的变化量。
+
+#### 3.5 估计ECM系数
+
+```108:126:strategies/ecm_zscore_strategy.py
+                    # 构建ECM模型：Δspread_t = α + β*ECM_{t-1} + ε_t
+                    ecm_terms_aligned = ecm_terms[-min_len:]
+                    diff_spreads_aligned = diff_spreads[-min_len:]
+                    
+                    # 使用OLS回归估计ECM系数
+                    X = add_constant(ecm_terms_aligned.reshape(-1, 1))
+                    y = diff_spreads_aligned
+                    
+                    try:
+                        model = OLS(y, X).fit()
+                        ecm_coefficient = model.params[1]  # β系数（误差修正系数）
+                        
+                        # 验证系数合理性（应该在-1到0之间，表示均值回归）
+                        if ecm_coefficient > 0 or ecm_coefficient < -1:
+                            # 系数不合理，使用默认值
+                            ecm_coefficient = -0.1
+                    except Exception:
+                        # 回归失败，使用默认值
+                        ecm_coefficient = -0.1
+```
+
+**回归方程**：
+```
+Δspread_t = α + β*ECM_{t-1} + ε_t
+```
+
+**OLS估计**：
+- `X = [1, ECM_0], [1, ECM_1], ..., [1, ECM_{T-1}]`（添加常数项）
+- `y = [Δspread_1, Δspread_2, ..., Δspread_T]`
+- `[α, β]' = (X'X)^{-1}X'y`
+- `ecm_coefficient = β`（误差修正系数）
+
+**系数验证**：
+- 合理的ECM系数应该在 `[-1, 0]` 之间
+- 如果系数不合理，使用默认值 `-0.1`
+
+#### 3.6 预测价差的均值回归
+
+```136:147:strategies/ecm_zscore_strategy.py
+            # 计算当前误差修正项
+            if len(historical_spreads) > self.ecm_lag:
+                ecm_current = historical_spreads[-self.ecm_lag] - long_term_mean
+            else:
+                ecm_current = historical_spreads[-1] - long_term_mean
+            
+            # 使用ECM模型预测价差的均值回归
+            # 预测的价差变化：Δspread_predicted = β*ECM_{t-1}
+            predicted_change = ecm_coefficient * ecm_current
+            
+            # 预测的价差均值（基于均值回归）
+            predicted_mean = long_term_mean - predicted_change
+```
+
+**公式推导**：
+
+1. **计算当前误差修正项**：
+   ```
+   ECM_{t-1} = spread_{t-1} - μ
+   ```
+
+2. **预测价差变化**：
+   ```
+   Δspread_t_predicted = β*ECM_{t-1}
+   ```
+
+3. **预测价差均值**（基于均值回归）：
+   ```
+   spread_t_predicted = spread_{t-1} + Δspread_t_predicted
+                      = spread_{t-1} + β*ECM_{t-1}
+                      = spread_{t-1} + β*(spread_{t-1} - μ)
+                      = spread_{t-1} + β*spread_{t-1} - β*μ
+                      = (1 + β)*spread_{t-1} - β*μ
+   ```
+
+4. **简化形式**（代码中的实现）：
+   ```
+   predicted_mean = μ - β*ECM_{t-1}
+                  = μ - β*(spread_{t-1} - μ)
+                  = μ - β*spread_{t-1} + β*μ
+                  = (1 + β)*μ - β*spread_{t-1}
+   ```
+
+**说明**：
+- 代码中使用 `predicted_mean = long_term_mean - predicted_change`
+- 这等价于 `predicted_mean = μ - β*ECM_{t-1}`
+- 当 `β < 0` 时，如果 `ECM_{t-1} > 0`（价差高于均值），则 `predicted_mean < μ`，价差下降
+- 当 `β < 0` 时，如果 `ECM_{t-1} < 0`（价差低于均值），则 `predicted_mean > μ`，价差上升
+
+#### 3.7 计算Z-score
+
+```154:155:strategies/ecm_zscore_strategy.py
+            # 计算Z-score
+            z_score = (current_spread - predicted_mean) / historical_std
+```
+
+**公式**：
+```
+Z = (spread_t - spread_t_predicted) / σ
+```
+
+其中：
+- `spread_t`：当前价差
+- `spread_t_predicted`：ECM模型预测的价差均值
+- `σ`：历史波动率（标准差）
+
+**与传统方法的区别**：
+- **传统方法**：`Z = (spread_t - μ) / σ`，使用固定的长期均值
+- **ECM方法**：`Z = (spread_t - spread_t_predicted) / σ`，使用动态预测的均值
+
+---
+
+### 四、ECM模型在回测中的应用
+
+#### 4.1 策略调用流程
+
+在回测主循环中，ECM策略的调用流程如下：
+
+```644:645:cointegration_test_windows_ECM.py
+                current_z_score = self.calculate_z_score(current_spread, historical_spreads,
+                                                        historical_prices1, historical_prices2)
+```
+
+**调用链**：
+1. `backtest_cointegration_trading()` 方法收集历史价差数据
+2. 调用 `calculate_z_score()` 方法（`AdvancedCointegrationTrading` 类）
+3. `calculate_z_score()` 方法调用 `z_score_strategy.calculate_z_score()`（策略对象）
+4. `EcmZScoreStrategy.calculate_z_score()` 执行以下步骤：
+   - 计算长期均值
+   - 计算误差修正项
+   - 估计ECM系数
+   - 预测价差的均值回归
+   - 计算Z-score
+
+#### 4.2 模型缓存机制
+
+为了提高计算效率，ECM策略实现了参数缓存：
+
+```89:134:strategies/ecm_zscore_strategy.py
+            # 创建缓存键（基于数据长度和最后几个值）
+            cache_key = (len(spreads_array), tuple(spreads_array[-5:]))
+            
+            # 检查缓存
+            if cache_key in self._ecm_params_cache:
+                ecm_coefficient = self._ecm_params_cache[cache_key]
+            else:
+                # 计算误差修正项序列
+                ecm_terms = spreads_array[:-1] - long_term_mean  # ECM_{t-1}
+                
+                # 计算价差的一阶差分
+                diff_spreads = np.diff(spreads_array)  # Δspread_t
+                
+                # 确保长度匹配
+                min_len = min(len(ecm_terms), len(diff_spreads))
+                if min_len < 10:
+                    # 数据不足，使用简单方法
+                    ecm_coefficient = -0.1  # 默认的均值回归系数
+                else:
+                    # 构建ECM模型：Δspread_t = α + β*ECM_{t-1} + ε_t
+                    ecm_terms_aligned = ecm_terms[-min_len:]
+                    diff_spreads_aligned = diff_spreads[-min_len:]
+                    
+                    # 使用OLS回归估计ECM系数
+                    X = add_constant(ecm_terms_aligned.reshape(-1, 1))
+                    y = diff_spreads_aligned
+                    
+                    try:
+                        model = OLS(y, X).fit()
+                        ecm_coefficient = model.params[1]  # β系数（误差修正系数）
+                        
+                        # 验证系数合理性（应该在-1到0之间，表示均值回归）
+                        if ecm_coefficient > 0 or ecm_coefficient < -1:
+                            # 系数不合理，使用默认值
+                            ecm_coefficient = -0.1
+                    except Exception:
+                        # 回归失败，使用默认值
+                        ecm_coefficient = -0.1
+                
+                # 缓存参数（限制缓存大小）
+                if len(self._ecm_params_cache) >= self._max_cache_size:
+                    # 清除最旧的缓存
+                    oldest_key = next(iter(self._ecm_params_cache))
+                    del self._ecm_params_cache[oldest_key]
+                
+                self._ecm_params_cache[cache_key] = ecm_coefficient
+```
+
+**缓存机制**：
+- **缓存键**：基于数据长度和最后5个数据点
+- **缓存内容**：ECM系数（β）
+- **缓存大小**：最多缓存10个参数（`_max_cache_size = 10`）
+- **缓存策略**：FIFO（先进先出），当缓存满时删除最旧的参数
+
+#### 4.3 容错机制
+
+ECM策略实现了多层容错机制：
+
+1. **数据不足**：如果历史数据少于最小要求，返回0
+2. **波动率为0**：如果历史波动率为0，返回0
+3. **回归失败**：如果OLS回归失败，使用默认ECM系数 `-0.1`
+4. **系数不合理**：如果ECM系数不在合理范围内（`[-1, 0]`），使用默认值
+5. **预测结果无效**：如果预测结果为NaN，使用长期均值
+
+---
+
+### 五、ECM模型参数说明
+
+#### 5.1 初始化参数
+
+```23:43:strategies/ecm_zscore_strategy.py
+    def __init__(self, ecm_lag: int = 1, min_data_length: int = 30, **kwargs):
+        """
+        初始化ECM策略
+        
+        Args:
+            ecm_lag: 误差修正项的滞后阶数（默认1，即使用前一期）
+            min_data_length: 最小数据长度要求
+            **kwargs: 其他策略参数
+        """
+        super().__init__(ecm_lag=ecm_lag, min_data_length=min_data_length, **kwargs)
+        self.name = "ECM误差修正模型"
+        self.ecm_lag = ecm_lag
+        self.min_data_length = min_data_length
+        
+        # 检查库是否可用
+        if not STATSMODELS_AVAILABLE:
+            raise ImportError("statsmodels库不可用，无法使用ECM策略")
+        
+        # 存储模型参数缓存
+        self._ecm_params_cache = {}
+        self._max_cache_size = 10
+```
+
+**参数说明**：
+- **ecm_lag**：误差修正项的滞后阶数，默认1
+  - `ecm_lag = 1`：使用前一期（`ECM_{t-1}`）
+  - `ecm_lag = 2`：使用前两期（`ECM_{t-2}`）
+  - 通常使用1阶即可
+- **min_data_length**：最小数据长度，默认30
+  - 如果历史数据少于这个长度，使用传统方法
+  - 建议值：至少是 `ecm_lag + 10`
+
+#### 5.2 参数选择建议
+
+**误差修正项滞后阶数（ecm_lag）**：
+- **1**（推荐）：适合大多数情况，使用前一期
+- **2**：如果价差回归有延迟，可以使用前两期
+- **更多阶数**：通常不推荐，模型复杂度高
+
+**最小数据长度（min_data_length）**：
+- **30**（默认）：适合大多数情况
+- **50**：如果数据充足，可以提高稳定性
+- **20**：最小推荐值，低于此值可能不稳定
+
+---
+
+### 六、ECM模型数学公式总结
+
+#### 6.1 完整模型公式
+
+**ECM模型**：
+```
+Δspread_t = α + β*ECM_{t-1} + ε_t
+```
+
+其中：
+- `Δspread_t = spread_t - spread_{t-1}`：价差的一阶差分
+- `ECM_{t-1} = spread_{t-1} - μ`：误差修正项
+- `μ = mean(historical_spreads)`：长期均值（均衡值）
+- `β`：误差修正系数（通常为负，表示均值回归）
+- `α`：常数项
+- `ε_t`：误差项
+
+#### 6.2 参数估计公式
+
+**OLS回归**：
+```
+[α, β]' = (X'X)^{-1}X'y
+```
+
+其中：
+- `X = [1, ECM_0], [1, ECM_1], ..., [1, ECM_{T-1}]`
+- `y = [Δspread_1, Δspread_2, ..., Δspread_T]`
+
+#### 6.3 预测公式
+
+**预测价差变化**：
+```
+Δspread_t_predicted = β*ECM_{t-1}
+```
+
+**预测价差均值**：
+```
+spread_t_predicted = μ - β*ECM_{t-1}
+                  = μ - β*(spread_{t-1} - μ)
+                  = (1 + β)*μ - β*spread_{t-1}
+```
+
+#### 6.4 Z-score计算公式
+
+**ECM Z-score**：
+```
+Z = (spread_t - spread_t_predicted) / σ
+```
+
+其中：
+- `spread_t`：当前价差
+- `spread_t_predicted`：ECM模型预测的价差均值
+- `σ`：历史波动率（标准差）
+
+---
+
+### 七、ECM策略的优势和局限性
+
+#### 7.1 优势
+
+1. **理论基础扎实**：
+   - 基于协整理论和误差修正模型，有坚实的统计学基础
+   - 专门描述协整关系的均值回归特性
+
+2. **动态预测**：
+   - 能够预测价差的均值回归，而不是使用固定的历史均值
+   - 根据当前偏离程度调整预测
+
+3. **适合协整交易**：
+   - ECM模型专门用于协整关系，特别适合协整交易
+   - 能够捕捉短期偏离和长期均衡的动态过程
+
+4. **计算效率高**：
+   - 虽然有OLS回归，但计算相对简单
+   - 有缓存机制，避免重复计算
+
+#### 7.2 局限性
+
+1. **需要足够的数据**：
+   - 至少需要 `min_data_length` 个数据点
+   - 需要足够的数据来估计ECM系数
+
+2. **假设协整关系稳定**：
+   - 如果协整关系破裂，ECM模型可能失效
+   - 需要定期重新检验协整关系
+
+3. **参数选择敏感**：
+   - 滞后阶数的选择影响模型性能
+   - 需要根据市场特性调整参数
+
+4. **可能过拟合**：
+   - 如果数据不足，OLS回归可能过拟合
+   - 需要验证ECM系数的合理性
+
+#### 7.3 适用场景
+
+**推荐使用ECM策略的场景**：
+1. **协整关系稳定**：两个资产之间存在稳定的协整关系
+2. **数据充足**：有足够的历史数据（至少30个数据点）
+3. **均值回归明显**：价差有明显的均值回归特性
+4. **对准确性要求高**：需要更准确的Z-score计算
+
+**不推荐使用ECM策略的场景**：
+1. **数据不足**：历史数据少于30个数据点
+2. **协整关系不稳定**：协整关系经常破裂
+3. **价差发散**：价差没有均值回归特性
+
+---
+
+### 八、ECM模型与传统方法的对比
+
+#### 8.1 传统方法
+
+**Z-score计算公式**：
+```
+Z_traditional = (spread_t - μ) / σ
+```
+
+其中：
+- `μ = mean(historical_spreads)`：固定的历史均值
+- `σ = std(historical_spreads)`：历史标准差
+
+**特点**：
+- 使用固定的历史均值
+- 不考虑均值回归的动态过程
+- 计算简单快速
+
+#### 8.2 ECM方法
+
+**Z-score计算公式**：
+```
+Z_ecm = (spread_t - spread_t_predicted) / σ
+```
+
+其中：
+- `spread_t_predicted = μ - β*ECM_{t-1}`：动态预测的均值
+- `σ = std(historical_spreads)`：历史标准差
+
+**特点**：
+- 使用动态预测的均值
+- 考虑均值回归的动态过程
+- 根据当前偏离程度调整预测
+
+#### 8.3 对比示例
+
+**场景**：当前价差 `spread_t = 10`，长期均值 `μ = 5`，历史标准差 `σ = 2`
+
+**传统方法**：
+```
+Z_traditional = (10 - 5) / 2 = 2.5
+```
+
+**ECM方法**（假设 `β = -0.2`，`ECM_{t-1} = 3`）：
+```
+spread_t_predicted = 5 - (-0.2) * 3 = 5 + 0.6 = 5.6
+Z_ecm = (10 - 5.6) / 2 = 2.2
+```
+
+**说明**：
+- ECM方法预测价差会回归到 `5.6`（接近均值 `5`）
+- 因此Z-score略低于传统方法（`2.2 < 2.5`）
+- 这反映了ECM模型对均值回归的预期
+
+---
+
+### 九、总结
+
+ECM误差修正模型是一个强大的Z-score计算策略，能够：
+
+1. **捕捉均值回归**：使用误差修正模型预测价差的均值回归
+2. **动态调整预测**：根据当前偏离程度调整预测的均值
+3. **理论基础扎实**：基于协整理论和误差修正模型
+4. **适合协整交易**：专门用于协整关系，特别适合协整交易
+
+在协整交易中，ECM策略特别适合：
+- 协整关系稳定的场景
+- 价差有明显均值回归特性的场景
+- 需要更准确Z-score计算的场景
+
+通过合理选择参数（滞后阶数、最小数据长度等），ECM策略能够显著提高协整交易的性能。
+
+---
+
 ## 版本信息
 
 - **文件版本**：cointegration_test_windows_ECM.py
 - **主要特性**：滚动窗口协整检验、参数优化、ECM误差修正模型
 - **最后更新**：添加了ECM误差修正模型支持，策略部分放在strategies文件夹下单独调用
+
 
