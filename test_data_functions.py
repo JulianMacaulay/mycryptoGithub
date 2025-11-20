@@ -227,8 +227,35 @@ def test_multiple_symbols_ccxt():
                 'defaultType': 'spot',  # 现货交易
             }
         })
-        
-        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'AVAXUSDT', 'SOLUSDT', 'AAVEUSDT', 'LTCUSDT', 'TONUSDT', 'UNIUSDT', 'SUSHIUSDT', 'OPUSDT', 'ARBUSDT', 'COMPUSDT']
+        # 13个货币
+        # symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'AVAXUSDT', 'SOLUSDT', 'AAVEUSDT', 'LTCUSDT', 'TONUSDT', 'UNIUSDT', 'SUSHIUSDT', 'OPUSDT', 'ARBUSDT', 'COMPUSDT']
+        # 28个货币
+        symbols = [
+        # 主流Layer1公链
+        "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "TONUSDT",
+
+        # Layer2解决方案
+        "ARBUSDT", "OPUSDT", "MATICUSDT",
+
+        # DeFi龙头
+        "UNIUSDT", "AAVEUSDT", "CRVUSDT", "COMPUSDT", "MKRUSDT", "SUSHIUSDT",
+
+        # 老牌公链
+        "LTCUSDT", "BCHUSDT", "ETCUSDT",
+
+        # Meme币
+        "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT",
+
+        # 隐私币
+        "XMRUSDT", "ZECUSDT",
+
+        # 预言机/Oracle
+        "LINKUSDT","BANDUSDT",
+
+        # BTC
+        "BTCUSDT",
+    ]
+
 
         all_data = {}
         
@@ -238,7 +265,7 @@ def test_multiple_symbols_ccxt():
             # ccxt获取历史数据
             all_klines = []
             limit = 1000  # 币安API限制
-            total_limit = 3000  # 期望获取的总数据量
+            total_limit = 5000  # 期望获取的总数据量
             max_requests = (total_limit + limit - 1) // limit  # 计算需要的请求次数
             
             # 使用ccxt的分页方式获取历史数据
@@ -252,11 +279,11 @@ def test_multiple_symbols_ccxt():
                     # 获取OHLCV数据
                     if end_time is None:
                         # 第一次请求，获取最新数据
-                        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=limit)
+                        ohlcv = exchange.fetch_ohlcv(symbol, '30m', limit=limit)
                     else:
                         # 后续请求，获取更早的数据
                         # 使用params传递endTime参数（币安API支持endTime来获取更早的数据）
-                        ohlcv = exchange.fetch_ohlcv(symbol, '1h', since=None, limit=limit, params={'endTime': end_time - 1})
+                        ohlcv = exchange.fetch_ohlcv(symbol, '30m', since=None, limit=limit, params={'endTime': end_time - 1})
                     
                     if not ohlcv:
                         print(f"   没有更多数据，停止获取")
@@ -327,7 +354,7 @@ def test_multiple_symbols_ccxt():
             
             # 分段保存数据
             print(f"\n--- 分段保存数据 ---")
-            segments = [2000, 1000]  # 第一段2000条，第二段1000条
+            segments = [4000, 1000]  # 第一段2000条，第二段1000条
             
             for segment_index, segment_limit in enumerate(segments):
                 print(f"\n保存第 {segment_index + 1} 段数据（{segment_limit} 条）...")
