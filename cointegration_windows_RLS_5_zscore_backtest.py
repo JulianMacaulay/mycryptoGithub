@@ -954,9 +954,9 @@ def filter_by_stability(summaries, data, diff_order=0, min_stability_score=0.5):
                 **summary,
                 'stability_result': stability_result
             })
-            print(f"  ✓ 通过稳定性评估")
+            print(f"   通过稳定性评估")
         else:
-            print(f"  ✗ 未通过稳定性评估")
+            print(f"   未通过稳定性评估")
 
     print(f"\n稳定性评估完成: {len(stable_pairs)}/{len(summaries)} 个币对通过评估")
 
@@ -1254,20 +1254,20 @@ def input_preselected_pairs(data, default_diff_order=0):
             else:
                 separator = '/'
             if separator not in pair_text:
-                print(f"  × 无法识别的币对格式: {pair_text}，请使用 SYMBOL1/SYMBOL2")
+                print(f"   无法识别的币对格式: {pair_text}，请使用 SYMBOL1/SYMBOL2")
                 continue
 
             symbol1, symbol2 = [s.strip().upper() for s in pair_text.split(separator)[:2]]
 
             if symbol1 == symbol2:
-                print(f"  × {symbol1} 与 {symbol2} 相同，忽略")
+                print(f"   {symbol1} 与 {symbol2} 相同，忽略")
                 continue
 
             if symbol1 not in data:
-                print(f"  × 数据中不存在 {symbol1}，跳过")
+                print(f"   数据中不存在 {symbol1}，跳过")
                 continue
             if symbol2 not in data:
-                print(f"  × 数据中不存在 {symbol2}，跳过")
+                print(f"   数据中不存在 {symbol2}，跳过")
                 continue
 
             pair_diff_order_input = input(
@@ -2102,10 +2102,10 @@ class AdvancedCointegrationTrading:
             status['last_check_index'] = current_index
 
             if is_cointegrated:
-                print(f"  ✓ 协整检验通过: {symbol1}/{symbol2} 仍然协整")
+                print(f"   协整检验通过: {symbol1}/{symbol2} 仍然协整")
                 # 如果之前失败过，现在恢复了，重置协整比率
                 if not status.get('is_cointegrated', True):
-                    print(f"  ✓ 协整关系已恢复！")
+                    print(f"   协整关系已恢复！")
                 status['cointegration_ratio'] = 1.0  # 假设通过检验时比率为1.0
                 status['consecutive_failures'] = 0  # 重置连续失败计数
             else:
@@ -2113,7 +2113,7 @@ class AdvancedCointegrationTrading:
                 consecutive_failures = status.get('consecutive_failures', 0) + 1
                 status['consecutive_failures'] = consecutive_failures
 
-                print(f"  ✗ 协整检验失败: {symbol1}/{symbol2} 协整关系破裂！")
+                print(f"  协整检验失败: {symbol1}/{symbol2} 协整关系破裂！")
                 print(f"  连续失败次数: {consecutive_failures}")
                 print(f"    将在 {self.cointegration_check_interval} 个数据点后重新检验")
 
@@ -2984,6 +2984,30 @@ class AdvancedCointegrationTrading:
                 'capital': capital,
                 'positions_count': len(self.positions)
             })
+
+        # 从交易记录中提取第一个交易的时间戳，用于调整capital_curve的起始时间
+        if len(results['trades']) > 0:
+            first_trade_timestamp = results['trades'][0].get('timestamp')
+            if first_trade_timestamp:
+                # 只保留从第一个交易时间戳开始的capital_curve数据
+                filtered_capital_curve = [
+                    point for point in results['capital_curve']
+                    if point['timestamp'] >= first_trade_timestamp
+                ]
+                # 如果过滤后的曲线为空，或者第一个点的时间戳不是第一个交易的时间戳，添加初始点
+                if not filtered_capital_curve or filtered_capital_curve[0]['timestamp'] != first_trade_timestamp:
+                    # 找到第一个交易时间戳对应的资金值（从原始capital_curve中查找）
+                    initial_capital_at_first_trade = capital
+                    for point in reversed(results['capital_curve']):
+                        if point['timestamp'] <= first_trade_timestamp:
+                            initial_capital_at_first_trade = point['capital']
+                            break
+                    filtered_capital_curve.insert(0, {
+                        'timestamp': first_trade_timestamp,
+                        'capital': initial_capital_at_first_trade,
+                        'positions_count': 0
+                    })
+                results['capital_curve'] = filtered_capital_curve
 
         # 计算最终结果
         total_trades = len(results['trades'])
