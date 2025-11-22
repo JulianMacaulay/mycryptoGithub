@@ -1224,8 +1224,7 @@ def input_preselected_pairs(data, default_diff_order=0):
     print("提示：")
     print("  1. 已假设协整检验和稳定性筛选已经完成")
     print("  2. 请直接输入需要回测/优化的币对，例如: BTCUSDT/ETHUSDT")
-    print("  3. 多个币对可使用逗号分隔，或逐个输入")
-    print("  4. 输入完成后直接回车即可开始回测/优化")
+    print("  3. 支持输入多个币对（用逗号分隔），但回测时只会按顺序选择第一个满足开仓条件的币对")
     print("\n可用币种列表（前20个，全部共 {0} 个）:".format(len(available_symbols)))
     print("  " + ", ".join(available_symbols[:20]))
     if len(available_symbols) > 20:
@@ -1233,17 +1232,13 @@ def input_preselected_pairs(data, default_diff_order=0):
 
     selected_pairs = []
 
-    while True:
-        pair_input = input("\n请输入币对 (格式: SYMBOL1/SYMBOL2，直接回车结束): ").strip()
-        if not pair_input:
-            if selected_pairs:
-                break
-            else:
-                print("尚未添加任何币对，请至少输入一个币对。")
-                continue
+    pair_input = input("\n请输入币对 (格式: SYMBOL1/SYMBOL2，支持逗号分隔多个币对): ").strip()
+    if not pair_input:
+        print("未输入任何币对，无法进行回测/优化")
+        return []
 
-        pair_candidates = [p.strip() for p in pair_input.replace('，', ',').split(',') if p.strip()]
-        for pair_text in pair_candidates:
+    pair_candidates = [p.strip() for p in pair_input.replace('，', ',').split(',') if p.strip()]
+    for pair_text in pair_candidates:
             separator = '/'
             if '/' in pair_text:
                 separator = '/'
