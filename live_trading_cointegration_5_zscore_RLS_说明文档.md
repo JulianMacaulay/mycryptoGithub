@@ -1,0 +1,923 @@
+# 实盘协整交易系统详细说明文档
+
+## 目录
+1. [系统概述](#系统概述)
+2. [程序运行流程](#程序运行流程)
+3. [核心模型和算法](#核心模型和算法)
+4. [代码详解](#代码详解)
+
+---
+
+## 系统概述
+
+本系统是一个基于协整关系的实盘交易系统，支持：
+- **6种Z-score计算策略**：传统方法、ARIMA-GARCH、ECM、Kalman Filter、Copula+DCC-GARCH、Regime-Switching
+- **RLS动态对冲比率**：使用递归最小二乘法动态更新对冲比率
+- **实时数据管理**：自动收集和管理实时价格数据
+- **Web监控界面**：实时监控交易状态
+
+---
+
+## 程序运行流程
+
+### 1. 程序入口 (`if __name__ == "__main__"`)
+
+**代码位置**：第2294行
+
+```python
+if __name__ == "__main__":
+    main()
+```
+
+**执行流程**：
+- 调用 `main()` 函数
+- `main()` 函数调用 `test_live_trading()` 开始实盘交易
+
+---
+
+### 2. 策略选择 (`select_z_score_strategy()`)
+
+**代码位置**：第1240-1434行
+
+**功能**：让用户选择Z-score计算策略
+
+**可选策略**：
+1. **传统方法**：使用均值和标准差
+2. **ARIMA-GARCH模型**：时间序列预测
+3. **ECM误差修正模型**：协整误差修正
+4. **Kalman Filter动态价差模型**：动态状态估计
+5. **Copula + DCC-GARCH模型**：相关性建模
+6. **Regime-Switching市场状态模型**：状态转换模型
+
+**代码示例**：
+```python
+def select_z_score_strategy():
+    """选择Z-score计算策略"""
+    if not STRATEGIES_AVAILABLE:
+        print("警告: 策略模块不可用，将使用传统方法")
+        return None
+    
+    print("请选择Z-score计算策略:")
+    print("  1. 传统方法（均值和标准差）")
+    print("  2. ARIMA-GARCH模型")
+    print("  3. ECM误差修正模型")
+    print("  4. Kalman Filter动态价差模型")
+    print("  5. Copula + DCC-GARCH相关性/波动率模型")
+    print("  6. Regime-Switching市场状态模型")
+    
+    choice = input("请选择 (0-6): ").strip()
+    # ... 根据选择创建对应策略对象
+```
+
+---
+
+### 3. 币安API初始化 (`BinanceAPI`)
+
+**代码位置**：第77-312行
+
+**功能**：初始化币安API客户端，用于获取实时价格和执行交易
+
+**关键方法**：
+- `get_current_price(symbol)`: 获取当前价格
+- `get_klines(symbol, interval, limit)`: 获取K线数据
+- `place_order(...)`: 下单
+- `get_account_info()`: 获取账户信息
+
+**代码示例**：
+```python
+class BinanceAPI:
+    def __init__(self, api_key=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.base_url = base_url
+    
+    def _generate_signature(self, query_string):
+        """生成API签名"""
+        return hmac.new(
+            self.secret_key.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+```
+
+---
+
+### 4. 币对配置 (`get_pairs_config()`)
+
+**代码位置**：第1439-1553行
+
+**功能**：配置要交易的币对信息
+
+**配置内容**：
+- 币对名称（symbol1, symbol2）
+- 对冲比率（hedge_ratio）
+- 差分阶数（diff_order）
+- 协整状态（cointegration_found）
+
+**代码示例**：
+```python
+def get_pairs_config():
+    """获取币对配置（用户输入）"""
+    pairs_config = []
+    
+    while True:
+        symbol1 = input("请输入第一个币种 (如: BTCUSDT): ").strip().upper()
+        symbol2 = input("请输入第二个币种 (如: ETHUSDT): ").strip().upper()
+        hedge_ratio = float(input("请输入对冲比率: ").strip())
+        
+        pair_info = {
+            'symbol1': symbol1,
+            'symbol2': symbol2,
+            'hedge_ratio': hedge_ratio,
+            'pair_name': f"{symbol1}_{symbol2}",
+            'diff_order': 0,  # 0=原始价差, 1=一阶差分, 2=二阶差分
+            'cointegration_found': True
+        }
+        pairs_config.append(pair_info)
+```
+
+---
+
+### 5. 交易参数配置 (`configure_trading_parameters()`)
+
+**代码位置**：第1554-1684行
+
+**功能**：配置交易策略参数
+
+**参数列表**：
+- `lookback_period`: 回看期（用于计算Z-score的历史数据长度）
+- `z_threshold`: Z-score开仓阈值
+- `z_exit_threshold`: Z-score平仓阈值
+- `take_profit_pct`: 止盈百分比
+- `stop_loss_pct`: 止损百分比
+- `max_holding_hours`: 最大持仓时间
+- `position_ratio`: 仓位比例
+- `leverage`: 杠杆倍数
+- `trading_fee_rate`: 交易手续费率
+
+---
+
+### 6. 预热数据收集 (`RealTimeDataManager.collect_warmup_data()`)
+
+**代码位置**：第313-416行
+
+**功能**：在开始交易前收集足够的历史数据
+
+**流程**：
+1. 计算需要的预热数据量：`warmup_period = lookback_period + warmup_safety_margin`
+2. 从币安API获取历史K线数据
+3. 存储到数据缓存中
+
+**代码示例**：
+```python
+def collect_warmup_data(self, symbols, interval='1h', warmup_period=100):
+    """收集预热数据"""
+    warmup_data = {}
+    
+    for symbol in symbols:
+        # 获取历史K线数据
+        klines = self.binance_api.get_klines(
+            symbol=symbol,
+            interval=interval,
+            limit=warmup_period
+        )
+        
+        # 转换为pandas Series
+        prices = pd.Series([float(k[4]) for k in klines])  # 收盘价
+        warmup_data[symbol] = prices
+    
+    return warmup_data
+```
+
+---
+
+### 7. RLS参数配置和初始化
+
+**代码位置**：第1823-1891行
+
+**功能**：配置并初始化RLS（递归最小二乘）算法
+
+**RLS参数**：
+- `use_rls`: 是否使用RLS（默认True）
+- `rls_lambda`: 遗忘因子（0 < λ ≤ 1，默认0.99）
+- `rls_max_change_rate`: 最大变化率（防止突变，默认0.2）
+
+**RLS初始化**：
+```python
+if use_rls:
+    print("\n初始化RLS...")
+    for pair_info in pairs_config:
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        pair_key = f"{symbol1}_{symbol2}"
+        
+        # 使用预热数据初始化RLS
+        init_price1 = warmup_data[symbol1]
+        init_price2 = warmup_data[symbol2]
+        
+        trading_strategy.initialize_rls_for_pair(pair_key, init_price1, init_price2)
+```
+
+---
+
+### 8. 交易策略初始化 (`AdvancedCointegrationTrading`)
+
+**代码位置**：第592-655行
+
+**功能**：初始化协整交易策略对象
+
+**初始化参数**：
+```python
+trading_strategy = AdvancedCointegrationTrading(
+    binance_api=binance_api,
+    lookback_period=trading_params['lookback_period'],
+    z_threshold=trading_params['z_threshold'],
+    z_exit_threshold=trading_params['z_exit_threshold'],
+    take_profit_pct=trading_params['take_profit_pct'],
+    stop_loss_pct=trading_params['stop_loss_pct'],
+    max_holding_hours=trading_params['max_holding_hours'],
+    position_ratio=trading_params['position_ratio'],
+    leverage=trading_params['leverage'],
+    trading_fee_rate=trading_params['trading_fee_rate'],
+    z_score_strategy=z_score_strategy,
+    use_rls=use_rls,
+    rls_lambda=rls_lambda,
+    rls_max_change_rate=rls_max_change_rate
+)
+```
+
+---
+
+### 9. 实时交易循环 (`trading_loop()`)
+
+**代码位置**：第1959-2251行
+
+**功能**：实时监控市场并执行交易
+
+**循环流程**：
+
+#### 9.1 获取当前数据
+```python
+current_data = data_manager.get_current_data()
+current_prices = data_manager.get_current_prices()
+```
+
+#### 9.2 更新RLS对冲比率（如果启用）
+```python
+if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+    current_hedge_ratio = trading_strategy.update_rls_for_pair(
+        pair_key, current_prices[symbol1], current_prices[symbol2]
+    )
+else:
+    current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
+```
+
+#### 9.3 计算价差
+根据 `diff_order` 选择计算方式：
+
+**原始价差**（diff_order=0）：
+```python
+current_spread = price1 - hedge_ratio * price2
+```
+
+**一阶差分价差**（diff_order=1）：
+```python
+diff1 = price1[t] - price1[t-1]
+diff2 = price2[t] - price2[t-1]
+current_spread = diff1 - hedge_ratio * diff2
+```
+
+**二阶差分价差**（diff_order=2）：
+```python
+diff2_1 = price1[t] - 2*price1[t-1] + price1[t-2]
+diff2_2 = price2[t] - 2*price2[t-1] + price2[t-2]
+current_spread = diff2_1 - hedge_ratio * diff2_2
+```
+
+#### 9.4 计算Z-score
+```python
+current_z_score = trading_strategy.calculate_z_score(
+    current_spread, 
+    historical_spreads,
+    historical_prices1=historical_prices1,
+    historical_prices2=historical_prices2
+)
+```
+
+#### 9.5 生成交易信号
+```python
+signal = trading_strategy.generate_trading_signal(current_z_score)
+```
+
+**信号规则**：
+- `Z-score > z_threshold` → `SHORT_LONG`（做空价差）
+- `Z-score < -z_threshold` → `LONG_SHORT`（做多价差）
+- 否则 → `HOLD`（观望）
+
+#### 9.6 检查平仓条件
+```python
+if pair_info['pair_name'] in trading_strategy.positions:
+    should_close, close_reason = trading_strategy.check_exit_conditions(
+        pair_info, current_prices, current_z_score, datetime.now(), current_spread
+    )
+    
+    if should_close:
+        trading_strategy.close_position(...)
+```
+
+**平仓条件**：
+1. Z-score回归到 `[-z_exit_threshold, z_exit_threshold]` 区间
+2. 达到止盈百分比
+3. 达到止损百分比
+4. 超过最大持仓时间
+
+#### 9.7 执行开仓
+```python
+if signal['action'] != 'HOLD' and len(trading_strategy.positions) == 0:
+    trading_strategy.execute_trade(
+        pair_info_with_rls, 
+        current_prices, 
+        signal, 
+        datetime.now(),
+        current_spread, 
+        available_capital
+    )
+```
+
+---
+
+## 核心模型和算法
+
+### 1. RLS（递归最小二乘）算法
+
+**代码位置**：第417-591行
+
+**模型公式**：
+
+**线性回归模型**：
+```
+price1_t = β₀ + β₁ × price2_t + ε_t
+```
+
+其中：
+- `β₀`: 截距
+- `β₁`: 对冲比率（斜率）
+- `ε_t`: 误差项
+
+**RLS更新公式**：
+
+1. **特征向量**：
+```
+x_t = [1, price2_t]ᵀ
+```
+
+2. **预测误差**：
+```
+e_t = price1_t - x_tᵀ × β_{t-1}
+```
+
+3. **Kalman增益**：
+```
+K_t = P_{t-1} × x_t / (λ + x_tᵀ × P_{t-1} × x_t)
+```
+
+其中：
+- `P_{t-1}`: 协方差矩阵
+- `λ`: 遗忘因子（0 < λ ≤ 1）
+
+4. **参数更新**：
+```
+β_t = β_{t-1} + K_t × e_t
+```
+
+5. **协方差矩阵更新**：
+```
+P_t = (P_{t-1} - K_t × x_tᵀ × P_{t-1}) / λ
+```
+
+**代码实现**：
+```python
+def update(self, price1_t, price2_t):
+    """更新对冲比率（RLS更新步骤）"""
+    # 特征向量
+    x_t = np.array([1.0, price2_t])
+    y_t = price1_t
+    
+    # 预测误差
+    prediction = np.dot(x_t, self.beta)
+    error = y_t - prediction
+    
+    # Kalman增益
+    denominator = self.lambda_forgetting + np.dot(x_t, np.dot(self.P, x_t))
+    K_t = np.dot(self.P, x_t) / denominator
+    
+    # 更新参数
+    beta_new = self.beta + K_t * error
+    
+    # 限制变化率（防止突变）
+    if len(self.beta_history) > 0:
+        beta_old = self.beta_history[-1]
+        change_rate = abs((beta_new[1] - beta_old[1]) / (beta_old[1] + 1e-8))
+        
+        if change_rate > self.max_change_rate:
+            max_change = self.max_change_rate * abs(beta_old[1])
+            if beta_new[1] > beta_old[1]:
+                beta_new[1] = beta_old[1] + max_change
+            else:
+                beta_new[1] = beta_old[1] - max_change
+    
+    # 更新协方差矩阵
+    self.P = (self.P - np.outer(K_t, np.dot(self.P, x_t))) / self.lambda_forgetting
+    
+    # 更新状态
+    self.beta = beta_new
+    self.beta_history.append(self.beta.copy())
+    
+    return self.beta[1]  # 返回对冲比率
+```
+
+---
+
+### 2. Z-score计算
+
+**代码位置**：第819-850行
+
+**传统方法公式**：
+```
+Z-score = (当前价差 - 历史价差均值) / 历史价差标准差
+```
+
+```
+Z_t = (spread_t - μ) / σ
+```
+
+其中：
+- `spread_t`: 当前价差
+- `μ`: 历史价差均值
+- `σ`: 历史价差标准差
+
+**代码实现**：
+```python
+def calculate_z_score(self, current_spread, historical_spreads, 
+                     historical_prices1=None, historical_prices2=None):
+    """计算当前Z-score（使用策略对象）"""
+    if self.z_score_strategy is not None:
+        return self.z_score_strategy.calculate_z_score(
+            current_spread, 
+            historical_spreads,
+            historical_prices1=historical_prices1,
+            historical_prices2=historical_prices2
+        )
+    
+    # 传统方法
+    if len(historical_spreads) < 2:
+        return 0.0
+    
+    spread_mean = np.mean(historical_spreads)
+    spread_std = np.std(historical_spreads)
+    
+    if spread_std == 0:
+        return 0.0
+    
+    return (current_spread - spread_mean) / spread_std
+```
+
+---
+
+### 3. 交易信号生成
+
+**代码位置**：第851-870行
+
+**信号规则**：
+
+```
+信号 = {
+    'SHORT_LONG':  如果 Z-score > z_threshold
+    'LONG_SHORT':  如果 Z-score < -z_threshold
+    'HOLD':        其他情况
+}
+```
+
+**代码实现**：
+```python
+def generate_trading_signal(self, z_score):
+    """生成交易信号"""
+    if z_score > self.z_threshold:
+        return {
+            'action': 'SHORT_LONG',
+            'description': f'Z-score过高({z_score:.3f})，做空价差',
+            'confidence': min(abs(z_score) / 3.0, 1.0)
+        }
+    elif z_score < -self.z_threshold:
+        return {
+            'action': 'LONG_SHORT',
+            'description': f'Z-score过低({z_score:.3f})，做多价差',
+            'confidence': min(abs(z_score) / 3.0, 1.0)
+        }
+    else:
+        return {
+            'action': 'HOLD',
+            'description': f'Z-score正常({z_score:.3f})，观望',
+            'confidence': 0.0
+        }
+```
+
+---
+
+### 4. 仓位计算（Beta中性）
+
+**代码位置**：第712-754行
+
+**模型公式**：
+
+**目标**：构建Beta中性的投资组合，使得：
+```
+ΔPortfolio = ΔPrice1 - β × ΔPrice2 = 0
+```
+
+**资金分配**：
+
+1. **总资金占用系数**：
+```
+C = price1 + β × price2
+```
+
+2. **Symbol1数量**：
+```
+Q1 = AvailableCapital / C
+```
+
+3. **Symbol2数量**：
+```
+Q2 = β × Q1
+```
+
+4. **实际资金占用**：
+```
+TotalCapital = |Q1| × price1 + |Q2| × price2
+```
+
+**代码实现**：
+```python
+def calculate_position_size_beta_neutral(self, available_capital, price1, price2, hedge_ratio, signal):
+    """基于Beta中性计算开仓数量"""
+    # 计算总资金占用系数
+    capital_coefficient = price1 + hedge_ratio * price2
+    
+    # 计算symbol1的数量（绝对值）
+    symbol1_size_abs = available_capital / capital_coefficient
+    
+    # 计算symbol2的数量（绝对值）
+    symbol2_size_abs = hedge_ratio * symbol1_size_abs
+    
+    # 根据信号方向确定正负
+    if signal['action'] == 'SHORT_LONG':
+        symbol1_size = -symbol1_size_abs  # 做空
+        symbol2_size = +symbol2_size_abs  # 做多
+    elif signal['action'] == 'LONG_SHORT':
+        symbol1_size = +symbol1_size_abs  # 做多
+        symbol2_size = -symbol2_size_abs  # 做空
+    
+    # 计算实际资金占用
+    total_capital_used = abs(symbol1_size) * price1 + abs(symbol2_size) * price2
+    
+    return symbol1_size, symbol2_size, total_capital_used
+```
+
+---
+
+### 5. 平仓条件检查
+
+**代码位置**：第1000-1100行（`check_exit_conditions`方法）
+
+**平仓条件**：
+
+1. **Z-score回归**：
+```
+|Z-score| ≤ z_exit_threshold
+```
+
+2. **止盈**：
+```
+收益率 ≥ take_profit_pct
+```
+
+3. **止损**：
+```
+收益率 ≤ -stop_loss_pct
+```
+
+4. **最大持仓时间**：
+```
+持仓时间 ≥ max_holding_hours
+```
+
+**收益率计算**：
+```
+收益率 = (当前价差 - 开仓价差) / 开仓价差
+```
+
+对于 `SHORT_LONG` 信号（做空价差）：
+```
+收益率 = (开仓价差 - 当前价差) / 开仓价差
+```
+
+对于 `LONG_SHORT` 信号（做多价差）：
+```
+收益率 = (当前价差 - 开仓价差) / 开仓价差
+```
+
+---
+
+### 6. 各策略模型公式
+
+#### 6.1 传统方法
+
+**公式**：
+```
+Z_t = (spread_t - μ) / σ
+```
+
+其中：
+- `μ = mean(historical_spreads)`
+- `σ = std(historical_spreads)`
+
+---
+
+#### 6.2 ARIMA-GARCH模型
+
+**ARIMA模型**：
+```
+(1 - φ₁B - ... - φₚBᵖ)(1 - B)ᵈ spread_t = (1 + θ₁B + ... + θₚBᵖ)ε_t
+```
+
+**GARCH模型**：
+```
+σ²_t = ω + Σᵢ αᵢε²_{t-i} + Σⱼ βⱼσ²_{t-j}
+```
+
+**Z-score计算**：
+```
+Z_t = (spread_t - μ_t) / σ_t
+```
+
+其中：
+- `μ_t`: ARIMA预测的均值
+- `σ_t`: GARCH预测的标准差
+
+---
+
+#### 6.3 ECM（误差修正模型）
+
+**协整关系**：
+```
+price1_t = α + β × price2_t + ε_t
+```
+
+**误差修正项**：
+```
+ECM_t = price1_t - α - β × price2_t
+```
+
+**ECM模型**：
+```
+Δspread_t = γ × ECM_{t-1} + Σᵢ φᵢΔspread_{t-i} + ε_t
+```
+
+**Z-score计算**：
+```
+Z_t = ECM_t / σ_ECM
+```
+
+---
+
+#### 6.4 Kalman Filter
+
+**状态方程**：
+```
+x_t = x_{t-1} + w_t,  w_t ~ N(0, Q)
+```
+
+**观测方程**：
+```
+y_t = x_t + v_t,  v_t ~ N(0, R)
+```
+
+**Kalman Filter更新**：
+
+1. **预测步骤**：
+```
+x_{t|t-1} = x_{t-1|t-1}
+P_{t|t-1} = P_{t-1|t-1} + Q
+```
+
+2. **更新步骤**：
+```
+K_t = P_{t|t-1} / (P_{t|t-1} + R)
+x_{t|t} = x_{t|t-1} + K_t × (y_t - x_{t|t-1})
+P_{t|t} = (1 - K_t) × P_{t|t-1}
+```
+
+**Z-score计算**：
+```
+Z_t = (spread_t - x_{t|t}) / σ_t
+```
+
+---
+
+#### 6.5 Copula + DCC-GARCH
+
+**DCC-GARCH模型**：
+
+**GARCH(1,1)波动率**：
+```
+σ²_{i,t} = ω_i + α_i × ε²_{i,t-1} + β_i × σ²_{i,t-1}
+```
+
+**标准化残差**：
+```
+z_{i,t} = ε_{i,t} / σ_{i,t}
+```
+
+**动态相关系数**：
+```
+Q_t = (1 - a - b) × Q̄ + a × z_{t-1}z'_{t-1} + b × Q_{t-1}
+R_t = diag(Q_t)^{-1/2} × Q_t × diag(Q_t)^{-1/2}
+```
+
+**Copula模型**：
+```
+C(u₁, u₂) = Φ_2(Φ⁻¹(u₁), Φ⁻¹(u₂); R_t)
+```
+
+其中：
+- `u_i = F_i(price_i)`: 边际分布
+- `Φ_2`: 二元正态分布
+- `R_t`: 动态相关系数矩阵
+
+**Z-score计算**：
+```
+Z_t = (spread_t - μ_t) / σ_t
+```
+
+其中 `σ_t` 由DCC-GARCH模型估计。
+
+---
+
+#### 6.6 Regime-Switching模型
+
+**状态转换模型**：
+```
+spread_t | S_t = k ~ N(μ_k, σ²_k)
+```
+
+**状态转换概率**（马尔可夫链）：
+```
+P(S_t = j | S_{t-1} = i) = p_{ij}
+```
+
+**状态转换概率矩阵**：
+```
+P = [p_{00}  p_{01}]  =  [p_{00}     1-p_{00}]
+    [p_{10}  p_{11}]     [1-p_{11}  p_{11}  ]
+```
+
+**滤波概率**：
+```
+P(S_t = k | spread_1, ..., spread_t)
+```
+
+**平滑概率**：
+```
+P(S_t = k | spread_1, ..., spread_T),  T > t
+```
+
+**Z-score计算**：
+```
+Z_t = (spread_t - μ_{S_t}) / σ_{S_t}
+```
+
+其中 `S_t` 是当前估计的市场状态。
+
+---
+
+## 代码详解
+
+### 关键类和方法
+
+#### 1. `RecursiveLeastSquares` 类
+
+**初始化方法**：
+```python
+def __init__(self, lambda_forgetting=0.99, initial_covariance=1000.0, max_change_rate=0.2):
+    self.lambda_forgetting = lambda_forgetting  # 遗忘因子
+    self.initial_covariance = initial_covariance  # 初始协方差
+    self.max_change_rate = max_change_rate  # 最大变化率
+    self.beta = None  # 对冲比率 [截距, 斜率]
+    self.P = None  # 协方差矩阵
+    self.initialized = False
+```
+
+**初始化RLS**：
+```python
+def initialize(self, initial_price1, initial_price2):
+    """使用OLS估计初始对冲比率"""
+    # 使用OLS回归
+    X = price2_aligned.values.reshape(-1, 1)
+    y = price1_aligned.values
+    X_with_const = add_constant(X)
+    
+    model = OLS(y, X_with_const).fit()
+    
+    # 初始化参数
+    self.beta = np.array([model.params[0], model.params[1]])
+    self.P = np.eye(2) * self.initial_covariance
+    self.initialized = True
+```
+
+---
+
+#### 2. `AdvancedCointegrationTrading` 类
+
+**初始化RLS**：
+```python
+def initialize_rls_for_pair(self, pair_key, initial_price1, initial_price2):
+    """为币对初始化RLS"""
+    if not self.use_rls:
+        return
+    
+    rls = RecursiveLeastSquares(
+        lambda_forgetting=self.rls_lambda,
+        max_change_rate=self.rls_max_change_rate
+    )
+    rls.initialize(initial_price1, initial_price2)
+    self.rls_instances[pair_key] = rls
+```
+
+**更新RLS**：
+```python
+def update_rls_for_pair(self, pair_key, price1_t, price2_t):
+    """更新币对的RLS对冲比率"""
+    if not self.use_rls or pair_key not in self.rls_instances:
+        return None
+    
+    rls = self.rls_instances[pair_key]
+    hedge_ratio = rls.update(price1_t, price2_t)
+    
+    # 更新价格历史
+    if pair_key in self.price_history:
+        self.price_history[pair_key]['price1'].append(price1_t)
+        self.price_history[pair_key]['price2'].append(price2_t)
+    
+    return hedge_ratio
+```
+
+---
+
+#### 3. `RealTimeDataManager` 类
+
+**收集预热数据**：
+```python
+def collect_warmup_data(self, symbols, interval='1h', warmup_period=100):
+    """收集预热数据"""
+    warmup_data = {}
+    
+    for symbol in symbols:
+        klines = self.binance_api.get_klines(
+            symbol=symbol,
+            interval=interval,
+            limit=warmup_period
+        )
+        
+        prices = pd.Series([float(k[4]) for k in klines])
+        warmup_data[symbol] = prices
+    
+    return warmup_data
+```
+
+**实时数据收集**：
+```python
+def start_data_collection(self, symbols, interval='1h'):
+    """启动实时数据收集线程"""
+    self.collection_thread = threading.Thread(
+        target=self._data_collection_loop,
+        args=(symbols, interval),
+        daemon=True
+    )
+    self.collection_thread.start()
+```
+
+---
+
+## 总结
+
+本系统实现了完整的协整交易流程：
+
+1. **策略选择**：支持6种Z-score计算策略
+2. **数据管理**：自动收集和管理实时价格数据
+3. **RLS动态对冲**：使用递归最小二乘法动态更新对冲比率
+4. **交易执行**：基于Z-score生成交易信号并执行交易
+5. **风险控制**：止盈、止损、最大持仓时间等风险控制机制
+6. **实时监控**：Web界面实时监控交易状态
+
+系统设计灵活，可根据市场情况选择最适合的策略和参数。
+
