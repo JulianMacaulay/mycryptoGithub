@@ -624,7 +624,7 @@ def rolling_window_cointegration_test(price1, price2, symbol1, symbol2, window_s
     """
     print(f"\n{'=' * 80}")
     print(f"滚动窗口协整检验: {symbol1}/{symbol2}")
-    print(f"窗口大小: {window_size}, 步长: {step_size}")
+    print(f"窗口大小: {window_size}")
     print(f"{'=' * 80}")
 
     # 确保两个序列长度一致
@@ -735,7 +735,7 @@ def rolling_window_find_cointegrated_pairs(data, window_size=500, step_size=100,
     print("滚动窗口协整检验")
     print("=" * 80)
     print(f"窗口大小: {window_size}")
-    print(f"步长: {step_size}")
+    # print(f"步长: {step_size}")
     diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
     print(f"价差类型: {diff_type}")
 
@@ -1020,7 +1020,7 @@ def configure_rolling_window_parameters():
 
     print("当前默认参数:")
     print(f"  1. 窗口大小: {default_params['window_size']} 条数据")
-    print(f"  2. 步长: {default_params['step_size']} 条数据")
+    # print(f"  2. 步长: {default_params['step_size']} 条数据")
 
     print("\n是否要修改参数？")
     print("输入 'y' 修改参数，直接回车使用默认参数")
@@ -1039,16 +1039,16 @@ def configure_rolling_window_parameters():
                 print(f"输入无效，使用默认值: {default_params['window_size']}")
 
         # 步长
-        step_input = input(f"步长 (默认: {default_params['step_size']}): ").strip()
-        if step_input:
-            try:
-                default_params['step_size'] = int(step_input)
-            except ValueError:
-                print(f"输入无效，使用默认值: {default_params['step_size']}")
+        # step_input = input(f"步长 (默认: {default_params['step_size']}): ").strip()
+        # if step_input:
+        #     try:
+        #         default_params['step_size'] = int(step_input)
+        #     except ValueError:
+        #         print(f"输入无效，使用默认值: {default_params['step_size']}")
 
         print("\n修改后的参数:")
         print(f"  1. 窗口大小: {default_params['window_size']} 条数据")
-        print(f"  2. 步长: {default_params['step_size']} 条数据")
+        # print(f"  2. 步长: {default_params['step_size']} 条数据")
 
     return default_params
 
@@ -1817,7 +1817,7 @@ class AdvancedCointegrationTrading:
                  position_ratio=0.5, leverage=5, trading_fee_rate=0.000275,
                  z_score_strategy=None, use_arima_garch=False, arima_order=(1, 0, 1), garch_order=(1, 1),
                  use_rls=True, rls_lambda=0.99, rls_max_change_rate=0.2,
-                 cointegration_check_interval=240, data_period_minutes=60, diff_order=0,
+                 cointegration_check_interval=500, data_period_minutes=60, diff_order=0,
                  cointegration_window_size=500):
         """
         初始化高级协整交易策略（支持RLS动态对冲比率）
@@ -1839,8 +1839,8 @@ class AdvancedCointegrationTrading:
             use_rls: 是否使用RLS动态更新对冲比率
             rls_lambda: RLS遗忘因子（0 < λ ≤ 1）
             rls_max_change_rate: RLS最大变化率（防止突变）
-            cointegration_check_interval: 协整检验间隔（数据条数，默认240，对应1h周期10天）
-            data_period_minutes: 数据周期（分钟，用于计算协整检验间隔，默认60分钟=1h）
+            cointegration_check_interval: 协整检验间隔（数据条数，使用窗口大小）
+            data_period_minutes: 数据周期（分钟，用于显示，默认60分钟=1h）
             diff_order: 价差类型，0=原始价差，1=一阶差分价差
             cointegration_window_size: 协整检验窗口大小（与初始筛选的window_size一致，默认500）
         """
@@ -2803,7 +2803,7 @@ class AdvancedCointegrationTrading:
                     symbol2][:init_window_size]
 
                 self.initialize_rls_for_pair(pair_key, init_price1, init_price2)
-                print(f"  ✓ {pair_key} RLS初始化完成")
+                print(f"   {pair_key} RLS初始化完成")
 
         # 回测循环
         for i, timestamp in enumerate(all_timestamps):
@@ -3250,8 +3250,11 @@ def test_rolling_window_cointegration_trading(csv_file_path):
         use_rls_input = input("是否使用RLS动态对冲比率? (y/n, 默认y): ").strip().lower()
         use_rls = use_rls_input != 'n'
 
-        # 根据数据周期计算协整检验间隔
-        # 假设数据是等间隔的，计算平均间隔
+        # 使用窗口大小作为协整检验间隔
+        cointegration_check_interval = cointegration_window_size
+        print(f"  协整检验间隔: {cointegration_check_interval} 个数据点（使用窗口大小）")
+        
+        # 计算数据周期（仅用于显示）
         if len(data) > 0:
             first_symbol = list(data.keys())[0]
             if len(data[first_symbol]) > 1:
@@ -3262,18 +3265,12 @@ def test_rolling_window_cointegration_trading(csv_file_path):
                     time_diffs.append(diff)
                 if time_diffs:
                     avg_period_minutes = np.mean(time_diffs)
-                    # 10天 = 10 * 24 * 60 = 14400分钟
-                    cointegration_check_interval = int(14400 / avg_period_minutes)
                     print(f"  检测到数据周期: {avg_period_minutes:.1f} 分钟")
-                    print(f"  协整检验间隔: {cointegration_check_interval} 个数据点 (约10天)")
                 else:
-                    cointegration_check_interval = 240  # 默认值（1h周期）
                     avg_period_minutes = 60
             else:
-                cointegration_check_interval = 240
                 avg_period_minutes = 60
         else:
-            cointegration_check_interval = 240
             avg_period_minutes = 60
 
         # 11. 执行交易回测
@@ -3361,7 +3358,8 @@ class ParameterOptimizer:
 
     def __init__(self, data, selected_pairs, initial_capital=10000,
                  objective='sharpe_ratio', stability_test=True, z_score_strategy=None,
-                 cointegration_window_size=500, diff_order=0):
+                 cointegration_window_size=500, diff_order=0, use_rls=True,
+                 cointegration_check_interval=500, data_period_minutes=60):
         """
         初始化参数优化器
 
@@ -3374,6 +3372,9 @@ class ParameterOptimizer:
             z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例）
             cointegration_window_size: 协整检验窗口大小（与初始筛选的window_size一致，默认500）
             diff_order: 价差类型，0=原始价差，1=一阶差分价差
+            use_rls: 是否使用RLS动态更新对冲比率（默认True）
+            cointegration_check_interval: 协整检验间隔（数据条数，使用窗口大小）
+            data_period_minutes: 数据周期（分钟，用于显示，默认60）
         """
         self.data = data
         self.selected_pairs = selected_pairs
@@ -3382,6 +3383,9 @@ class ParameterOptimizer:
         self.stability_test = stability_test
         self.cointegration_window_size = cointegration_window_size
         self.diff_order = diff_order
+        self.use_rls = use_rls
+        self.cointegration_check_interval = cointegration_check_interval
+        self.data_period_minutes = data_period_minutes
 
         # 定义参数搜索空间（注意：z_score_strategy不在优化范围内，需要单独设置）
         self.param_space = {
@@ -3447,7 +3451,10 @@ class ParameterOptimizer:
                 trading_fee_rate=params.get('trading_fee_rate', 0.000275),
                 z_score_strategy=self.z_score_strategy,  # 使用策略对象
                 cointegration_window_size=self.cointegration_window_size,  # 传递窗口大小
-                diff_order=self.diff_order  # 传递价差类型
+                diff_order=self.diff_order,  # 传递价差类型
+                use_rls=self.use_rls,  # 传递RLS选择
+                cointegration_check_interval=self.cointegration_check_interval,  # 传递协整检验间隔
+                data_period_minutes=self.data_period_minutes  # 传递数据周期
             )
 
             # 执行回测（不显示图表和详细输出）
@@ -4069,11 +4076,40 @@ def test_parameter_optimization(csv_file_path):
         if 'cointegration_ratio' in pair:
             print(f"  协整比例: {pair['cointegration_ratio'] * 100:.1f}%")
 
-    # 9. 创建优化器
+    # 9. 配置RLS参数
+    print(f"\n9. 配置RLS和协整检验参数")
+    use_rls_input = input("是否使用RLS动态对冲比率? (y/n, 默认y): ").strip().lower()
+    use_rls = use_rls_input != 'n'
+    
+    # 使用窗口大小作为协整检验间隔
+    cointegration_check_interval = window_params['window_size']
+    print(f"  协整检验间隔: {cointegration_check_interval} 个数据点（使用窗口大小）")
+    
+    # 计算数据周期（仅用于显示）
+    if len(data) > 0:
+        first_symbol = list(data.keys())[0]
+        if len(data[first_symbol]) > 1:
+            time_diffs = []
+            timestamps = sorted(data[first_symbol].index)
+            for i in range(1, min(100, len(timestamps))):  # 只检查前100个
+                diff = (timestamps[i] - timestamps[i - 1]).total_seconds() / 60  # 转换为分钟
+                time_diffs.append(diff)
+            if time_diffs:
+                avg_period_minutes = np.mean(time_diffs)
+                print(f"  检测到数据周期: {avg_period_minutes:.1f} 分钟")
+            else:
+                avg_period_minutes = 60
+        else:
+            avg_period_minutes = 60
+    else:
+        avg_period_minutes = 60
+
+    # 10. 创建优化器
     strategy_name = z_score_strategy.get_strategy_description() if z_score_strategy else "未知"
     diff_type = '原始价差' if diff_order == 0 else '一阶差分价差'
     print(f"\n10. 创建优化器 (方法={method}, 目标={objective}, 策略={strategy_name}, 价差类型={diff_type})")
     print(f"  协整检验窗口大小: {window_params['window_size']} 个数据点（与初始筛选一致）")
+    print(f"  使用RLS: {'是' if use_rls else '否'}")
     optimizer = ParameterOptimizer(
         data=data,
         selected_pairs=selected_pairs,
@@ -4082,7 +4118,10 @@ def test_parameter_optimization(csv_file_path):
         stability_test=True,
         z_score_strategy=z_score_strategy,  # 传入策略对象
         cointegration_window_size=window_params['window_size'],  # 传递用户选择的窗口大小
-        diff_order=diff_order  # 传递价差类型
+        diff_order=diff_order,  # 传递价差类型
+        use_rls=use_rls,  # 传递RLS选择
+        cointegration_check_interval=cointegration_check_interval,  # 传递协整检验间隔
+        data_period_minutes=avg_period_minutes  # 传递数据周期
     )
 
     # 10. 执行优化
