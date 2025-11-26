@@ -28,10 +28,8 @@ from urllib.parse import urlencode
 from flask import Flask, jsonify, request
 from typing import Dict, List, Tuple, Any, Optional
 from decimal import Decimal, ROUND_HALF_UP
-from scipy import stats
 from statsmodels.tsa.stattools import adfuller
-from statsmodels.regression.linear_model import OLS
-from statsmodels.tools import add_constant
+
 
 warnings.filterwarnings('ignore')
 
@@ -372,13 +370,32 @@ class RealTimeDataManager:
         return self.data_cache.copy()
 
     def get_current_prices(self):
-        """获取当前价格"""
+        """获取当前价格（实时价格，用于监控）"""
         prices = {}
         for symbol in self.symbols:
             price = self.binance_api.get_current_price(symbol)
             if price:
                 prices[symbol] = price
         return prices
+    
+    def get_latest_closed_kline_prices(self):
+        """获取最新已收盘K线的收盘价（用于交易决策）"""
+        prices = {}
+        for symbol in self.symbols:
+            if symbol in self.data_cache and len(self.data_cache[symbol]) > 0:
+                # 获取最后一个K线的收盘价（已收盘的K线）
+                prices[symbol] = self.data_cache[symbol].iloc[-1]
+        return prices
+    
+    def get_latest_closed_kline_timestamp(self):
+        """获取最新已收盘K线的时间戳"""
+        latest_timestamp = None
+        for symbol in self.symbols:
+            if symbol in self.data_cache and len(self.data_cache[symbol]) > 0:
+                timestamp = self.data_cache[symbol].index[-1]
+                if latest_timestamp is None or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+        return latest_timestamp
 
     def collect_warmup_data(self, symbols, interval='1h', warmup_period=70):
         """
@@ -2378,21 +2395,40 @@ def test_live_trading():
     # 13. 启动交易循环
     print("\n12. 启动交易循环")
     trading_strategy.running = True
+    
+    # 获取预热数据中的最后一个K线时间戳，作为基准时间戳
+    # 只有在这个时间戳之后的新K线才会被认为是"新K线"并触发交易
+    initial_kline_timestamp = data_manager.get_latest_closed_kline_timestamp()
+    if initial_kline_timestamp:
+        print(f"实盘开始时间基准: {initial_kline_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  预热数据中的最后一个K线时间戳，此时间之前的K线不会触发交易")
+    else:
+        print("警告: 无法获取初始K线时间戳")
 
     def trading_loop():
-        """交易循环"""
+        """交易循环（只在K线收盘时执行交易决策）"""
         last_spread_output = 0
         last_position_sync = 0
+        # 初始化为预热数据中的最后一个K线时间戳，避免对历史数据执行交易
+        last_processed_kline_timestamp = initial_kline_timestamp
 
         while trading_strategy.running:
             try:
                 # 获取当前数据
                 current_data = data_manager.get_current_data()
-                current_prices = data_manager.get_current_prices()
+                current_prices = data_manager.get_current_prices()  # 实时价格，用于监控显示
 
                 if not current_data or not current_prices:
                     time.sleep(10)
                     continue
+                
+                # 检查是否有新的K线收盘（用于交易决策）
+                latest_kline_timestamp = data_manager.get_latest_closed_kline_timestamp()
+                has_new_kline = (latest_kline_timestamp is not None and 
+                                latest_kline_timestamp != last_processed_kline_timestamp)
+                
+                # 获取最新已收盘K线的收盘价（用于交易决策，与回测保持一致）
+                kline_close_prices = data_manager.get_latest_closed_kline_prices()
 
                 # 每10秒输出一次价差数据
                 current_time = time.time()
@@ -2554,203 +2590,237 @@ def test_live_trading():
 
                     last_spread_output = current_time
 
-                # 检查每个币对（交易逻辑）
-                for pair_info in pairs_config:
-                    symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
-                    pair_key = f"{symbol1}_{symbol2}"
+                # 只在有新K线收盘时执行交易逻辑（与回测保持一致）
+                if has_new_kline and kline_close_prices:
+                    print(f"\n{'=' * 60}")
+                    print(f"K线收盘 - {latest_kline_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"{'=' * 60}")
+                    
+                    # 检查每个币对（交易逻辑）
+                    for pair_info in pairs_config:
+                        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+                        pair_key = f"{symbol1}_{symbol2}"
 
-                    if symbol1 not in current_prices or symbol2 not in current_prices:
-                        continue
+                        if symbol1 not in kline_close_prices or symbol2 not in kline_close_prices:
+                            continue
 
-                    if symbol1 not in current_data or symbol2 not in current_data:
-                        continue
+                        if symbol1 not in current_data or symbol2 not in current_data:
+                            continue
 
-                    # 获取或更新对冲比率（使用RLS或静态值）
-                    if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
-                        # 更新RLS对冲比率
-                        current_hedge_ratio = trading_strategy.update_rls_for_pair(
-                            pair_key, current_prices[symbol1], current_prices[symbol2]
-                        )
-                        if current_hedge_ratio is None:
-                            current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
-                        
-                        # 更新数据点计数器
-                        if pair_key not in trading_strategy.data_point_count:
-                            trading_strategy.data_point_count[pair_key] = 0
-                        trading_strategy.data_point_count[pair_key] += 1
-                        
-                        # 定期协整检验
-                        if pair_key in trading_strategy.cointegration_status:
-                            data1 = current_data[symbol1]
-                            data2 = current_data[symbol2]
-                            
-                            coint_check_result = trading_strategy.check_cointegration_periodically(
-                                pair_key, data1, data2, symbol1, symbol2
+                        # 使用K线收盘价（与回测保持一致）
+                        close_price1 = kline_close_prices[symbol1]
+                        close_price2 = kline_close_prices[symbol2]
+
+                        # 获取或更新对冲比率（使用RLS或静态值）
+                        if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+                            # 使用K线收盘价更新RLS对冲比率
+                            current_hedge_ratio = trading_strategy.update_rls_for_pair(
+                                pair_key, close_price1, close_price2
                             )
+                            if current_hedge_ratio is None:
+                                current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
                             
-                            # 如果协整关系破裂，根据协整比率决定是否交易
-                            cointegration_ratio = coint_check_result.get('cointegration_ratio', 1.0)
-                            if cointegration_ratio <= 0:
-                                # 完全暂停交易
-                                continue
-                            # 如果协整比率很低（<0.2），也暂停交易
-                            elif cointegration_ratio < 0.2:
-                                continue
-                    else:
-                        # 使用静态对冲比率
-                        current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
-
-                    # 计算价差和Z-score（根据diff_order选择计算方式）
-                    diff_order = pair_info.get('diff_order', 0)
-                    data1 = current_data[symbol1]
-                    data2 = current_data[symbol2]
-
-                    if diff_order == 0:
-                        # 原始价差
-                        current_spread = trading_strategy.calculate_current_spread(
-                            current_prices[symbol1],
-                            current_prices[symbol2],
-                            current_hedge_ratio
-                        )
-
-                        # 获取历史价差数据
-                        historical_spreads = []
-                        historical_prices1 = []
-                        historical_prices2 = []
-                        for i in range(max(0, len(data1) - trading_strategy.lookback_period), len(data1)):
-                            if i < len(data2):
-                                # 如果使用RLS，尝试获取历史对冲比率
-                                hist_hedge_ratio = current_hedge_ratio
-                                if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
-                                    rls = trading_strategy.rls_instances[pair_key]
-                                    if len(rls.beta_history) > (len(data1) - i):
-                                        hist_hedge_ratio = rls.beta_history[-(len(data1) - i)][1]
+                            # 更新数据点计数器
+                            if pair_key not in trading_strategy.data_point_count:
+                                trading_strategy.data_point_count[pair_key] = 0
+                            trading_strategy.data_point_count[pair_key] += 1
+                            
+                            # 定期协整检验
+                            if pair_key in trading_strategy.cointegration_status:
+                                data1 = current_data[symbol1]
+                                data2 = current_data[symbol2]
                                 
-                                hist_spread = trading_strategy.calculate_current_spread(
-                                    data1.iloc[i], data2.iloc[i], hist_hedge_ratio
+                                coint_check_result = trading_strategy.check_cointegration_periodically(
+                                    pair_key, data1, data2, symbol1, symbol2
                                 )
-                                historical_spreads.append(hist_spread)
-                                historical_prices1.append(data1.iloc[i])
-                                historical_prices2.append(data2.iloc[i])
-                    elif diff_order == 1:
-                        # 一阶差分价差
-                        if len(data1) > 1 and len(data2) > 1:
-                            # 当前一阶差分：当前价格 - 前一个价格
-                            current_diff1 = current_prices[symbol1] - data1.iloc[-1]
-                            current_diff2 = current_prices[symbol2] - data2.iloc[-1]
-                            # 一阶差分价差 = diff1 - hedge_ratio * diff2
-                            # 注意：hedge_ratio应该从一阶差分价格计算得出
-                            current_spread = current_diff1 - current_hedge_ratio * current_diff2
+                                
+                                # 如果协整关系破裂，根据协整比率决定是否交易
+                                cointegration_ratio = coint_check_result.get('cointegration_ratio', 1.0)
+                                if cointegration_ratio <= 0:
+                                    # 完全暂停交易
+                                    continue
+                                # 如果协整比率很低（<0.2），也暂停交易
+                                elif cointegration_ratio < 0.2:
+                                    continue
+                        else:
+                            # 使用静态对冲比率
+                            current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
 
-                            # 获取历史一阶差分价差数据
+                        # 计算价差和Z-score（根据diff_order选择计算方式，使用K线收盘价）
+                        diff_order = pair_info.get('diff_order', 0)
+                        data1 = current_data[symbol1]
+                        data2 = current_data[symbol2]
+
+                        if diff_order == 0:
+                            # 原始价差（使用K线收盘价）
+                            current_spread = trading_strategy.calculate_current_spread(
+                                close_price1,
+                                close_price2,
+                                current_hedge_ratio
+                            )
+
+                            # 获取历史价差数据
                             historical_spreads = []
                             historical_prices1 = []
                             historical_prices2 = []
-                            for i in range(max(1, len(data1) - trading_strategy.lookback_period), len(data1)):
-                                if i < len(data2) and i > 0:
-                                    hist_diff1 = data1.iloc[i] - data1.iloc[i - 1]
-                                    hist_diff2 = data2.iloc[i] - data2.iloc[i - 1]
-                                    hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
+                            for i in range(max(0, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                if i < len(data2):
+                                    # 如果使用RLS，尝试获取历史对冲比率
+                                    hist_hedge_ratio = current_hedge_ratio
+                                    if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+                                        rls = trading_strategy.rls_instances[pair_key]
+                                        if len(rls.beta_history) > (len(data1) - i):
+                                            hist_hedge_ratio = rls.beta_history[-(len(data1) - i)][1]
+                                    
+                                    hist_spread = trading_strategy.calculate_current_spread(
+                                        data1.iloc[i], data2.iloc[i], hist_hedge_ratio
+                                    )
                                     historical_spreads.append(hist_spread)
                                     historical_prices1.append(data1.iloc[i])
                                     historical_prices2.append(data2.iloc[i])
+                        elif diff_order == 1:
+                            # 一阶差分价差（使用K线收盘价）
+                            if len(data1) > 1 and len(data2) > 1:
+                                # 当前一阶差分：当前K线收盘价 - 前一个K线收盘价
+                                current_diff1 = close_price1 - data1.iloc[-1]
+                                current_diff2 = close_price2 - data2.iloc[-1]
+                                # 一阶差分价差 = diff1 - hedge_ratio * diff2
+                                # 注意：hedge_ratio应该从一阶差分价格计算得出
+                                current_spread = current_diff1 - current_hedge_ratio * current_diff2
+
+                                # 获取历史一阶差分价差数据
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                                for i in range(max(1, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 0:
+                                        hist_diff1 = data1.iloc[i] - data1.iloc[i - 1]
+                                        hist_diff2 = data2.iloc[i] - data2.iloc[i - 1]
+                                        hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                                        historical_prices1.append(data1.iloc[i])
+                                        historical_prices2.append(data2.iloc[i])
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                        elif diff_order == 2:
+                            # 二阶差分价差（使用K线收盘价）
+                            if len(data1) > 2 and len(data2) > 2:
+                                # 当前二阶差分：price[t] - 2*price[t-1] + price[t-2]
+                                current_diff1 = (close_price1 -
+                                                 2 * data1.iloc[-1] +
+                                                 data1.iloc[-2])
+                                current_diff2 = (close_price2 -
+                                                 2 * data2.iloc[-1] +
+                                                 data2.iloc[-2])
+                                # 二阶差分价差 = diff2_1 - hedge_ratio * diff2_2
+                                # 注意：hedge_ratio应该从二阶差分价格计算得出
+                                current_spread = current_diff1 - current_hedge_ratio * current_diff2
+
+                                # 获取历史二阶差分价差数据
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                                for i in range(max(2, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 1:
+                                        hist_diff1 = (data1.iloc[i] -
+                                                      2 * data1.iloc[i - 1] +
+                                                      data1.iloc[i - 2])
+                                        hist_diff2 = (data2.iloc[i] -
+                                                      2 * data2.iloc[i - 1] +
+                                                      data2.iloc[i - 2])
+                                        hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                                        historical_prices1.append(data1.iloc[i])
+                                        historical_prices2.append(data2.iloc[i])
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
                         else:
-                            current_spread = 0
+                            # 不支持其他差分阶数，使用原始价差（使用K线收盘价）
+                            current_spread = trading_strategy.calculate_current_spread(
+                                close_price1,
+                                close_price2,
+                                current_hedge_ratio
+                            )
                             historical_spreads = []
                             historical_prices1 = []
                             historical_prices2 = []
-                    elif diff_order == 2:
-                        # 二阶差分价差
-                        if len(data1) > 2 and len(data2) > 2:
-                            # 当前二阶差分：price[t] - 2*price[t-1] + price[t-2]
-                            current_diff1 = (current_prices[symbol1] -
-                                             2 * data1.iloc[-1] +
-                                             data1.iloc[-2])
-                            current_diff2 = (current_prices[symbol2] -
-                                             2 * data2.iloc[-1] +
-                                             data2.iloc[-2])
-                            # 二阶差分价差 = diff2_1 - hedge_ratio * diff2_2
-                            # 注意：hedge_ratio应该从二阶差分价格计算得出
-                            current_spread = current_diff1 - current_hedge_ratio * current_diff2
 
-                            # 获取历史二阶差分价差数据
-                            historical_spreads = []
-                            historical_prices1 = []
-                            historical_prices2 = []
-                            for i in range(max(2, len(data1) - trading_strategy.lookback_period), len(data1)):
-                                if i < len(data2) and i > 1:
-                                    hist_diff1 = (data1.iloc[i] -
-                                                  2 * data1.iloc[i - 1] +
-                                                  data1.iloc[i - 2])
-                                    hist_diff2 = (data2.iloc[i] -
-                                                  2 * data2.iloc[i - 1] +
-                                                  data2.iloc[i - 2])
-                                    hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
-                                    historical_spreads.append(hist_spread)
-                                    historical_prices1.append(data1.iloc[i])
-                                    historical_prices2.append(data2.iloc[i])
-                        else:
-                            current_spread = 0
-                            historical_spreads = []
-                            historical_prices1 = []
-                            historical_prices2 = []
-                    else:
-                        # 不支持其他差分阶数，使用原始价差
-                        current_spread = trading_strategy.calculate_current_spread(
-                            current_prices[symbol1],
-                            current_prices[symbol2],
-                            current_hedge_ratio
-                        )
-                        historical_spreads = []
-                        historical_prices1 = []
-                        historical_prices2 = []
-
-                    current_z_score = trading_strategy.calculate_z_score(
-                        current_spread, 
-                        historical_spreads,
-                        historical_prices1=historical_prices1 if historical_prices1 else None,
-                        historical_prices2=historical_prices2 if historical_prices2 else None
-                    )
-
-                    # 检查平仓条件
-                    if pair_info['pair_name'] in trading_strategy.positions:
-                        should_close, close_reason = trading_strategy.check_exit_conditions(
-                            pair_info, current_prices, current_z_score, datetime.now(), current_spread
+                        current_z_score = trading_strategy.calculate_z_score(
+                            current_spread, 
+                            historical_spreads,
+                            historical_prices1=historical_prices1 if historical_prices1 else None,
+                            historical_prices2=historical_prices2 if historical_prices2 else None
                         )
 
-                        if should_close:
-                            trading_strategy.close_position(pair_info, current_prices, close_reason, datetime.now(),
-                                                            current_spread)
+                        print(f"币对: {pair_info['pair_name']}")
+                        print(f"  K线收盘价: {symbol1}={close_price1:.4f}, {symbol2}={close_price2:.4f}")
+                        print(f"  当前价差: {current_spread:.8f}")
+                        print(f"  Z-score: {current_z_score:.4f}")
 
-                    # 检查开仓条件
-                    elif len(trading_strategy.positions) == 0:
-                        signal = trading_strategy.generate_trading_signal(current_z_score)
-                        signal['z_score'] = current_z_score
+                        # 检查平仓条件（使用K线收盘价）
+                        if pair_info['pair_name'] in trading_strategy.positions:
+                            should_close, close_reason = trading_strategy.check_exit_conditions(
+                                pair_info, kline_close_prices, current_z_score, latest_kline_timestamp, current_spread
+                            )
 
-                        if signal['action'] != 'HOLD':
-                            # 获取可用资金
-                            try:
-                                account_info = binance_api.get_account_info()
-                                if account_info:
-                                    available_balance = float(account_info.get('availableBalance', 0))
-                                    available_capital = available_balance * trading_strategy.position_ratio * trading_strategy.leverage
-                                else:
+                            if should_close:
+                                trading_strategy.close_position(pair_info, kline_close_prices, close_reason, latest_kline_timestamp,
+                                                                current_spread)
+                                print(f"  ✅ 平仓: {close_reason}")
+
+                        # 检查开仓条件（使用K线收盘价）
+                        elif len(trading_strategy.positions) == 0:
+                            signal = trading_strategy.generate_trading_signal(current_z_score)
+                            signal['z_score'] = current_z_score
+
+                            if signal['action'] != 'HOLD':
+                                print(f"  🔴 交易信号: {signal['description']}")
+                                
+                                # 获取可用资金
+                                try:
+                                    account_info = binance_api.get_account_info()
+                                    if account_info:
+                                        available_balance = float(account_info.get('availableBalance', 0))
+                                        available_capital = available_balance * trading_strategy.position_ratio * trading_strategy.leverage
+                                    else:
+                                        available_capital = trading_strategy.current_capital * trading_strategy.position_ratio * trading_strategy.leverage
+                                except:
                                     available_capital = trading_strategy.current_capital * trading_strategy.position_ratio * trading_strategy.leverage
-                            except:
-                                available_capital = trading_strategy.current_capital * trading_strategy.position_ratio * trading_strategy.leverage
 
-                            # 使用当前对冲比率（RLS或静态）
-                            pair_info_with_rls = pair_info.copy()
-                            pair_info_with_rls['hedge_ratio'] = current_hedge_ratio
+                                # 使用当前对冲比率（RLS或静态）
+                                pair_info_with_rls = pair_info.copy()
+                                pair_info_with_rls['hedge_ratio'] = current_hedge_ratio
 
-                            trading_strategy.execute_trade(pair_info_with_rls, current_prices, signal, datetime.now(),
-                                                           current_spread, available_capital)
+                                trading_strategy.execute_trade(pair_info_with_rls, kline_close_prices, signal, latest_kline_timestamp,
+                                                               current_spread, available_capital)
+                                print(f"   开仓执行完成")
+                            else:
+                                print(f"   交易信号: {signal['description']}")
+                        
+                        print()
+                    
+                    # 更新已处理的K线时间戳
+                    last_processed_kline_timestamp = latest_kline_timestamp
 
                 # 更新资金曲线
                 trading_strategy.update_capital_curve()
 
-                # 每5分钟检查一次
-                time.sleep(5)
+                # 根据K线周期确定检查频率
+                # 在K线收盘前频繁检查，收盘后可以降低频率
+                if warmup_params['interval'] == '1m':
+                    time.sleep(10)  # 1分钟K线，每10秒检查一次
+                elif warmup_params['interval'] == '5m':
+                    time.sleep(10)  # 5分钟K线，每30秒检查一次
+                elif warmup_params['interval'] == '1h':
+                    time.sleep(10)  # 1小时K线，每60秒检查一次
+                else:
+                    time.sleep(30)  # 默认每30秒检查一次
 
             except Exception as e:
                 print(f"交易循环异常: {str(e)}")
