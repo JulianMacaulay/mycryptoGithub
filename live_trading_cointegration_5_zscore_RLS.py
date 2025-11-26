@@ -28,6 +28,10 @@ from urllib.parse import urlencode
 from flask import Flask, jsonify, request
 from typing import Dict, List, Tuple, Any, Optional
 from decimal import Decimal, ROUND_HALF_UP
+from scipy import stats
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
 
 warnings.filterwarnings('ignore')
 
@@ -587,6 +591,281 @@ class RecursiveLeastSquares:
         self.change_history = []
 
 
+# ==================== 协整检验辅助函数 ====================
+
+def calculate_hedge_ratio(price1, price2):
+    """
+    计算对冲比率（使用OLS回归）
+
+    Args:
+        price1: 第一个币种的价格序列
+        price2: 第二个币种的价格序列
+
+    Returns:
+        float: 对冲比率
+    """
+    # 确保两个序列长度一致
+    min_length = min(len(price1), len(price2))
+    price1_aligned = price1.iloc[:min_length] if hasattr(price1, 'iloc') else price1[:min_length]
+    price2_aligned = price2.iloc[:min_length] if hasattr(price2, 'iloc') else price2[:min_length]
+
+    # 使用OLS回归计算对冲比率
+    X = price2_aligned.values.reshape(-1, 1)
+    y = price1_aligned.values
+
+    # 添加常数项
+    X_with_const = add_constant(X)
+
+    # 执行回归
+    model = OLS(y, X_with_const).fit()
+    hedge_ratio = model.params[1]  # 斜率系数
+
+    return hedge_ratio
+
+
+def advanced_adf_test(series, max_lags=None, verbose=True):
+    """
+    执行增强的ADF检验
+    Args:
+        series: 时间序列
+        max_lags: 最大滞后阶数
+        verbose: 是否打印详细信息
+
+    Returns:
+        dict: ADF检验结果
+    """
+    if verbose:
+        print("执行ADF检验...")
+
+    try:
+        # 执行ADF检验
+        adf_result = adfuller(series, maxlag=max_lags, autolag='AIC')
+
+        adf_statistic = adf_result[0]
+        p_value = adf_result[1]
+        critical_values = adf_result[4]
+        used_lag = adf_result[2]
+
+        if verbose:
+            print(f"ADF检验结果:")
+            print(f"  ADF统计量: {adf_statistic:.6f}")
+            print(f"  P值: {p_value:.6f}")
+            print(f"  使用的滞后阶数: {used_lag}")
+            print(f"  临界值:")
+            for level, value in critical_values.items():
+                print(f"    {level}: {value:.6f}")
+
+        # 判断是否平稳
+        is_stationary = p_value < 0.05
+
+        if verbose:
+            print(f"  是否平稳: {'是' if is_stationary else '否'}")
+
+        return {
+            'adf_statistic': adf_statistic,
+            'p_value': p_value,
+            'critical_values': critical_values,
+            'used_lag': used_lag,
+            'is_stationary': is_stationary
+        }
+
+    except Exception as e:
+        if verbose:
+            print(f"ADF检验失败: {str(e)}")
+        return None
+
+
+def determine_integration_order(series, max_order=2):
+    """
+    确定序列的积分阶数
+
+    Args:
+        series: 时间序列
+        max_order: 最大检查的积分阶数
+
+    Returns:
+        int: 积分阶数（0=I(0), 1=I(1), 2=I(2), None=无法确定）
+    """
+    # 检验原序列
+    adf_result = advanced_adf_test(series, verbose=False)
+    if adf_result and adf_result['is_stationary']:
+        return 0  # I(0)
+
+    # 检验一阶差分
+    if max_order >= 1:
+        diff1 = series.diff().dropna()
+        if len(diff1) < 50:
+            return None
+        adf_result = advanced_adf_test(diff1, verbose=False)
+        if adf_result and adf_result['is_stationary']:
+            return 1  # I(1)
+
+    # 检验二阶差分
+    if max_order >= 2:
+        diff2 = series.diff().diff().dropna()
+        if len(diff2) < 50:
+            return None
+        adf_result = advanced_adf_test(diff2, verbose=False)
+        if adf_result and adf_result['is_stationary']:
+            return 2  # I(2)
+
+    return None  # 无法确定
+
+
+def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True, diff_order=0):
+    """
+    正确的协整检验（Engle-Granger方法）
+
+    Args:
+        price1: 第一个价格序列
+        price2: 第二个价格序列
+        symbol1: 第一个币种名称
+        symbol2: 第二个币种名称
+        verbose: 是否打印详细信息
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
+
+    Returns:
+        dict: 检验结果
+    """
+    if verbose:
+        print(f"\n开始协整检验: {symbol1}/{symbol2}")
+        print("=" * 60)
+
+    results = {
+        'pair_name': f"{symbol1}/{symbol2}",
+        'symbol1': symbol1,
+        'symbol2': symbol2,
+        'price1_order': None,
+        'price2_order': None,
+        'hedge_ratio': None,
+        'spread': None,
+        'spread_adf': None,
+        'cointegration_found': False,
+        'best_test': None,
+        'diff_order': diff_order
+    }
+
+    # 步骤1: 检验price1的积分阶数
+    if verbose:
+        print(f"\n--- 步骤1: 检验 {symbol1} 的积分阶数 ---")
+    price1_order = determine_integration_order(price1, max_order=2)
+    results['price1_order'] = price1_order
+
+    if price1_order is None:
+        if verbose:
+            print(f"{symbol1} 的积分阶数无法确定，跳过协整检验")
+        return results
+
+    if price1_order == 0:
+        if verbose:
+            print(f"{symbol1} 是 I(0)（平稳序列），不能进行协整检验")
+        return results
+
+    if verbose:
+        print(f"{symbol1} 是 I({price1_order})")
+
+    # 步骤2: 检验price2的积分阶数
+    if verbose:
+        print(f"\n--- 步骤2: 检验 {symbol2} 的积分阶数 ---")
+    price2_order = determine_integration_order(price2, max_order=2)
+    results['price2_order'] = price2_order
+
+    if price2_order is None:
+        if verbose:
+            print(f"{symbol2} 的积分阶数无法确定，跳过协整检验")
+        return results
+
+    if price2_order == 0:
+        if verbose:
+            print(f"{symbol2} 是 I(0)（平稳序列），不能进行协整检验")
+        return results
+
+    if verbose:
+        print(f"{symbol2} 是 I({price2_order})")
+
+    # 步骤3: 检查两个序列是否同阶单整
+    if price1_order != price2_order:
+        if verbose:
+            print(f"{symbol1} 是 I({price1_order})，{symbol2} 是 I({price2_order})，积分阶数不同，不能协整")
+        return results
+
+    # 步骤4: 只有当两个序列都是I(1)时，才进行协整检验
+    if price1_order != 1:
+        if verbose:
+            print(f"当前只支持I(1)序列的协整检验，{symbol1}和{symbol2}都是I({price1_order})，跳过")
+        return results
+
+    if verbose:
+        print(f"\n {symbol1} 和 {symbol2} 都是 I(1)，可以进行协整检验")
+
+    # 步骤5: 根据diff_order计算对冲比率和价差
+    min_length = min(len(price1), len(price2))
+    price1_aligned = price1.iloc[:min_length] if hasattr(price1, 'iloc') else price1[:min_length]
+    price2_aligned = price2.iloc[:min_length] if hasattr(price2, 'iloc') else price2[:min_length]
+
+    if diff_order == 0:
+        # 原始价差：使用原始价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算最优对冲比率（OLS回归，原始价格） ---")
+        hedge_ratio = calculate_hedge_ratio(price1_aligned, price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+
+        if verbose:
+            print(f"\n--- 步骤4: 计算原始价差（残差） ---")
+        spread = price1_aligned - hedge_ratio * price2_aligned
+        results['spread'] = spread
+
+        # 步骤6: 检验原始价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤5: 检验原始价差的平稳性（协整检验） ---")
+    else:
+        # 一阶差分价差：使用一阶差分价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算一阶差分价格 ---")
+        diff_price1 = price1_aligned.diff().dropna()
+        diff_price2 = price2_aligned.diff().dropna()
+
+        # 确保两个差分序列长度一致
+        min_diff_length = min(len(diff_price1), len(diff_price2))
+        diff_price1_aligned = diff_price1.iloc[:min_diff_length]
+        diff_price2_aligned = diff_price2.iloc[:min_diff_length]
+
+        if verbose:
+            print(f"\n--- 步骤4: 计算最优对冲比率（OLS回归，一阶差分价格） ---")
+        hedge_ratio = calculate_hedge_ratio(diff_price1_aligned, diff_price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+
+        if verbose:
+            print(f"\n--- 步骤5: 计算一阶差分价差 ---")
+        spread = diff_price1_aligned - hedge_ratio * diff_price2_aligned
+        results['spread'] = spread
+
+        # 步骤6: 检验一阶差分价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤6: 检验一阶差分价差的平稳性（协整检验） ---")
+    
+    spread_adf = advanced_adf_test(spread, verbose=verbose)
+    results['spread_adf'] = spread_adf
+
+    if spread_adf and spread_adf['is_stationary']:
+        # 价差平稳，协整关系成立！
+        results['cointegration_found'] = True
+        results['best_test'] = {
+            'type': 'cointegration',
+            'adf_result': spread_adf,
+            'spread': spread
+        }
+        if verbose:
+            print(f"\n 协整检验通过！{symbol1} 和 {symbol2} 存在协整关系")
+            print(f"  价差是平稳的（I(0)），ADF P值: {spread_adf['p_value']:.6f}")
+    else:
+        if verbose:
+            print(f"\n 协整检验未通过")
+            print(f"  价差不平稳，ADF P值: {spread_adf['p_value']:.6f if spread_adf else 'N/A'}")
+
+    return results
+
+
 # ==================== 高级交易流程代码 ====================
 
 class AdvancedCointegrationTrading:
@@ -596,7 +875,8 @@ class AdvancedCointegrationTrading:
                  take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
                  position_ratio=0.5, leverage=5, trading_fee_rate=0.000275,
                  z_score_strategy=None, use_arima_garch=False, arima_order=(1, 0, 1), garch_order=(1, 1),
-                 use_rls=True, rls_lambda=0.99, rls_max_change_rate=0.2):
+                 use_rls=True, rls_lambda=0.99, rls_max_change_rate=0.2,
+                 cointegration_window_size=500, cointegration_check_interval=500, diff_order=0):
         """
         初始化高级协整交易策略（支持RLS动态对冲比率）
 
@@ -618,6 +898,9 @@ class AdvancedCointegrationTrading:
             use_rls: 是否使用RLS动态更新对冲比率
             rls_lambda: RLS遗忘因子（0 < λ ≤ 1）
             rls_max_change_rate: RLS最大变化率（防止突变）
+            cointegration_window_size: 协整检验窗口大小（与初始筛选的window_size一致，默认500）
+            cointegration_check_interval: 协整检验间隔（数据条数，使用窗口大小，默认500）
+            diff_order: 价差类型，0=原始价差，1=一阶差分价差
         """
         self.binance_api = binance_api
         self.lookback_period = lookback_period
@@ -641,6 +924,17 @@ class AdvancedCointegrationTrading:
         
         # RLS实例字典（每个币对一个RLS实例）
         self.rls_instances = {}
+        
+        # 协整状态跟踪（每个币对的协整状态）
+        self.cointegration_status = {}  # {pair_key: {'is_cointegrated': bool, 'last_check_index': int, 'cointegration_ratio': float}}
+        
+        # 协整检验相关参数
+        self.cointegration_window_size = cointegration_window_size
+        self.cointegration_check_interval = cointegration_check_interval
+        self.diff_order = diff_order
+        
+        # 协整检验计数器（用于实盘交易，记录数据点数量）
+        self.data_point_count = {}  # {pair_key: count}
         
         # 存储历史价格数据（用于RLS和策略）
         self.price_history = {}  # {pair_key: {'price1': [...], 'price2': [...]}}
@@ -773,6 +1067,18 @@ class AdvancedCointegrationTrading:
             rls.initialize(initial_price1, initial_price2)
             self.rls_instances[pair_key] = rls
             
+            # 初始化协整状态
+            self.cointegration_status[pair_key] = {
+                'is_cointegrated': True,
+                'last_check_index': 0,
+                'cointegration_ratio': 1.0,  # 初始假设协整
+                'last_hedge_ratio': rls.get_hedge_ratio(),
+                'consecutive_failures': 0  # 连续失败计数
+            }
+            
+            # 初始化数据点计数器
+            self.data_point_count[pair_key] = 0
+            
             # 初始化价格历史
             self.price_history[pair_key] = {
                 'price1': list(initial_price1) if hasattr(initial_price1, '__iter__') and not isinstance(initial_price1, str) else [initial_price1],
@@ -815,6 +1121,135 @@ class AdvancedCointegrationTrading:
         except Exception as e:
             print(f"警告: 更新币对 {pair_key} 的RLS失败: {str(e)}")
             return None
+    
+    def check_cointegration_periodically(self, pair_key, price1_series, price2_series, symbol1, symbol2):
+        """
+        定期进行协整检验（实盘交易版本）
+        
+        Args:
+            pair_key: 币对标识
+            price1_series: 价格序列1（pandas Series或list）
+            price2_series: 价格序列2（pandas Series或list）
+            symbol1: 币种1名称
+            symbol2: 币种2名称
+            
+        Returns:
+            dict: 协整检验结果
+        """
+        if pair_key not in self.cointegration_status:
+            return {'is_cointegrated': False, 'cointegration_ratio': 0.0}
+        
+        status = self.cointegration_status[pair_key]
+        last_check = status['last_check_index']
+        current_index = self.data_point_count.get(pair_key, 0)
+        
+        # 检查是否需要重新检验（每N个数据点检验一次）
+        if current_index - last_check < self.cointegration_check_interval:
+            # 不需要检验，返回当前状态
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
+        
+        # 需要重新检验
+        print(f"\n{'=' * 60}")
+        print(f"定期协整检验: {symbol1}/{symbol2} (数据点: {current_index})")
+        print(f"{'=' * 60}")
+        
+        # 转换为pandas Series（如果还不是）
+        if not isinstance(price1_series, pd.Series):
+            price1_series = pd.Series(price1_series)
+        if not isinstance(price2_series, pd.Series):
+            price2_series = pd.Series(price2_series)
+        
+        # 使用与初始筛选相同的窗口大小进行协整检验
+        # 如果可用数据不足，使用可用数据的80%，但至少需要100个数据点
+        max_window_size = min(len(price1_series), len(price2_series))
+        target_window_size = self.cointegration_window_size
+        
+        # 如果可用数据少于目标窗口大小，使用可用数据的80%
+        if max_window_size < target_window_size:
+            window_size = max(100, int(max_window_size * 0.8))  # 至少100个数据点
+            print(f"  可用数据不足，使用可用数据的80%: {window_size} 个数据点（目标: {target_window_size}）")
+        else:
+            window_size = target_window_size
+            print(f"  使用窗口大小: {window_size} 个数据点（与初始筛选一致）")
+        
+        if window_size < 100:  # 至少需要100个数据点
+            print(f"  数据不足，跳过协整检验（需要至少100个数据点，当前{window_size}个）")
+            # 如果数据不足，保持当前状态，但标记为需要更多数据
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
+        
+        # 获取最近的数据
+        recent_price1 = price1_series.iloc[-window_size:] if hasattr(price1_series, 'iloc') else price1_series[-window_size:]
+        recent_price2 = price2_series.iloc[-window_size:] if hasattr(price2_series, 'iloc') else price2_series[-window_size:]
+        
+        # 执行协整检验
+        try:
+            coint_result = enhanced_cointegration_test(
+                recent_price1, recent_price2, symbol1, symbol2,
+                verbose=False, diff_order=self.diff_order
+            )
+            
+            is_cointegrated = coint_result.get('cointegration_found', False)
+            spread_adf = coint_result.get('spread_adf', {})
+            p_value = spread_adf.get('p_value', 1.0) if spread_adf else 1.0
+            
+            print(f"  协整检验结果: {'通过' if is_cointegrated else '失败'}")
+            print(f"  ADF P值: {p_value:.6f}")
+            
+            # 更新协整状态
+            status['is_cointegrated'] = is_cointegrated
+            status['last_check_index'] = current_index
+            
+            if is_cointegrated:
+                print(f"   协整检验通过: {symbol1}/{symbol2} 仍然协整")
+                # 如果之前失败过，现在恢复了，重置协整比率
+                if not status.get('is_cointegrated', True):
+                    print(f"   协整关系已恢复！")
+                status['cointegration_ratio'] = 1.0  # 假设通过检验时比率为1.0
+                status['consecutive_failures'] = 0  # 重置连续失败计数
+            else:
+                # 增加连续失败计数
+                consecutive_failures = status.get('consecutive_failures', 0) + 1
+                status['consecutive_failures'] = consecutive_failures
+                
+                print(f"  协整检验失败: {symbol1}/{symbol2} 协整关系破裂！")
+                print(f"  连续失败次数: {consecutive_failures}")
+                print(f"    将在 {self.cointegration_check_interval} 个数据点后重新检验")
+                
+                # 根据连续失败次数决定协整比率
+                # 第1次失败：降低到0.5
+                # 第2次失败：降低到0.2
+                # 第3次及以上：降低到0（完全暂停）
+                if consecutive_failures == 1:
+                    status['cointegration_ratio'] = 0.5
+                    print(f"    协整比率降低至50%，减少交易仓位")
+                elif consecutive_failures == 2:
+                    status['cointegration_ratio'] = 0.2
+                    print(f"    协整比率降低至20%，大幅减少交易仓位")
+                else:
+                    status['cointegration_ratio'] = 0.0
+                    print(f"    协整比率降至0%，完全暂停交易，等待协整关系修复...")
+            
+            return {
+                'is_cointegrated': is_cointegrated,
+                'cointegration_ratio': status.get('cointegration_ratio', 0.0),
+                'coint_result': coint_result
+            }
+        
+        except Exception as e:
+            print(f"  协整检验出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 检验出错时，保持当前状态，不改变协整状态
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
     
     def calculate_z_score(self, current_spread, historical_spreads, historical_prices1=None, historical_prices2=None):
         """
@@ -1820,10 +2255,33 @@ def test_live_trading():
     print("\n7. 启动实时数据收集")
     data_manager.start_data_collection(symbols, interval=warmup_params['interval'])
 
-    # 9. 配置RLS参数
-    print("\n8. 配置RLS参数")
+    # 9. 配置RLS和协整检验参数
+    print("\n8. 配置RLS和协整检验参数")
     use_rls_input = input("是否使用RLS动态对冲比率? (y/n, 默认y): ").strip().lower()
     use_rls = use_rls_input != 'n'
+    
+    # 配置协整监控窗口参数（如果使用RLS）
+    cointegration_window_size = 500
+    cointegration_check_interval = 500
+    if use_rls:
+        print("\n配置协整监控窗口参数（用于定期协整检验）")
+        print("该窗口大小用于定期协整检验，验证协整关系是否仍然存在")
+        window_input = input(f"协整检验窗口大小 (默认500): ").strip()
+        if window_input:
+            try:
+                cointegration_window_size = int(window_input)
+                if cointegration_window_size <= 0:
+                    print("窗口大小必须为正整数，使用默认值500")
+                    cointegration_window_size = 500
+            except ValueError:
+                print("输入无效，使用默认值500")
+                cointegration_window_size = 500
+        
+        # 使用窗口大小作为协整检验间隔
+        cointegration_check_interval = cointegration_window_size
+        print(f"  协整检验窗口大小: {cointegration_window_size} 个数据点")
+        print(f"  协整检验间隔: {cointegration_check_interval} 个数据点（使用窗口大小）")
+    
     rls_lambda = 0.99
     rls_max_change_rate = 0.2
     
@@ -1852,6 +2310,8 @@ def test_live_trading():
 
     # 10. 初始化交易策略
     print("\n9. 初始化交易策略")
+    # 获取价差类型（从第一个币对获取，假设所有币对使用相同的价差类型）
+    diff_order = pairs_config[0].get('diff_order', 0) if pairs_config else 0
     trading_strategy = AdvancedCointegrationTrading(
         binance_api=binance_api,
         lookback_period=trading_params['lookback_period'],
@@ -1866,7 +2326,10 @@ def test_live_trading():
         z_score_strategy=z_score_strategy,
         use_rls=use_rls,
         rls_lambda=rls_lambda,
-        rls_max_change_rate=rls_max_change_rate
+        rls_max_change_rate=rls_max_change_rate,
+        cointegration_window_size=cointegration_window_size,
+        cointegration_check_interval=cointegration_check_interval,
+        diff_order=diff_order
     )
     
     # 初始化RLS（如果使用）
@@ -1904,14 +2367,16 @@ def test_live_trading():
     if use_rls:
         print(f"  RLS遗忘因子: {rls_lambda}")
         print(f"  RLS最大变化率: {rls_max_change_rate}")
+        print(f"  协整检验窗口大小: {cointegration_window_size} 个数据点")
+        print(f"  协整检验间隔: {cointegration_check_interval} 个数据点")
     print(f"  K线周期: {warmup_params['interval']}")
 
-    # 11. 启动Web服务器
-    print("\n10. 启动Web服务器")
+    # 12. 启动Web服务器
+    print("\n11. 启动Web服务器")
     server = LiveTradingServer(trading_strategy)
 
-    # 12. 启动交易循环
-    print("\n11. 启动交易循环")
+    # 13. 启动交易循环
+    print("\n12. 启动交易循环")
     trading_strategy.running = True
 
     def trading_loop():
@@ -1954,6 +2419,11 @@ def test_live_trading():
                             )
                             if current_hedge_ratio is None:
                                 current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
+                            
+                            # 更新数据点计数器（用于定期协整检验）
+                            if pair_key not in trading_strategy.data_point_count:
+                                trading_strategy.data_point_count[pair_key] = 0
+                            trading_strategy.data_point_count[pair_key] += 1
                         else:
                             # 使用静态对冲比率
                             current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
@@ -2103,6 +2573,29 @@ def test_live_trading():
                         )
                         if current_hedge_ratio is None:
                             current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
+                        
+                        # 更新数据点计数器
+                        if pair_key not in trading_strategy.data_point_count:
+                            trading_strategy.data_point_count[pair_key] = 0
+                        trading_strategy.data_point_count[pair_key] += 1
+                        
+                        # 定期协整检验
+                        if pair_key in trading_strategy.cointegration_status:
+                            data1 = current_data[symbol1]
+                            data2 = current_data[symbol2]
+                            
+                            coint_check_result = trading_strategy.check_cointegration_periodically(
+                                pair_key, data1, data2, symbol1, symbol2
+                            )
+                            
+                            # 如果协整关系破裂，根据协整比率决定是否交易
+                            cointegration_ratio = coint_check_result.get('cointegration_ratio', 1.0)
+                            if cointegration_ratio <= 0:
+                                # 完全暂停交易
+                                continue
+                            # 如果协整比率很低（<0.2），也暂停交易
+                            elif cointegration_ratio < 0.2:
+                                continue
                     else:
                         # 使用静态对冲比率
                         current_hedge_ratio = pair_info.get('hedge_ratio', 1.0)
@@ -2283,8 +2776,7 @@ def test_live_trading():
 def main():
     """主函数"""
     print("实盘协整交易系统（支持传统方法、ARIMA-GARCH、ECM、Kalman Filter、Copula+DCC-GARCH、Regime-Switching）")
-    print("基于 cointegration_test_windows_optimization_arima_garch.py 的核心交易逻辑")
-    print("结合 test_live_trading.py 的实时交易基础设施")
+    print("实时交易基础设施")
     print()
 
     # 执行实盘交易
