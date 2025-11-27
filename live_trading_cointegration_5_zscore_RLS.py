@@ -1450,8 +1450,60 @@ class AdvancedCointegrationTrading:
             else:
                 print(f"订单未完全成交，不保存持仓")
                 return None
+        elif order1 and order1.get('orderId') and (not order2 or not order2.get('orderId')):
+            # 第一个订单成功，第二个订单失败
+            print(f"配对交易失败: {symbol1} 成功，{symbol2} 失败")
+            print(f"  正在紧急平仓 {symbol1}...")
+            
+            # 根据信号方向确定平仓方向
+            if signal['action'] == 'SHORT_LONG':
+                # 做空symbol1，需要买入平仓
+                close_side = 'BUY'
+            else:  # LONG_SHORT
+                # 做多symbol1，需要卖出平仓
+                close_side = 'SELL'
+            
+            # 紧急平仓第一个订单
+            close_success = self.emergency_close_position(
+                symbol1, close_side, quantity1, f"配对交易失败，{symbol2}下单失败"
+            )
+            
+            if close_success:
+                print(f"✓ 紧急平仓成功，风险已控制")
+            else:
+                print(f"✗ 紧急平仓失败，请手动处理 {symbol1} 仓位")
+            
+            return None
+        elif order2 and order2.get('orderId') and (not order1 or not order1.get('orderId')):
+            # 第二个订单成功，第一个订单失败
+            print(f"配对交易失败: {symbol2} 成功，{symbol1} 失败")
+            print(f"  正在紧急平仓 {symbol2}...")
+            
+            # 根据信号方向确定平仓方向
+            if signal['action'] == 'SHORT_LONG':
+                # 做多symbol2，需要卖出平仓
+                close_side = 'SELL'
+            else:  # LONG_SHORT
+                # 做空symbol2，需要买入平仓
+                close_side = 'BUY'
+            
+            # 紧急平仓第二个订单
+            close_success = self.emergency_close_position(
+                symbol2, close_side, quantity2, f"配对交易失败，{symbol1}下单失败"
+            )
+            
+            if close_success:
+                print(f"✓ 紧急平仓成功，风险已控制")
+            else:
+                print(f"✗ 紧急平仓失败，请手动处理 {symbol2} 仓位")
+            
+            return None
         else:
             print(f"下单失败: {symbol1} 或 {symbol2} 订单未成功提交")
+            if order1:
+                print(f"  {symbol1} 订单: {order1}")
+            if order2:
+                print(f"  {symbol2} 订单: {order2}")
             return None
 
     def check_exit_conditions(self, pair_info, current_prices, current_z_score, timestamp, current_spread):
@@ -1571,7 +1623,25 @@ class AdvancedCointegrationTrading:
         return None
 
     def wait_for_orders_completion(self, order1, order2, symbol1, symbol2, max_wait=30):
-        """等待订单成交"""
+        """等待订单成交（支持单个订单）"""
+        # 如果order2为None，只等待order1
+        if order2 is None:
+            for i in range(max_wait):
+                try:
+                    status1 = self.binance_api.get_order_status(order1['orderId'], symbol1)
+                    if status1:
+                        status1_str = status1.get('status', 'UNKNOWN')
+                        if status1_str in ['FILLED', 'PARTIALLY_FILLED']:
+                            return True, status1, None
+                        elif status1_str in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                            return False, status1, None
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"查询订单状态异常: {str(e)}")
+                    time.sleep(1)
+            return False, None, None
+        
+        # 两个订单的情况
         for i in range(max_wait):
             try:
                 status1 = self.binance_api.get_order_status(order1['orderId'], symbol1)
@@ -1595,6 +1665,36 @@ class AdvancedCointegrationTrading:
                 time.sleep(1)
 
         return False, None, None
+
+    def emergency_close_position(self, symbol, side, quantity, reason="紧急平仓"):
+        """紧急平仓单个仓位"""
+        try:
+            print(f"  紧急平仓: {symbol} {side} {quantity} - 原因: {reason}")
+            
+            # 执行平仓订单
+            order = self.binance_api.place_order(symbol, side, quantity)
+            
+            if order and order.get('orderId'):
+                print(f"  紧急平仓订单已提交: {symbol} {side} {quantity}")
+                
+                # 等待平仓订单成交
+                success, final_status, _ = self.wait_for_orders_completion(
+                    order, None, symbol, None, max_wait=10
+                )
+                
+                if success:
+                    print(f"  ✓ 紧急平仓成功: {symbol}")
+                    return True
+                else:
+                    print(f"  ✗ 紧急平仓失败: {symbol}")
+                    return False
+            else:
+                print(f"  ✗ 紧急平仓订单提交失败: {symbol}")
+                return False
+                
+        except Exception as e:
+            print(f"✗ 紧急平仓异常: {symbol} - {str(e)}")
+            return False
 
     def update_capital_curve(self):
         """更新资金曲线"""
@@ -2772,7 +2872,7 @@ def test_live_trading():
                             if should_close:
                                 trading_strategy.close_position(pair_info, kline_close_prices, close_reason, latest_kline_timestamp,
                                                                 current_spread)
-                                print(f"  ✅ 平仓: {close_reason}")
+                                print(f"   平仓: {close_reason}")
 
                         # 检查开仓条件（使用K线收盘价）
                         elif len(trading_strategy.positions) == 0:

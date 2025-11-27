@@ -483,6 +483,320 @@ if signal['action'] != 'HOLD' and len(trading_strategy.positions) == 0:
     )
 ```
 
+**部分成交处理**（新增功能）：
+
+当配对交易出现部分成交时（一个订单成功，另一个订单失败），系统会自动平掉已成交的订单，避免单边持仓风险。
+
+**处理流程**：
+
+1. **检测部分成交**：
+   - 如果`order1`成功但`order2`失败
+   - 如果`order2`成功但`order1`失败
+
+2. **自动紧急平仓**：
+   ```python
+   # 第一个订单成功，第二个订单失败
+   elif order1 and order1.get('orderId') and (not order2 or not order2.get('orderId')):
+       print(f"配对交易失败: {symbol1} 成功，{symbol2} 失败")
+       print(f"  正在紧急平仓 {symbol1}...")
+       
+       # 根据信号方向确定平仓方向
+       if signal['action'] == 'SHORT_LONG':
+           close_side = 'BUY'  # 做空symbol1，需要买入平仓
+       else:  # LONG_SHORT
+           close_side = 'SELL'  # 做多symbol1，需要卖出平仓
+       
+       # 紧急平仓第一个订单
+       close_success = self.emergency_close_position(
+           symbol1, close_side, quantity1, f"配对交易失败，{symbol2}下单失败"
+       )
+   ```
+
+3. **紧急平仓方法**：
+   ```python
+   def emergency_close_position(self, symbol, side, quantity, reason="紧急平仓"):
+       """紧急平仓单个仓位"""
+       # 执行平仓订单
+       order = self.binance_api.place_order(symbol, side, quantity)
+       
+       # 等待平仓订单成交
+       success, final_status, _ = self.wait_for_orders_completion(
+           order, None, symbol, None, max_wait=10
+       )
+       
+       return success
+   ```
+
+**风险控制**：
+- 如果紧急平仓成功，系统会提示"✓ 紧急平仓成功，风险已控制"
+- 如果紧急平仓失败，系统会提示"✗ 紧急平仓失败，请手动处理"，需要手动处理仓位
+
+**重要性**：
+配对交易的核心是对冲风险，如果只有一个币种成交，就会形成单边持仓，暴露方向性风险。自动平仓机制可以及时控制这种风险。
+
+---
+
+### 10. 实时交易服务器框架
+
+**代码位置**：第1728-1788行（`LiveTradingServer`类）
+
+**功能**：提供Web监控界面和API接口，实时监控交易状态
+
+#### 10.1 系统架构
+
+系统采用**多线程架构**，包含以下组件：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   主进程 (Main Process)                  │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌──────────────────┐  ┌──────────────────┐            │
+│  │  Flask Web服务器  │  │   交易循环线程    │            │
+│  │   (主线程)        │  │  (trading_loop)  │            │
+│  │                  │  │                  │            │
+│  │  - 提供Web界面   │  │  - 监控市场      │            │
+│  │  - API接口       │  │  - 执行交易      │            │
+│  │  - 端口: 5000    │  │  - 检查平仓条件  │            │
+│  └──────────────────┘  └──────────────────┘            │
+│                                                          │
+│  ┌──────────────────┐                                  │
+│  │  数据收集线程      │                                  │
+│  │  (update_thread)  │                                  │
+│  │                    │                                  │
+│  │  - 定期获取K线数据 │                                  │
+│  │  - 更新数据缓存    │                                  │
+│  └──────────────────┘                                  │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**线程说明**：
+
+1. **Flask Web服务器（主线程）**：
+   - 运行Flask应用，监听HTTP请求
+   - 提供Web监控界面和RESTful API
+   - 阻塞主线程，直到程序退出
+
+2. **交易循环线程（`trading_loop`）**：
+   - 独立线程，后台运行
+   - 定期检查市场数据
+   - 执行交易决策（开仓、平仓）
+   - 只在K线收盘时执行交易
+
+3. **数据收集线程（`update_thread`）**：
+   - 独立线程，后台运行
+   - 定期从币安API获取最新K线数据
+   - 更新数据缓存（`data_cache`）
+
+#### 10.2 Flask Web服务器
+
+**初始化**：
+```python
+class LiveTradingServer:
+    def __init__(self, trading_strategy):
+        self.trading_strategy = trading_strategy
+        self.app = Flask(__name__, static_folder='templates', static_url_path='')
+        self.setup_routes()
+```
+
+**路由设置**：
+```python
+def setup_routes(self):
+    """设置路由"""
+    
+    @self.app.route('/')
+    def index():
+        """主页面"""
+        return self.app.send_static_file('live_trading_monitor.html')
+    
+    @self.app.route('/api/status')
+    def get_status():
+        """获取交易状态"""
+        return jsonify(self.trading_strategy.get_trading_status())
+    
+    @self.app.route('/api/positions')
+    def get_positions():
+        """获取当前持仓"""
+        return jsonify(self.trading_strategy.positions)
+    
+    @self.app.route('/api/trades')
+    def get_trades():
+        """获取交易记录"""
+        return jsonify(self.trading_strategy.trades)
+    
+    @self.app.route('/api/capital_curve')
+    def get_capital_curve():
+        """获取资金曲线"""
+        return jsonify(self.trading_strategy.capital_curve)
+    
+    @self.app.route('/api/start_trading', methods=['POST'])
+    def start_trading():
+        """开始交易"""
+        if not self.trading_strategy.running:
+            self.trading_strategy.running = True
+            return jsonify({'status': 'success', 'message': '交易已开始'})
+        else:
+            return jsonify({'status': 'error', 'message': '交易已在运行中'})
+    
+    @self.app.route('/api/stop_trading', methods=['POST'])
+    def stop_trading():
+        """停止交易"""
+        if self.trading_strategy.running:
+            self.trading_strategy.running = False
+            return jsonify({'status': 'success', 'message': '交易已停止'})
+        else:
+            return jsonify({'status': 'error', 'message': '交易未在运行'})
+```
+
+#### 10.3 API接口说明
+
+**GET接口**：
+
+| 路径 | 说明 | 返回数据 |
+|------|------|---------|
+| `/` | Web监控界面 | HTML页面 |
+| `/api/status` | 获取交易状态 | 运行状态、资金、持仓数、交易数等 |
+| `/api/positions` | 获取当前持仓 | 所有持仓的详细信息 |
+| `/api/trades` | 获取交易记录 | 所有历史交易记录 |
+| `/api/capital_curve` | 获取资金曲线 | 资金曲线数据（时间序列） |
+
+**POST接口**：
+
+| 路径 | 说明 | 请求体 | 返回数据 |
+|------|------|--------|---------|
+| `/api/start_trading` | 开始交易 | 无 | `{'status': 'success', 'message': '交易已开始'}` |
+| `/api/stop_trading` | 停止交易 | 无 | `{'status': 'success', 'message': '交易已停止'}` |
+
+**状态接口返回示例**：
+```json
+{
+    "running": true,
+    "current_capital": 10000.0,
+    "initial_capital": 10000.0,
+    "total_return": 0.0,
+    "positions_count": 1,
+    "total_trades": 5,
+    "positions": {
+        "BTCUSDT_ETHUSDT": {
+            "pair": "BTCUSDT_ETHUSDT",
+            "symbol1": "BTCUSDT",
+            "symbol2": "ETHUSDT",
+            "symbol1_size": -0.1,
+            "symbol2_size": 1.5,
+            "entry_prices": {"BTCUSDT": 50000.0, "ETHUSDT": 3000.0},
+            "entry_spread": 100.0,
+            "entry_time": "2024-01-01T10:00:00"
+        }
+    },
+    "recent_trades": [...]
+}
+```
+
+#### 10.4 服务器启动流程
+
+**代码位置**：第2491-2550行
+
+```python
+# 12. 启动Web服务器
+print("\n11. 启动Web服务器")
+server = LiveTradingServer(trading_strategy)
+
+# 13. 启动交易循环
+print("\n12. 启动交易循环")
+trading_strategy.running = True
+
+# 获取预热数据中的最后一个K线时间戳，作为基准时间戳
+initial_kline_timestamp = data_manager.get_latest_closed_kline_timestamp()
+
+# 定义交易循环函数
+def trading_loop():
+    """交易循环（只在K线收盘时执行交易决策）"""
+    last_processed_kline_timestamp = initial_kline_timestamp
+    
+    while trading_strategy.running:
+        # 交易逻辑...
+        pass
+
+# 启动交易循环线程
+trading_thread = threading.Thread(target=trading_loop)
+trading_thread.daemon = True
+trading_thread.start()
+
+# 启动Web服务器（阻塞主线程）
+try:
+    server.run(host='0.0.0.0', port=5000, debug=False)
+except KeyboardInterrupt:
+    print("\n停止实盘交易...")
+    trading_strategy.running = False
+    data_manager.stop_data_collection()
+    print("实盘交易已停止")
+```
+
+**启动顺序**：
+
+1. 创建`LiveTradingServer`实例
+2. 设置`trading_strategy.running = True`
+3. 启动交易循环线程（后台运行）
+4. 启动Flask Web服务器（阻塞主线程，监听HTTP请求）
+
+**线程生命周期**：
+
+- **主线程**：运行Flask服务器，直到程序退出（Ctrl+C）
+- **交易循环线程**：后台运行，检查`trading_strategy.running`标志
+- **数据收集线程**：后台运行，由`RealTimeDataManager`管理
+
+#### 10.5 数据流架构
+
+```
+币安API
+   │
+   ├─→ RealTimeDataManager (数据收集线程)
+   │      │
+   │      └─→ data_cache (数据缓存)
+   │             │
+   │             ├─→ trading_loop (交易循环线程)
+   │             │      │
+   │             │      └─→ AdvancedCointegrationTrading
+   │             │             │
+   │             │             ├─→ 计算价差和Z-score
+   │             │             ├─→ 生成交易信号
+   │             │             └─→ 执行交易
+   │             │
+   │             └─→ LiveTradingServer (Web服务器)
+   │                    │
+   │                    └─→ API接口 → Web界面
+```
+
+**数据同步**：
+
+- 所有线程共享`trading_strategy`对象
+- 数据收集线程更新`data_cache`
+- 交易循环线程读取`data_cache`进行交易决策
+- Web服务器读取`trading_strategy`状态提供API
+
+#### 10.6 访问Web界面
+
+启动程序后，可以通过浏览器访问：
+
+```
+http://localhost:5000
+```
+
+或者从其他设备访问（如果在服务器上运行）：
+
+```
+http://服务器IP:5000
+```
+
+**Web界面功能**：
+
+- 实时显示交易状态
+- 显示当前持仓
+- 显示交易记录
+- 显示资金曲线
+- 可以启动/停止交易
+
 ---
 
 ## 核心模型和算法
@@ -1229,6 +1543,90 @@ def update_rls_for_pair(self, pair_key, price1_t, price2_t):
     return hedge_ratio
 ```
 
+**紧急平仓**：
+```python
+def emergency_close_position(self, symbol, side, quantity, reason="紧急平仓"):
+    """紧急平仓单个仓位（用于部分成交时平掉已成交的订单）"""
+    # 执行平仓订单
+    order = self.binance_api.place_order(symbol, side, quantity)
+    
+    if order and order.get('orderId'):
+        # 等待平仓订单成交
+        success, final_status, _ = self.wait_for_orders_completion(
+            order, None, symbol, None, max_wait=10
+        )
+        return success
+    return False
+```
+
+**执行交易（包含部分成交处理）**：
+```python
+def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread, available_capital):
+    """执行交易（实盘下单）"""
+    # 1. 计算开仓数量
+    symbol1_size, symbol2_size, total_capital_used = self.calculate_position_size_beta_neutral(...)
+    
+    # 2. 下单
+    order1 = self.binance_api.place_order(symbol1, 'SELL', quantity1)
+    order2 = self.binance_api.place_order(symbol2, 'BUY', quantity2)
+    
+    # 3. 检查下单结果
+    if order1 and order2 and order1.get('orderId') and order2.get('orderId'):
+        # 两个订单都成功提交，等待成交
+        success, final_status1, final_status2 = self.wait_for_orders_completion(...)
+        
+        if success:
+            # 创建持仓记录
+            self.positions[pair_info['pair_name']] = position
+            self.trades.append(trade)
+            return position
+        else:
+            return None
+    elif order1 and order1.get('orderId') and (not order2 or not order2.get('orderId')):
+        # 第一个订单成功，第二个订单失败 - 紧急平仓
+        close_success = self.emergency_close_position(...)
+        return None
+    elif order2 and order2.get('orderId') and (not order1 or not order1.get('orderId')):
+        # 第二个订单成功，第一个订单失败 - 紧急平仓
+        close_success = self.emergency_close_position(...)
+        return None
+    else:
+        # 两个订单都失败
+        return None
+```
+
+**紧急平仓**：
+```python
+def emergency_close_position(self, symbol, side, quantity, reason="紧急平仓"):
+    """紧急平仓单个仓位（用于部分成交时平掉已成交的订单）"""
+    try:
+        print(f"  紧急平仓: {symbol} {side} {quantity} - 原因: {reason}")
+        
+        # 执行平仓订单
+        order = self.binance_api.place_order(symbol, side, quantity)
+        
+        if order and order.get('orderId'):
+            print(f"  紧急平仓订单已提交: {symbol} {side} {quantity}")
+            
+            # 等待平仓订单成交
+            success, final_status, _ = self.wait_for_orders_completion(
+                order, None, symbol, None, max_wait=10
+            )
+            
+            if success:
+                print(f"  ✓ 紧急平仓成功: {symbol}")
+                return True
+            else:
+                print(f"  ✗ 紧急平仓失败: {symbol}")
+                return False
+        else:
+            print(f"  ✗ 紧急平仓订单提交失败: {symbol}")
+            return False
+    except Exception as e:
+        print(f"✗ 紧急平仓异常: {symbol} - {str(e)}")
+        return False
+```
+
 **定期协整检验**：
 ```python
 def check_cointegration_periodically(self, pair_key, price1_series, price2_series, symbol1, symbol2):
@@ -1368,6 +1766,14 @@ def start_data_collection(self, symbols, interval='1h'):
 3. **自动恢复**：如果协整关系恢复，系统会自动恢复正常交易
 
 这样可以在协整关系破裂时及时停止交易，避免不必要的损失。
+
+**部分成交风险控制**：
+
+配对交易的核心是对冲风险，如果只有一个币种成交，就会形成单边持仓，暴露方向性风险。系统实现了自动紧急平仓机制：
+
+1. **检测部分成交**：实时检测订单状态，发现部分成交立即处理
+2. **自动平仓**：自动平掉已成交的订单，避免单边持仓
+3. **风险提示**：如果紧急平仓失败，会提示手动处理
 
 系统设计灵活，可根据市场情况选择最适合的策略和参数。
 
