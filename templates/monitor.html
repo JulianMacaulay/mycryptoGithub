@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+
+{% block title %}实时监控 - 统计套利交易系统{% endblock %}
+
+{% block content %}
+<div class="monitor-container">
+    <div class="container">
+        <div class="monitor-header">
+            <h2>实时交易监控</h2>
+            <div class="monitor-status">
+                <span class="status-indicator" id="statusIndicator"></span>
+                <span id="statusText">连接中...</span>
+            </div>
+        </div>
+        
+        <div class="monitor-grid">
+            <div class="monitor-card">
+                <h3>账户信息</h3>
+                <div class="account-info">
+                    <div class="info-item">
+                        <span class="info-label">账户余额</span>
+                        <span class="info-value" id="balance">--</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">账户权益</span>
+                        <span class="info-value" id="equity">--</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">可用余额</span>
+                        <span class="info-value" id="available">--</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="monitor-card">
+                <h3>交易对状态</h3>
+                <div class="pairs-list" id="pairsList">
+                    <div class="empty-state">暂无交易对</div>
+                </div>
+            </div>
+            
+            <div class="monitor-card">
+                <h3>持仓信息</h3>
+                <div class="positions-list" id="positionsList">
+                    <div class="empty-state">暂无持仓</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="monitor-actions">
+            <button class="btn btn-primary" onclick="startTrading()">开始交易</button>
+            <button class="btn btn-outline" onclick="stopTrading()">停止交易</button>
+            <a href="{{ url_for('api_config') }}" class="btn btn-outline">修改配置</a>
+        </div>
+    </div>
+</div>
+
+<script>
+let updateInterval = null;
+
+function updateMonitorData() {
+    // 获取交易状态
+    Promise.all([
+        fetch('/api/monitor/data').then(r => r.json()),
+        fetch('/api/status').then(r => r.json()).catch(() => null),
+        fetch('/api/positions').then(r => r.json()).catch(() => [])
+    ])
+        .then(([monitorData, statusData, positionsData]) => {
+            // 更新状态
+            const indicator = document.getElementById('statusIndicator');
+            const statusText = document.getElementById('statusText');
+            const isRunning = monitorData.status === 'running' || (statusData && statusData.running);
+            if (isRunning) {
+                indicator.className = 'status-indicator active';
+                statusText.textContent = '运行中';
+            } else {
+                indicator.className = 'status-indicator';
+                statusText.textContent = '已停止';
+            }
+            
+            // 更新账户信息
+            if (monitorData.account) {
+                document.getElementById('balance').textContent = (monitorData.account.balance || 0).toFixed(2) + ' USDT';
+                document.getElementById('equity').textContent = (monitorData.account.equity || 0).toFixed(2) + ' USDT';
+                document.getElementById('available').textContent = (monitorData.account.available || 0).toFixed(2) + ' USDT';
+            } else if (statusData) {
+                document.getElementById('balance').textContent = (statusData.balance || 0).toFixed(2) + ' USDT';
+                document.getElementById('equity').textContent = (statusData.equity || 0).toFixed(2) + ' USDT';
+                document.getElementById('available').textContent = (statusData.available_balance || 0).toFixed(2) + ' USDT';
+            }
+            
+            // 更新交易对列表
+            const pairsList = document.getElementById('pairsList');
+            if (monitorData.pairs && monitorData.pairs.length > 0) {
+                pairsList.innerHTML = monitorData.pairs.map(pair => `
+                    <div class="pair-item">
+                        <span class="pair-name">${pair.symbol1 || pair.pair_name || 'N/A'}/${pair.symbol2 || ''}</span>
+                        <span class="pair-status active">监控中</span>
+                    </div>
+                `).join('');
+            } else {
+                pairsList.innerHTML = '<div class="empty-state">暂无交易对</div>';
+            }
+            
+            // 更新持仓列表
+            const positionsList = document.getElementById('positionsList');
+            const positions = monitorData.positions || positionsData || [];
+            if (positions && positions.length > 0) {
+                positionsList.innerHTML = positions.map(pos => {
+                    const pairName = pos.pair_name || pos.symbol || 'N/A';
+                    const side = pos.side || pos.direction || 'N/A';
+                    const quantity = pos.quantity || pos.size || 0;
+                    const price = pos.entry_price || pos.price || 0;
+                    return `
+                    <div class="position-item">
+                        <div class="position-header">
+                            <span class="position-symbol">${pairName}</span>
+                            <span class="position-side ${side}">${side}</span>
+                        </div>
+                        <div class="position-details">
+                            <span>数量: ${quantity.toFixed(4)}</span>
+                            <span>价格: ${price.toFixed(4)}</span>
+                        </div>
+                    </div>
+                `;
+                }).join('');
+            } else {
+                positionsList.innerHTML = '<div class="empty-state">暂无持仓</div>';
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching monitor data:', error);
+            document.getElementById('statusIndicator').className = 'status-indicator error';
+            document.getElementById('statusText').textContent = '连接错误';
+        });
+}
+
+function startTrading() {
+    fetch('/api/start_trading', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert('交易已开始');
+            updateMonitorData();
+        } else {
+            alert(data.message || '启动失败');
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('启动交易时出错');
+    });
+}
+
+function stopTrading() {
+    fetch('/api/stop_trading', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert('交易已停止');
+            updateMonitorData();
+        } else {
+            alert(data.message || '停止失败');
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('停止交易时出错');
+    });
+}
+
+// 页面加载时开始更新
+updateMonitorData();
+updateInterval = setInterval(updateMonitorData, 5000); // 每5秒更新一次
+
+// 页面卸载时清除定时器
+window.addEventListener('beforeunload', () => {
+    if (updateInterval) {
+        clearInterval(updateInterval);
+    }
+});
+</script>
+{% endblock %}
+

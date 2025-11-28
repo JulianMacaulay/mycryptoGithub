@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}统计套利交易系统{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <svg class="icon" viewBox="0 0 1024 1024" width="24" height="24">
+                    <path d="M512 64L128 192v384c0 211.2 172.8 384 384 384s384-172.8 384-384V192L512 64zm0 64l256 96v320c0 176-144 320-320 320S192 720 192 544V224l320-96z" fill="currentColor"/>
+                </svg>
+                <span>统计套利交易系统</span>
+            </div>
+            <div class="nav-menu">
+                {% if session.user_id %}
+                <a href="{{ url_for('monitor') }}" class="nav-link">实时监控</a>
+                <a href="{{ url_for('api_config') }}" class="nav-link">API配置</a>
+                <span class="nav-user">{{ session.username }}</span>
+                <a href="{{ url_for('logout') }}" class="nav-link">退出</a>
+                {% else %}
+                <a href="{{ url_for('index') }}" class="nav-link">首页</a>
+                <a href="{{ url_for('login') }}" class="nav-link">登录</a>
+                <a href="{{ url_for('register') }}" class="nav-link btn-primary">注册</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="flash-message flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2024 统计套利交易系统. 保留所有权利.</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+

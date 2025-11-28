@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}API配置 - 统计套利交易系统{% endblock %}
+
+{% block content %}
+<div class="config-container">
+    <div class="container">
+        <div class="config-header">
+            <h2>API密钥配置</h2>
+            <p>配置您的币安API密钥以开始交易</p>
+        </div>
+        
+        <div class="config-card">
+            <form method="POST" action="{{ url_for('api_config') }}" class="config-form">
+                <div class="form-group">
+                    <label for="api_key">API Key</label>
+                    <input type="text" id="api_key" name="api_key" 
+                           value="{{ config.api_key if config else '' }}" 
+                           placeholder="请输入您的币安API Key" required>
+                    <small class="form-hint">在币安账户中创建API密钥</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="secret_key">Secret Key</label>
+                    <input type="password" id="secret_key" name="secret_key" 
+                           value="{{ config.secret_key if config else '' }}" 
+                           placeholder="请输入您的币安Secret Key" required>
+                    <small class="form-hint">请妥善保管您的Secret Key，不要泄露给他人</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="base_url">API地址</label>
+                    <select id="base_url" name="base_url">
+                        <option value="https://testnet.binancefuture.com" 
+                                {% if not config or config.base_url == 'https://testnet.binancefuture.com' %}selected{% endif %}>
+                            测试网 (Testnet)
+                        </option>
+                        <option value="https://fapi.binance.com" 
+                                {% if config and config.base_url == 'https://fapi.binance.com' %}selected{% endif %}>
+                            实盘 (Production)
+                        </option>
+                    </select>
+                    <small class="form-hint">建议先在测试网环境测试</small>
+                </div>
+                
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">保存配置</button>
+                    <a href="{{ url_for('monitor') }}" class="btn btn-outline">跳过</a>
+                </div>
+            </form>
+            
+            <div class="config-info">
+                <h3>安全提示</h3>
+                <ul>
+                    <li>请确保您的API密钥具有适当的权限（仅交易权限，不要开启提现权限）</li>
+                    <li>建议使用IP白名单功能限制API访问</li>
+                    <li>定期更换API密钥以提高安全性</li>
+                    <li>不要在公共网络环境下配置API密钥</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+

@@ -25,7 +25,11 @@ import hmac
 import hashlib
 import urllib.parse
 from urllib.parse import urlencode
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template, redirect, url_for, session, flash
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+from functools import wraps
 from typing import Dict, List, Tuple, Any, Optional
 from decimal import Decimal, ROUND_HALF_UP
 from statsmodels.tsa.stattools import adfuller
@@ -1732,38 +1736,360 @@ class LiveTradingServer:
 
     def __init__(self, trading_strategy):
         self.trading_strategy = trading_strategy
-        self.app = Flask(__name__, static_folder='templates', static_url_path='')
+        self.app = Flask(__name__, 
+                        template_folder='templates',
+                        static_folder='static',
+                        static_url_path='/static')
+        self.app.secret_key = 'your-secret-key-change-in-production'  # 生产环境请更改
+        CORS(self.app)
+        self.init_database()
         self.setup_routes()
+    
+    def init_database(self):
+        """初始化数据库"""
+        conn = sqlite3.connect('trading_system.db')
+        c = conn.cursor()
+        
+        # 用户表
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      username TEXT UNIQUE NOT NULL,
+                      email TEXT UNIQUE NOT NULL,
+                      password_hash TEXT NOT NULL,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        
+        # 订阅表
+        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      plan_type TEXT NOT NULL,
+                      amount REAL NOT NULL,
+                      payment_method TEXT,
+                      status TEXT DEFAULT 'active',
+                      start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      end_date TIMESTAMP,
+                      FOREIGN KEY (user_id) REFERENCES users (id))''')
+        
+        # API配置表
+        c.execute('''CREATE TABLE IF NOT EXISTS api_configs
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      api_key TEXT NOT NULL,
+                      secret_key TEXT NOT NULL,
+                      base_url TEXT DEFAULT 'https://testnet.binancefuture.com',
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      FOREIGN KEY (user_id) REFERENCES users (id))''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_db(self):
+        """获取数据库连接"""
+        conn = sqlite3.connect('trading_system.db')
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def login_required(self, f):
+        """登录装饰器"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return f(*args, **kwargs)
+        return decorated_function
+    
+    def subscription_required(self, f):
+        """订阅检查装饰器"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''SELECT * FROM subscriptions 
+                         WHERE user_id = ? AND status = 'active' 
+                         AND (end_date IS NULL OR end_date > datetime('now'))
+                         ORDER BY end_date DESC LIMIT 1''', 
+                      (session['user_id'],))
+            subscription = c.fetchone()
+            conn.close()
+            
+            if not subscription:
+                return redirect(url_for('subscribe'))
+            return f(*args, **kwargs)
+        return decorated_function
 
     def setup_routes(self):
         """设置路由"""
-
+        
+        # ========== 用户系统路由 ==========
         @self.app.route('/')
         def index():
-            """主页面"""
-            return self.app.send_static_file('live_trading_monitor.html')
-
+            """首页 - 统计套利介绍"""
+            return render_template('index.html')
+        
+        @self.app.route('/login', methods=['GET', 'POST'])
+        def login():
+            """登录页面"""
+            if request.method == 'POST':
+                username = request.form.get('username')
+                password = request.form.get('password')
+                
+                conn = self.get_db()
+                c = conn.cursor()
+                c.execute('SELECT * FROM users WHERE username = ?', (username,))
+                user = c.fetchone()
+                conn.close()
+                
+                if user and check_password_hash(user['password_hash'], password):
+                    session['user_id'] = user['id']
+                    session['username'] = user['username']
+                    return redirect(url_for('subscribe'))
+                else:
+                    flash('用户名或密码错误', 'error')
+            
+            return render_template('login.html')
+        
+        @self.app.route('/register', methods=['GET', 'POST'])
+        def register():
+            """注册页面"""
+            if request.method == 'POST':
+                username = request.form.get('username')
+                email = request.form.get('email')
+                password = request.form.get('password')
+                confirm_password = request.form.get('confirm_password')
+                
+                if password != confirm_password:
+                    flash('两次输入的密码不一致', 'error')
+                    return render_template('register.html')
+                
+                conn = self.get_db()
+                c = conn.cursor()
+                
+                # 检查用户名是否已存在
+                c.execute('SELECT * FROM users WHERE username = ?', (username,))
+                if c.fetchone():
+                    conn.close()
+                    flash('用户名已存在', 'error')
+                    return render_template('register.html')
+                
+                # 检查邮箱是否已存在
+                c.execute('SELECT * FROM users WHERE email = ?', (email,))
+                if c.fetchone():
+                    conn.close()
+                    flash('邮箱已被注册', 'error')
+                    return render_template('register.html')
+                
+                # 创建新用户
+                password_hash = generate_password_hash(password)
+                c.execute('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+                          (username, email, password_hash))
+                conn.commit()
+                user_id = c.lastrowid
+                conn.close()
+                
+                session['user_id'] = user_id
+                session['username'] = username
+                return redirect(url_for('subscribe'))
+            
+            return render_template('register.html')
+        
+        @self.app.route('/logout')
+        def logout():
+            """登出"""
+            session.clear()
+            return redirect(url_for('index'))
+        
+        # ========== 订阅系统路由 ==========
+        @self.app.route('/subscribe')
+        @self.login_required
+        def subscribe():
+            """订阅页面"""
+            # 检查是否已有有效订阅
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''SELECT * FROM subscriptions 
+                         WHERE user_id = ? AND status = 'active' 
+                         AND (end_date IS NULL OR end_date > datetime('now'))
+                         ORDER BY end_date DESC LIMIT 1''', 
+                      (session['user_id'],))
+            subscription = c.fetchone()
+            conn.close()
+            
+            if subscription:
+                return redirect(url_for('api_config'))
+            
+            return render_template('subscribe.html')
+        
+        @self.app.route('/api/payment', methods=['POST'])
+        @self.login_required
+        def payment():
+            """处理支付（模拟）"""
+            data = request.json
+            plan_type = data.get('plan_type')  # 'monthly' 或 'yearly'
+            payment_method = data.get('payment_method')  # 'alipay' 或 'wechat'
+            
+            if plan_type not in ['monthly', 'yearly']:
+                return jsonify({'success': False, 'message': '无效的订阅类型'}), 400
+            
+            if payment_method not in ['alipay', 'wechat']:
+                return jsonify({'success': False, 'message': '无效的支付方式'}), 400
+            
+            # 计算金额和结束日期
+            if plan_type == 'monthly':
+                amount = 200.0
+                end_date = datetime.now() + timedelta(days=30)
+            else:
+                amount = 1500.0
+                end_date = datetime.now() + timedelta(days=365)
+            
+            # 模拟支付处理（实际应用中这里会调用支付API）
+            # 这里直接返回成功
+            
+            # 保存订阅信息
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''INSERT INTO subscriptions (user_id, plan_type, amount, payment_method, end_date)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (session['user_id'], plan_type, amount, payment_method, end_date))
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'message': '支付成功',
+                'redirect': url_for('api_config')
+            })
+        
+        # ========== API配置路由 ==========
+        @self.app.route('/api/config', methods=['GET', 'POST'])
+        @self.login_required
+        @self.subscription_required
+        def api_config():
+            """API配置页面"""
+            if request.method == 'POST':
+                api_key = request.form.get('api_key')
+                secret_key = request.form.get('secret_key')
+                base_url = request.form.get('base_url', 'https://testnet.binancefuture.com')
+                
+                if not api_key or not secret_key:
+                    flash('API Key和Secret Key不能为空', 'error')
+                    return render_template('api_config.html')
+                
+                conn = self.get_db()
+                c = conn.cursor()
+                
+                # 检查是否已有配置
+                c.execute('SELECT * FROM api_configs WHERE user_id = ?', (session['user_id'],))
+                existing = c.fetchone()
+                
+                if existing:
+                    # 更新配置
+                    c.execute('''UPDATE api_configs 
+                                 SET api_key = ?, secret_key = ?, base_url = ?, updated_at = CURRENT_TIMESTAMP
+                                 WHERE user_id = ?''',
+                              (api_key, secret_key, base_url, session['user_id']))
+                else:
+                    # 创建新配置
+                    c.execute('''INSERT INTO api_configs (user_id, api_key, secret_key, base_url)
+                                 VALUES (?, ?, ?, ?)''',
+                              (session['user_id'], api_key, secret_key, base_url))
+                
+                conn.commit()
+                conn.close()
+                
+                flash('API配置保存成功', 'success')
+                return redirect(url_for('monitor'))
+            
+            # GET请求 - 显示配置页面
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('SELECT * FROM api_configs WHERE user_id = ?', (session['user_id'],))
+            config = c.fetchone()
+            conn.close()
+            
+            return render_template('api_config.html', config=config)
+        
+        # ========== 监控页面路由 ==========
+        @self.app.route('/monitor')
+        @self.login_required
+        @self.subscription_required
+        def monitor():
+            """实时监控页面"""
+            return render_template('monitor.html')
+        
+        # ========== 交易API路由 ==========
         @self.app.route('/api/status')
+        @self.login_required
+        @self.subscription_required
         def get_status():
             """获取交易状态"""
             return jsonify(self.trading_strategy.get_trading_status())
 
         @self.app.route('/api/positions')
+        @self.login_required
+        @self.subscription_required
         def get_positions():
             """获取当前持仓"""
             return jsonify(self.trading_strategy.positions)
 
         @self.app.route('/api/trades')
+        @self.login_required
+        @self.subscription_required
         def get_trades():
             """获取交易记录"""
             return jsonify(self.trading_strategy.trades)
 
         @self.app.route('/api/capital_curve')
+        @self.login_required
+        @self.subscription_required
         def get_capital_curve():
             """获取资金曲线"""
             return jsonify(self.trading_strategy.capital_curve)
+        
+        @self.app.route('/api/monitor/data')
+        @self.login_required
+        @self.subscription_required
+        def monitor_data():
+            """获取监控数据API"""
+            # 从币安API实时获取账户信息
+            account_info = None
+            try:
+                account_info = self.trading_strategy.binance_api.get_account_info()
+            except Exception as e:
+                print(f"获取账户信息失败: {str(e)}")
+            
+            # 解析账户信息
+            balance = 0.0
+            equity = 0.0
+            available = 0.0
+            
+            if account_info:
+                balance = float(account_info.get('totalWalletBalance', 0))
+                available = float(account_info.get('availableBalance', 0))
+                # 账户权益 = 总钱包余额 + 未实现盈亏
+                unrealized_profit = float(account_info.get('totalUnrealizedProfit', 0))
+                equity = balance + unrealized_profit
+                # 或者使用保证金余额（已包含未实现盈亏）
+                # equity = float(account_info.get('totalMarginBalance', balance))
+            
+            status = self.trading_strategy.get_trading_status()
+            return jsonify({
+                'status': 'running' if self.trading_strategy.running else 'stopped',
+                'pairs': [],
+                'positions': list(self.trading_strategy.positions.values()) if self.trading_strategy.positions else [],
+                'account': {
+                    'balance': balance,
+                    'equity': equity,
+                    'available': available
+                }
+            })
 
         @self.app.route('/api/start_trading', methods=['POST'])
+        @self.login_required
+        @self.subscription_required
         def start_trading():
             """开始交易"""
             if not self.trading_strategy.running:
@@ -1773,6 +2099,8 @@ class LiveTradingServer:
                 return jsonify({'status': 'error', 'message': '交易已在运行中'})
 
         @self.app.route('/api/stop_trading', methods=['POST'])
+        @self.login_required
+        @self.subscription_required
         def stop_trading():
             """停止交易"""
             if self.trading_strategy.running:

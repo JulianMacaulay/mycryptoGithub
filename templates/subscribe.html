@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+
+{% block title %}订阅服务 - 统计套利交易系统{% endblock %}
+
+{% block content %}
+<div class="subscribe-container">
+    <div class="container">
+        <div class="subscribe-header">
+            <h2>选择订阅计划</h2>
+            <p>选择适合您的订阅方案，开始使用统计套利交易系统</p>
+        </div>
+        
+        <div class="pricing-grid">
+            <div class="pricing-card">
+                <div class="pricing-header">
+                    <h3>月度会员</h3>
+                    <div class="pricing-price">
+                        <span class="price-amount">¥200</span>
+                        <span class="price-period">/月</span>
+                    </div>
+                </div>
+                <ul class="pricing-features">
+                    <li>✓ 完整的交易功能</li>
+                    <li>✓ 实时监控面板</li>
+                    <li>✓ 技术支持</li>
+                    <li>✓ 策略配置</li>
+                </ul>
+                <button class="btn btn-outline btn-block" onclick="selectPlan('monthly')">选择月度</button>
+            </div>
+            
+            <div class="pricing-card featured">
+                <div class="pricing-badge">推荐</div>
+                <div class="pricing-header">
+                    <h3>年度会员</h3>
+                    <div class="pricing-price">
+                        <span class="price-amount">¥1500</span>
+                        <span class="price-period">/年</span>
+                    </div>
+                    <div class="pricing-save">节省 ¥900</div>
+                </div>
+                <ul class="pricing-features">
+                    <li>✓ 完整的交易功能</li>
+                    <li>✓ 实时监控面板</li>
+                    <li>✓ 优先技术支持</li>
+                    <li>✓ 高级策略配置</li>
+                    <li>✓ 数据分析报告</li>
+                </ul>
+                <button class="btn btn-primary btn-block" onclick="selectPlan('yearly')">选择年度</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 支付模态框 -->
+<div id="paymentModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>选择支付方式</h3>
+            <span class="modal-close" onclick="closePaymentModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <div class="payment-methods">
+                <div class="payment-method" onclick="processPayment('alipay')">
+                    <div class="payment-icon">
+                        <svg viewBox="0 0 1024 1024" width="48" height="48">
+                            <path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372z" fill="#1677FF"/>
+                            <path d="M464 336a48 48 0 1 0 96 0 48 48 0 1 0-96 0zm72 112h-48c-4.4 0-8 3.6-8 8v272c0 4.4 3.6 8 8 8h48c4.4 0 8-3.6 8-8V456c0-4.4-3.6-8-8-8z" fill="#1677FF"/>
+                        </svg>
+                    </div>
+                    <span>支付宝</span>
+                </div>
+                <div class="payment-method" onclick="processPayment('wechat')">
+                    <div class="payment-icon">
+                        <svg viewBox="0 0 1024 1024" width="48" height="48">
+                            <path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372z" fill="#07C160"/>
+                            <path d="M464 336a48 48 0 1 0 96 0 48 48 0 1 0-96 0zm72 112h-48c-4.4 0-8 3.6-8 8v272c0 4.4 3.6 8 8 8h48c4.4 0 8-3.6 8-8V456c0-4.4-3.6-8-8-8z" fill="#07C160"/>
+                        </svg>
+                    </div>
+                    <span>微信支付</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let selectedPlan = null;
+
+function selectPlan(plan) {
+    selectedPlan = plan;
+    document.getElementById('paymentModal').style.display = 'block';
+}
+
+function closePaymentModal() {
+    document.getElementById('paymentModal').style.display = 'none';
+}
+
+function processPayment(method) {
+    if (!selectedPlan) return;
+    
+    // 显示加载状态
+    const modal = document.getElementById('paymentModal');
+    modal.querySelector('.modal-body').innerHTML = '<div class="loading">处理中...</div>';
+    
+    // 发送支付请求
+    fetch('/api/payment', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            plan_type: selectedPlan,
+            payment_method: method
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            window.location.href = data.redirect;
+        } else {
+            alert(data.message || '支付失败，请重试');
+            closePaymentModal();
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('支付处理出错，请重试');
+        closePaymentModal();
+    });
+}
+
+// 点击模态框外部关闭
+window.onclick = function(event) {
+    const modal = document.getElementById('paymentModal');
+    if (event.target == modal) {
+        closePaymentModal();
+    }
+}
+</script>
+{% endblock %}
+
+
