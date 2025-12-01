@@ -5,6 +5,7 @@
 
 from .base_strategy import BaseStrategy
 from .turtle_strategy import TurtleStrategy
+from .final_multiple_period_strategy import FinalMultiplePeriodStrategy
 from .base_zscore_strategy import BaseZScoreStrategy
 from .traditional_zscore_strategy import TraditionalZScoreStrategy
 from .arima_garch_zscore_strategy import ArimaGarchZScoreStrategy
@@ -16,6 +17,7 @@ from .regime_switching_zscore_strategy import RegimeSwitchingZScoreStrategy
 __all__ = [
     'BaseStrategy',
     'TurtleStrategy',
+    'FinalMultiplePeriodStrategy',
     'BaseZScoreStrategy',
     'TraditionalZScoreStrategy',
     'ArimaGarchZScoreStrategy',

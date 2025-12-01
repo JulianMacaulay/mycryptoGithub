@@ -48,13 +48,12 @@ class BaseStrategy(ABC):
         """
         pass
     
-    def get_position_size(self, account_balance: float, atr: float, entry_price: float, leverage: float = 1.0) -> float:
+    def get_position_size(self, account_balance: float, entry_price: float, leverage: float = 1.0) -> float:
         """
         计算仓位大小
         
         Args:
             account_balance: 账户余额
-            atr: ATR值（保留参数以兼容调用，但不使用）
             entry_price: 入场价格
             leverage: 杠杆倍数（默认1.0，即无杠杆）
             
