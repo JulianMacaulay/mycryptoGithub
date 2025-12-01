@@ -641,7 +641,7 @@ class MarketRegimeMLDetector:
         print(f"\n模型训练完成！")
         print(f"测试集准确率: {accuracy:.2%}")
         print("\n分类报告:")
-        print(classification_report(y_test, y_pred, target_names=['震荡', '趋势']))
+        # print(classification_report(y_test, y_pred, target_names=['震荡', '趋势']))
         
         self.is_trained = True
     
@@ -1276,13 +1276,50 @@ class BacktestSystem:
                     self.entry_strategy = None  # 清除开仓策略记录
                     continue
 
-                # 检查均线交叉退出
+                # 检查均线交叉退出和反向开仓
                 signal = current_strategy.generate_signals(self.data, idx, self.engine.position_size)
                 if signal['signal'] in ['close_long', 'close_short']:
                     pnl = self.engine.close_position(current_price, idx, signal['reason'])
                     if pnl is not None:
                         current_strategy.update_trade_result(pnl)
                     self.entry_strategy = None  # 清除开仓策略记录
+                    
+                    # 检查是否需要反向开仓
+                    if 'reverse_signal' in signal and signal['reverse_signal']:
+                        reverse_signal = {
+                            'signal': signal['reverse_signal'],
+                            'price': signal.get('reverse_price', current_price),
+                            'reason': signal['reason']
+                        }
+                        # 立即执行反向开仓
+                        if reverse_signal['signal'] == 'long':
+                            position_size = current_strategy.get_position_size(
+                                self.engine.balance,
+                                reverse_signal['price'],
+                                self.engine.leverage
+                            )
+                            self.engine.open_position(
+                                'long',
+                                reverse_signal['price'],
+                                position_size,
+                                idx,
+                                reverse_signal['reason']
+                            )
+                            self.entry_strategy = current_strategy
+                        elif reverse_signal['signal'] == 'short':
+                            position_size = current_strategy.get_position_size(
+                                self.engine.balance,
+                                reverse_signal['price'],
+                                self.engine.leverage
+                            )
+                            self.engine.open_position(
+                                'short',
+                                reverse_signal['price'],
+                                position_size,
+                                idx,
+                                reverse_signal['reason']
+                            )
+                            self.entry_strategy = current_strategy
                     continue
 
                 # 检查加仓
@@ -1294,26 +1331,23 @@ class BacktestSystem:
                     )
                     if add_signal:
                         # 计算加仓数量
-                        atr_value = current_strategy.atr.iloc[idx]
-                        if not pd.isna(atr_value) and atr_value > 0:
-                            add_size = current_strategy.get_position_size(
-                                self.engine.balance,
-                                atr_value,
+                        add_size = current_strategy.get_position_size(
+                            self.engine.balance,
+                            add_signal['price'],
+                            self.engine.leverage
+                        )
+                        # 限制加仓数量不超过最大可开仓位
+                        max_add_value = self.engine.balance * self.engine.leverage
+                        max_add_size = max_add_value / add_signal['price'] if add_signal['price'] > 0 else 0
+                        actual_add_size = min(add_size, max_add_size) if max_add_size > 0 else 0
+                        if actual_add_size > 0:
+                            self.engine.add_position(
+                                add_signal['signal'],
                                 add_signal['price'],
-                                self.engine.leverage
+                                actual_add_size,
+                                idx,
+                                add_signal['reason']
                             )
-                            # 限制加仓数量不超过最大可开仓位
-                            max_add_value = self.engine.balance * self.engine.leverage
-                            max_add_size = max_add_value / add_signal['price'] if add_signal['price'] > 0 else 0
-                            actual_add_size = min(add_size, max_add_size) if max_add_size > 0 else 0
-                            if actual_add_size > 0:
-                                self.engine.add_position(
-                                    add_signal['signal'],
-                                    add_signal['price'],
-                                    actual_add_size,
-                                    idx,
-                                    add_signal['reason']
-                                )
                     continue
             
             # 如果没有可用策略，跳过开仓逻辑
@@ -1326,43 +1360,37 @@ class BacktestSystem:
 
                 if signal['signal'] == 'long':
                     # 计算仓位大小
-                    atr_value = self.strategy.atr.iloc[idx]
-                    if not pd.isna(atr_value) and atr_value > 0:
-                        position_size = self.strategy.get_position_size(
-                            self.engine.balance,
-                            atr_value,
-                            signal['price'],
-                            self.engine.leverage
-                        )
-                        self.engine.open_position(
-                            'long',
-                            signal['price'],
-                            position_size,
-                            idx,
-                            signal['reason']
-                        )
-                        # 记录开仓时使用的策略
-                        self.entry_strategy = self.strategy
+                    position_size = self.strategy.get_position_size(
+                        self.engine.balance,
+                        signal['price'],
+                        self.engine.leverage
+                    )
+                    self.engine.open_position(
+                        'long',
+                        signal['price'],
+                        position_size,
+                        idx,
+                        signal['reason']
+                    )
+                    # 记录开仓时使用的策略
+                    self.entry_strategy = self.strategy
 
                 elif signal['signal'] == 'short':
                     # 计算仓位大小
-                    atr_value = self.strategy.atr.iloc[idx]
-                    if not pd.isna(atr_value) and atr_value > 0:
-                        position_size = self.strategy.get_position_size(
-                            self.engine.balance,
-                            atr_value,
-                            signal['price'],
-                            self.engine.leverage
-                        )
-                        self.engine.open_position(
-                            'short',
-                            signal['price'],
-                            position_size,
-                            idx,
-                            signal['reason']
-                        )
-                        # 记录开仓时使用的策略
-                        self.entry_strategy = self.strategy
+                    position_size = self.strategy.get_position_size(
+                        self.engine.balance,
+                        signal['price'],
+                        self.engine.leverage
+                    )
+                    self.engine.open_position(
+                        'short',
+                        signal['price'],
+                        position_size,
+                        idx,
+                        signal['reason']
+                    )
+                    # 记录开仓时使用的策略
+                    self.entry_strategy = self.strategy
 
         # 最后平仓（如果有持仓）
         if self.engine.position_size != 0:
