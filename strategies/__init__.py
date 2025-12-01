@@ -8,6 +8,7 @@ from .turtle_strategy import TurtleStrategy
 from .final_multiple_period_strategy import FinalMultiplePeriodStrategy
 from .martingale_strategy import MartingaleStrategy
 from .grid_strategy import GridStrategy
+from .rsi_oscillation_strategy import RSIOscillationStrategy
 from .base_zscore_strategy import BaseZScoreStrategy
 from .traditional_zscore_strategy import TraditionalZScoreStrategy
 from .arima_garch_zscore_strategy import ArimaGarchZScoreStrategy
@@ -22,6 +23,7 @@ __all__ = [
     'FinalMultiplePeriodStrategy',
     'MartingaleStrategy',
     'GridStrategy',
+    'RSIOscillationStrategy',
     'BaseZScoreStrategy',
     'TraditionalZScoreStrategy',
     'ArimaGarchZScoreStrategy',
