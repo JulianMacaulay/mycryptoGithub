@@ -11,7 +11,7 @@ from .base_strategy import BaseStrategy
 # 尝试导入talib，如果失败则使用自定义函数
 try:
     import talib
-    TALIB_AVAILABLE = True
+    TALIB_AVAILABLE = False
 except ImportError:
     TALIB_AVAILABLE = False
     from .indicators import (

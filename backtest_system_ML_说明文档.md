@@ -1934,13 +1934,158 @@ Z₄ = A₃' · W₄ + b₄  # (batch_size, 1)
 
 ### 2. BacktestEngine（回测引擎）
 
-**主要方法：**
-- `open_position()`: 开仓
-- `add_position()`: 加仓
-- `close_position()`: 平仓
-- `update_equity()`: 更新权益
+**核心设计理念：统一多持仓管理**
 
-### 3. BacktestSystem（回测系统）
+回测引擎采用统一的多持仓管理模式，所有策略（单一持仓或多持仓）都使用同一套机制：
+- **单一持仓策略**：使用 `position_id='default'`，作为多持仓模式的特例
+- **多持仓策略**（如网格策略）：使用自定义的 `position_id`（如 `'grid_50000.0000'`）来标识不同的持仓
+
+**数据结构：**
+```python
+self.positions = [
+    {
+        'position_id': str,      # 持仓ID（'default'或自定义）
+        'size': float,           # 持仓数量（正数=多头，负数=空头）
+        'entry_price': float,    # 开仓价
+        'entry_idx': int,        # 开仓索引
+        'entry_count': int,      # 加仓次数
+        'strategy': BaseStrategy # 开仓时使用的策略
+    },
+    ...
+]
+```
+
+**主要方法：**
+
+#### 2.1 `open_position()` - 开仓
+```python
+def open_position(self, signal: str, price: float, size: float, 
+                  current_idx: int, reason: str = "", 
+                  position_id: str = None, strategy=None):
+```
+- **功能**：创建新持仓
+- **参数**：
+  - `position_id`: 持仓ID，如果为 `None` 则默认为 `'default'`
+  - `strategy`: 开仓时使用的策略实例
+- **特点**：检查 `position_id` 是否已存在，防止重复开仓
+
+#### 2.2 `add_position()` - 加仓
+```python
+def add_position(self, signal: str, price: float, size: float,
+                 current_idx: int, reason: str = "", 
+                 position_id: str = 'default'):
+```
+- **功能**：向指定持仓加仓
+- **加权平均价格计算**：
+  ```
+  新平均价 = (旧持仓价值 + 新加仓价值) / (旧持仓数量 + 新加仓数量)
+  ```
+- **更新**：`size`、`entry_price`（加权平均）、`entry_count`
+
+#### 2.3 `close_position()` - 平仓
+```python
+def close_position(self, price: float, current_idx: int, 
+                  reason: str = "", position_id: str = None):
+```
+- **功能**：平掉指定持仓或所有持仓
+- **参数**：
+  - `position_id=None`: 平掉所有持仓
+  - `position_id='default'`: 只平掉 `'default'` 持仓
+  - `position_id='grid_50000.0000'`: 只平掉指定网格持仓
+
+#### 2.4 `update_equity()` - 更新权益（计算未实现盈亏）
+
+**位置**：`backtest_system_ML.py` 第 1064-1092 行
+
+**功能**：计算所有持仓的未实现盈亏，更新账户权益
+
+**计算逻辑**：
+```python
+# 遍历所有持仓
+for pos in self.positions:
+    size = abs(pos['size'])
+    entry_price = pos['entry_price']
+    
+    if pos['size'] > 0:  # 多头
+        unrealized_pnl = (current_price - entry_price) * size
+    else:  # 空头
+        unrealized_pnl = (entry_price - current_price) * size
+    
+    total_unrealized_pnl += unrealized_pnl
+
+# 总权益 = 余额 + 总未实现盈亏
+self.equity = self.balance + total_unrealized_pnl
+```
+
+**公式说明**：
+- **多头未实现盈亏**：`(当前价 - 开仓价) × 持仓数量`
+- **空头未实现盈亏**：`(开仓价 - 当前价) × 持仓数量`
+- **总权益**：`余额 + 所有持仓的未实现盈亏之和`
+
+#### 2.5 `close_position()` - 计算已实现盈亏
+
+**位置**：`backtest_system_ML.py` 第 992-1062 行
+
+**功能**：平仓时计算已实现盈亏（Realized PnL）
+
+**计算逻辑**：
+```python
+# 计算毛盈亏
+if pos['size'] > 0:  # 平多
+    gross_pnl = (price - entry_price) * size
+else:  # 平空
+    gross_pnl = (entry_price - price) * size
+
+# 计算手续费
+entry_margin = (entry_price * size) / self.leverage
+close_cost = (size * price) * self.commission_rate
+open_cost = entry_margin * self.commission_rate
+
+# 净盈亏 = 毛盈亏 - 平仓手续费 - 开仓手续费
+pnl = gross_pnl - close_cost - open_cost
+```
+
+**公式说明**：
+- **毛盈亏**：
+  - 多头：`(平仓价 - 开仓价) × 数量`
+  - 空头：`(开仓价 - 平仓价) × 数量`
+- **手续费**：
+  - 开仓手续费：`(开仓价 × 数量 / 杠杆) × 手续费率`
+  - 平仓手续费：`(平仓价 × 数量) × 手续费率`
+- **净盈亏**：`毛盈亏 - 平仓手续费 - 开仓手续费`
+
+**与币安API的对比**：
+- 币安API提供 `unrealizedProfit` 和 `realizedProfit` 字段
+- 本系统的计算方式与币安基本一致，但使用最新价而非标记价格（Mark Price）
+
+#### 2.6 辅助方法
+
+- `get_total_position_size()`: 获取总持仓数量（所有持仓的size之和）
+- `has_positions()`: 检查是否有持仓
+- `get_position_by_id(position_id)`: 根据 `position_id` 获取持仓
+- `get_all_position_ids()`: 获取所有持仓ID列表
+
+**向后兼容属性**：
+- `position_size`: 返回总持仓数量（向后兼容）
+- `entry_price`: 返回 `'default'` 持仓的入场价格（向后兼容）
+- `entry_idx`: 返回 `'default'` 持仓的入场索引（向后兼容）
+- `entry_count`: 返回 `'default'` 持仓的加仓次数（向后兼容）
+
+### 3. BaseStrategy（策略基类）
+
+**新增属性**：
+```python
+self.engine = None  # 回测引擎引用（由回测系统设置）
+```
+
+**用途**：
+- 策略可以通过 `self.engine.get_position_by_id(position_id)` 查询持仓状态
+- 网格策略等多持仓策略需要查询多个持仓的状态
+
+**设置时机**：
+- 在 `BacktestSystem` 初始化策略时自动设置：`strategy.engine = self.engine`
+
+### 4. BacktestSystem（回测系统）
 
 **主要方法：**
 - `load_data_from_csv()`: 从CSV加载数据
@@ -1950,7 +2095,216 @@ Z₄ = A₃' · W₄ + b₄  # (batch_size, 1)
 - `plot_results()`: 绘制结果
 - `export_trades_to_csv()`: 导出交易记录
 
+**回测主循环中的持仓管理**：
+
+#### 4.1 网格策略的特殊处理
+
+对于网格策略，系统会特殊处理：
+```python
+# 检查是否是网格策略
+is_grid_strategy = self.strategy.__class__.__name__ == 'GridStrategy'
+
+# 对于网格策略，只调用一次generate_signals，让它遍历所有网格
+if is_grid_strategy and self.strategy:
+    signal = self.strategy.generate_signals(self.data, idx, 0)
+    # 处理信号...
+```
+
+**原因**：
+- 网格策略需要遍历所有网格，检查每个网格的持仓状态
+- 如果按每个持仓调用 `generate_signals()`，会导致重复检查
+
+#### 4.2 单一持仓策略的处理
+
+对于单一持仓策略（如 `MartingaleStrategy`、`final_multiple_period_strategy`）：
+- 不提供 `position_id` 的信号 → 自动使用 `'default'` 作为 `position_id`
+- 只在无 `'default'` 持仓时开新仓
+
+#### 4.3 多持仓策略的处理
+
+对于多持仓策略（如 `GridStrategy`）：
+- 信号中包含 `position_id`（如 `'grid_50000.0000'`）
+- 可以同时持有多个持仓
+- 每个持仓独立管理（止损、止盈、加仓等）
+
 ---
+
+## 盈亏计算详解
+
+### 1. 已实现盈亏（Realized PnL）
+
+**定义**：平仓时确定的盈亏，已经计入账户余额
+
+**计算方法**：`BacktestEngine.close_position()`
+
+**公式**：
+```
+毛盈亏 = {
+    多头: (平仓价 - 开仓价) × 数量
+    空头: (开仓价 - 平仓价) × 数量
+}
+
+手续费 = 开仓手续费 + 平仓手续费
+开仓手续费 = (开仓价 × 数量 / 杠杆) × 手续费率
+平仓手续费 = (平仓价 × 数量) × 手续费率
+
+净盈亏 = 毛盈亏 - 手续费
+```
+
+**示例**：
+- 开仓：50000 USDT，数量 0.1 BTC，杠杆 5倍，手续费率 0.1%
+- 平仓：51000 USDT
+- 毛盈亏 = (51000 - 50000) × 0.1 = 100 USDT
+- 开仓手续费 = (50000 × 0.1 / 5) × 0.001 = 1 USDT
+- 平仓手续费 = (51000 × 0.1) × 0.001 = 5.1 USDT
+- 净盈亏 = 100 - 1 - 5.1 = 93.9 USDT
+
+### 2. 未实现盈亏（Unrealized PnL）
+
+**定义**：持仓尚未平仓时的浮动盈亏，随价格变动而变化
+
+**计算方法**：`BacktestEngine.update_equity()`
+
+**公式**：
+```
+未实现盈亏 = {
+    多头: (当前价 - 开仓价) × 数量
+    空头: (开仓价 - 当前价) × 数量
+}
+
+总未实现盈亏 = Σ(所有持仓的未实现盈亏)
+
+总权益 = 账户余额 + 总未实现盈亏
+```
+
+**示例**：
+- 开仓：50000 USDT，数量 0.1 BTC（多头）
+- 当前价：51000 USDT
+- 未实现盈亏 = (51000 - 50000) × 0.1 = 100 USDT
+- 如果账户余额为 10000 USDT
+- 总权益 = 10000 + 100 = 10100 USDT
+
+### 3. 多持仓的盈亏计算
+
+**特点**：系统支持同时持有多个持仓，每个持仓独立计算盈亏
+
+**示例（网格策略）**：
+```
+持仓1: grid_50000.0000, 开仓价 50000, 数量 0.1, 当前价 51000
+  未实现盈亏 = (51000 - 50000) × 0.1 = 100 USDT
+
+持仓2: grid_49000.0000, 开仓价 49000, 数量 0.1, 当前价 51000
+  未实现盈亏 = (51000 - 49000) × 0.1 = 200 USDT
+
+总未实现盈亏 = 100 + 200 = 300 USDT
+```
+
+### 4. 与币安API的对比
+
+**币安API接口**：
+- `GET /fapi/v2/positionInformation`: 返回 `unrealizedProfit`（未实现盈亏）
+- `GET /fapi/v2/account`: 返回 `totalUnrealizedProfit`（总未实现盈亏）
+
+**本系统的计算方式**：
+- 与币安API基本一致
+- 使用最新价（`current_price`）而非标记价格（Mark Price）
+- 手续费计算方式与币安一致
+
+**差异说明**：
+- 币安使用标记价格（Mark Price）计算未实现盈亏，防止价格操纵
+- 本系统使用最新价，更适合回测场景（历史数据已确定）
+
+## 多持仓管理架构
+
+### 1. 设计理念
+
+**统一多持仓管理模式**：
+- 所有策略（单一持仓或多持仓）都使用同一套多持仓管理机制
+- 单一持仓策略是多持仓模式的特例（使用 `position_id='default'`）
+- 数据单一来源：持仓状态完全由回测系统管理，策略不维护内部持仓状态
+
+### 2. 策略分类
+
+#### 2.1 单一持仓策略
+- **特点**：同时只能持有一个持仓
+- **position_id**：使用 `'default'`（或不提供，系统自动分配）
+- **示例**：
+  - `MartingaleStrategy`（马丁策略）
+  - `final_multiple_period_strategy`（多周期策略）
+  - `TurtleStrategy`（海龟策略）
+
+#### 2.2 多持仓策略
+- **特点**：可以同时持有多个持仓
+- **position_id**：使用自定义ID（如 `'grid_50000.0000'`）
+- **示例**：
+  - `GridStrategy`（网格策略）：每个网格使用独立的 `position_id`
+
+### 3. 网格策略的实现
+
+**关键设计**：
+- **不维护内部状态**：网格策略不再维护 `grid_positions` 字典
+- **完全依赖回测系统**：通过 `self.engine.get_position_by_id(position_id)` 查询持仓状态
+- **position_id格式**：`f'grid_{grid_level:.4f}'`（如 `'grid_50000.0000'`）
+
+**代码示例**：
+```python
+# 网格策略的generate_signals()方法
+for i, grid_level in enumerate(self.grid_levels):
+    position_id = f'grid_{grid_level:.4f}'
+    
+    # 从回测系统查询该网格的持仓状态
+    grid_pos = self.engine.get_position_by_id(position_id)
+    has_position = grid_pos is not None and grid_pos['size'] != 0
+    
+    if not has_position:
+        # 无持仓，检查是否可以买入
+        ...
+    else:
+        # 有持仓，检查是否可以卖出
+        entry_price = grid_pos['entry_price']
+        ...
+```
+
+**优势**：
+1. **数据单一来源**：持仓状态只由回测系统管理，不会出现不同步
+2. **简化策略逻辑**：策略只需生成信号，不需要维护状态
+3. **统一管理**：所有策略都使用统一的多持仓管理机制
+
+### 4. 回测系统的处理逻辑
+
+#### 4.1 有持仓时的处理
+
+```python
+if self.engine.has_positions():
+    # 检查是否是网格策略
+    is_grid_strategy = self.strategy.__class__.__name__ == 'GridStrategy'
+    
+    if is_grid_strategy:
+        # 网格策略：只调用一次generate_signals，遍历所有网格
+        signal = self.strategy.generate_signals(self.data, idx, 0)
+        # 处理信号...
+    else:
+        # 非网格策略：遍历每个持仓
+        for pos in self.engine.positions:
+            position_id = pos['position_id']
+            pos_strategy = pos.get('strategy') or self.entry_strategy or self.strategy
+            # 检查止损、信号、加仓等...
+```
+
+#### 4.2 无持仓时的处理
+
+```python
+# 检查入场信号
+default_pos = self.engine.get_position_by_id('default')
+is_grid_strategy = self.strategy.__class__.__name__ == 'GridStrategy'
+
+# 网格策略可以随时开新仓，单一持仓策略只在无'default'持仓时开仓
+can_open_new = default_pos is None or is_grid_strategy
+
+if can_open_new:
+    signal = self.strategy.generate_signals(self.data, idx, ...)
+    # 处理开仓信号...
+```
 
 ## 总结
 
@@ -1962,7 +2316,19 @@ Z₄ = A₃' · W₄ + b₄  # (batch_size, 1)
 4. **交易执行**：执行交易并记录市场状态
 5. **结果分析**：在交易记录中可以看到每笔交易的市场状态，便于分析不同市场状态下的表现
 
-这种设计使得系统能够根据市场状态自适应地选择策略，提高回测的准确性和实用性。
+**多持仓管理**：
+1. **统一架构**：所有策略使用统一的多持仓管理机制
+2. **数据单一来源**：持仓状态完全由回测系统管理
+3. **策略职责分离**：策略只负责生成信号，不维护持仓状态
+4. **灵活扩展**：支持单一持仓和多持仓策略，易于添加新策略
+
+**盈亏计算**：
+1. **已实现盈亏**：平仓时计算，计入账户余额
+2. **未实现盈亏**：每个K线更新，反映持仓的浮动盈亏
+3. **多持仓支持**：每个持仓独立计算，汇总得到总盈亏
+4. **与币安一致**：计算方式与币安API基本一致
+
+这种设计使得系统能够根据市场状态自适应地选择策略，支持多种持仓模式，准确计算盈亏，提高回测的准确性和实用性。
 
 
 

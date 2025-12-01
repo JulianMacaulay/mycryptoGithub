@@ -753,11 +753,12 @@ class BacktestEngine:
         # 账户状态（使用可用资金，因为只有这部分可以交易）
         self.balance = self.available_capital
         self.equity = self.available_capital
-        self.position_size = 0.0  # 持仓数量（正数=多头，负数=空头）
-        self.position_value = 0.0  # 持仓价值
-        self.entry_price = 0.0  # 入场价格
-        self.entry_idx = -1  # 入场索引
-        self.entry_count = 0  # 加仓次数
+        
+        # 统一使用多持仓管理
+        # positions列表：每个元素是字典 {'position_id': str, 'size': float, 'entry_price': float, 
+        #                                  'entry_idx': int, 'entry_count': int, 'strategy': BaseStrategy}
+        self.positions = []  # 持仓列表
+        self.position_value = 0.0  # 持仓价值（所有持仓的总价值）
 
         # 交易记录
         self.trades = []  # 所有交易记录
@@ -769,17 +770,90 @@ class BacktestEngine:
         # 重置时使用可用资金（考虑仓位比例）
         self.balance = self.available_capital
         self.equity = self.available_capital
-        self.position_size = 0.0
+        self.positions = []  # 重置持仓列表
         self.position_value = 0.0
-        self.entry_price = 0.0
-        self.entry_idx = -1
-        self.entry_count = 0
         self.trades = []
         self.equity_curve = []
         self.signals = []
+    
+    def get_total_position_size(self) -> float:
+        """
+        获取总持仓数量（所有持仓的size之和）
+        
+        Returns:
+            总持仓数量（正数=多头，负数=空头，0=无持仓）
+        """
+        return sum(pos['size'] for pos in self.positions)
+    
+    def has_positions(self) -> bool:
+        """
+        检查是否有持仓
+        
+        Returns:
+            bool: 是否有持仓
+        """
+        return len(self.positions) > 0
+    
+    def get_position_by_id(self, position_id: str = 'default'):
+        """
+        根据position_id获取持仓
+        
+        Args:
+            position_id: 持仓ID（默认为'default'，用于单一持仓策略）
+            
+        Returns:
+            持仓字典或None
+        """
+        for pos in self.positions:
+            if pos['position_id'] == position_id:
+                return pos
+        return None
+    
+    def get_all_position_ids(self) -> list:
+        """
+        获取所有持仓ID列表
+        
+        Returns:
+            持仓ID列表
+        """
+        return [pos['position_id'] for pos in self.positions]
+    
+    # 向后兼容的属性访问器
+    @property
+    def position_size(self) -> float:
+        """
+        获取总持仓数量（向后兼容）
+        单一持仓策略可以通过此属性访问持仓
+        """
+        return self.get_total_position_size()
+    
+    @property
+    def entry_price(self) -> float:
+        """
+        获取默认持仓的入场价格（向后兼容）
+        单一持仓策略可以通过此属性访问入场价格
+        """
+        default_pos = self.get_position_by_id('default')
+        return default_pos['entry_price'] if default_pos else 0.0
+    
+    @property
+    def entry_idx(self) -> int:
+        """
+        获取默认持仓的入场索引（向后兼容）
+        """
+        default_pos = self.get_position_by_id('default')
+        return default_pos['entry_idx'] if default_pos else -1
+    
+    @property
+    def entry_count(self) -> int:
+        """
+        获取默认持仓的加仓次数（向后兼容）
+        """
+        default_pos = self.get_position_by_id('default')
+        return default_pos['entry_count'] if default_pos else 0
 
     def open_position(self, signal: str, price: float, size: float,
-                      current_idx: int, reason: str = ""):
+                      current_idx: int, reason: str = "", position_id: str = None, strategy=None):
         """
         开仓
 
@@ -789,6 +863,8 @@ class BacktestEngine:
             size: 开仓数量（绝对值）
             current_idx: 当前索引
             reason: 开仓原因
+            position_id: 持仓ID（可选，如果提供则使用多持仓模式）
+            strategy: 策略实例（可选，用于记录开仓时使用的策略）
         """
         # 计算最大可开仓位（基于可用资金和杠杆）
         max_position_value = self.balance * self.leverage  # 最大仓位价值
@@ -801,59 +877,53 @@ class BacktestEngine:
             # 无法开仓，直接返回
             return
 
-        if signal == 'long':
-            self.position_size = actual_size
-            self.entry_price = price
-            self.entry_idx = current_idx
-            self.entry_count = 1
-
-            # 计算成本（考虑杠杆）
-            # 开仓价值 = actual_size * price
-            # 保证金 = 开仓价值 / 杠杆倍数
-            # 成本 = 保证金 * (1 + 手续费率)
-            position_value = actual_size * price
-            margin = position_value / self.leverage
-            cost = margin * (1 + self.commission_rate)
-            self.balance -= cost
-
-            self.trades.append({
-                'type': 'open_long',
-                'price': price,
-                'size': actual_size,
-                'idx': current_idx,
-                'balance': self.balance,
-                'equity': self.equity,  # 记录当前权益
-                'reason': reason
-            })
-
-        elif signal == 'short':
-            self.position_size = -actual_size  # 负数表示空头
-            self.entry_price = price  # 价格始终是正数
-            self.entry_idx = current_idx
-            self.entry_count = 1
-
-            # 做空：也需要保证金（类似做多），扣除资金
-            # 在期货交易中，做空也需要保证金，只是持仓方向相反
-            # 计算成本（考虑杠杆）
-            position_value = actual_size * price
-            margin = position_value / self.leverage
-            cost = margin * (1 + self.commission_rate)
-            self.balance -= cost
-
-            self.trades.append({
-                'type': 'open_short',
-                'price': price,
-                'size': actual_size,
-                'idx': current_idx,
-                'balance': self.balance,
-                'equity': self.equity,  # 记录当前权益
-                'reason': reason
-            })
+        # 如果没有提供position_id，使用默认的'default'（用于单一持仓策略）
+        if position_id is None:
+            position_id = 'default'
+        
+        # 检查是否已存在该position_id的持仓
+        existing_pos = self.get_position_by_id(position_id)
+        if existing_pos is not None:
+            # 如果已存在，报错（避免意外覆盖）
+            raise ValueError(f"持仓ID {position_id} 已存在，无法重复开仓")
+        
+        # 确定持仓方向
+        position_size = actual_size if signal == 'long' else -actual_size
+        
+        # 创建新持仓
+        new_position = {
+            'position_id': position_id,
+            'size': position_size,
+            'entry_price': price,
+            'entry_idx': current_idx,
+            'entry_count': 1,
+            'strategy': strategy
+        }
+        self.positions.append(new_position)
+        
+        # 计算成本（考虑杠杆）
+        position_value = actual_size * price
+        margin = position_value / self.leverage
+        cost = margin * (1 + self.commission_rate)
+        self.balance -= cost
+        
+        # 记录交易
+        trade_type = 'open_long' if signal == 'long' else 'open_short'
+        self.trades.append({
+            'type': trade_type,
+            'price': price,
+            'size': actual_size,
+            'idx': current_idx,
+            'balance': self.balance,
+            'equity': self.equity,
+            'reason': reason,
+            'position_id': position_id
+        })
 
     def add_position(self, signal: str, price: float, size: float,
-                     current_idx: int, reason: str = ""):
+                     current_idx: int, reason: str = "", position_id: str = None):
         """
-        加仓
+        加仓（统一使用多持仓模式）
 
         Args:
             signal: 'add_long' 或 'add_short'
@@ -861,6 +931,7 @@ class BacktestEngine:
             size: 加仓数量（绝对值）
             current_idx: 当前索引
             reason: 加仓原因
+            position_id: 持仓ID（可选，如果不提供则使用'default'，用于单一持仓策略）
         """
         # 计算最大可加仓位（基于可用资金和杠杆）
         max_position_value = self.balance * self.leverage  # 最大仓位价值
@@ -873,56 +944,52 @@ class BacktestEngine:
             # 无法加仓（资金不足）
             return
 
-        if signal == 'add_long' and self.position_size > 0:
-            # 计算新的平均入场价格
-            total_size = self.position_size + actual_size
-            total_cost = self.position_size * self.entry_price + actual_size * price
-            self.entry_price = total_cost / total_size
-            self.position_size = total_size
-            self.entry_count += 1
+        # 如果没有提供position_id，使用默认的'default'（用于单一持仓策略）
+        if position_id is None:
+            position_id = 'default'
+        
+        # 获取持仓
+        pos = self.get_position_by_id(position_id)
+        if pos is None:
+            # 如果持仓不存在，无法加仓
+            return
+        
+        # 检查方向是否一致
+        if (signal == 'add_long' and pos['size'] <= 0) or (signal == 'add_short' and pos['size'] >= 0):
+            # 方向不一致，无法加仓
+            return
+        
+        # 计算新的平均入场价格
+        current_size = abs(pos['size'])
+        total_size = current_size + actual_size
+        total_cost = current_size * pos['entry_price'] + actual_size * price
+        new_entry_price = total_cost / total_size
+        
+        # 更新持仓
+        pos['size'] = pos['size'] + (actual_size if signal == 'add_long' else -actual_size)
+        pos['entry_price'] = new_entry_price
+        pos['entry_count'] += 1
+        
+        # 扣除成本（考虑杠杆）
+        position_value = actual_size * price
+        margin = position_value / self.leverage
+        cost = margin * (1 + self.commission_rate)
+        self.balance -= cost
+        
+        # 记录交易
+        trade_type = 'add_long' if signal == 'add_long' else 'add_short'
+        self.trades.append({
+            'type': trade_type,
+            'price': price,
+            'size': actual_size,
+            'idx': current_idx,
+            'balance': self.balance,
+            'equity': self.equity,
+            'reason': reason,
+            'position_id': position_id
+        })
 
-            # 扣除成本（考虑杠杆）
-            position_value = actual_size * price
-            margin = position_value / self.leverage
-            cost = margin * (1 + self.commission_rate)
-            self.balance -= cost
-
-            self.trades.append({
-                'type': 'add_long',
-                'price': price,
-                'size': actual_size,
-                'idx': current_idx,
-                'balance': self.balance,
-                'equity': self.equity,  # 记录当前权益
-                'reason': reason
-            })
-
-        elif signal == 'add_short' and self.position_size < 0:
-            # 计算新的平均入场价格（价格始终是正数）
-            current_size = abs(self.position_size)
-            total_size = current_size + actual_size
-            total_cost = current_size * self.entry_price + actual_size * price
-            self.entry_price = total_cost / total_size  # 价格始终是正数
-            self.position_size = -total_size  # 负数表示空头
-            self.entry_count += 1
-
-            # 做空加仓：也需要扣除保证金（考虑杠杆）
-            position_value = actual_size * price
-            margin = position_value / self.leverage
-            cost = margin * (1 + self.commission_rate)
-            self.balance -= cost
-
-            self.trades.append({
-                'type': 'add_short',
-                'price': price,
-                'size': actual_size,
-                'idx': current_idx,
-                'balance': self.balance,
-                'equity': self.equity,  # 记录当前权益
-                'reason': reason
-            })
-
-    def close_position(self, price: float, current_idx: int, reason: str = ""):
+    def close_position(self, price: float, current_idx: int, reason: str = "", position_id: str = None):
         """
         平仓
 
@@ -930,96 +997,95 @@ class BacktestEngine:
             price: 平仓价格
             current_idx: 当前索引
             reason: 平仓原因
+            position_id: 持仓ID（可选，如果提供则只平掉指定持仓；如果不提供且使用多持仓模式，则平掉所有持仓）
+            
+        Returns:
+            盈亏（如果是多持仓模式且指定了position_id，返回该持仓的盈亏；否则返回总盈亏）
         """
-        if self.position_size == 0:
+        # 如果不提供position_id，平掉所有持仓
+        if position_id is None:
+            if len(self.positions) == 0:
+                return None
+            
+            total_pnl = 0.0
+            # 逐个平仓
+            positions_to_close = list(self.positions)  # 复制列表，避免在迭代时修改
+            for pos in positions_to_close:
+                pnl = self.close_position(price, current_idx, reason, pos['position_id'])
+                if pnl is not None:
+                    total_pnl += pnl
+            return total_pnl
+        
+        # 平掉指定持仓
+        pos = self.get_position_by_id(position_id)
+        if pos is None:
+            # 持仓不存在
             return None
-
-        # 计算盈亏
-        if self.position_size > 0:  # 平多
-            # 多头：买入价 entry_price，卖出价 price
-            gross_pnl = (price - self.entry_price) * self.position_size
-            # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
-            # 开仓时扣除了：margin * (1 + commission_rate) = margin + margin * commission_rate
-            # 平仓时收回：margin + gross_pnl - close_cost
-            size = self.position_size
-            entry_margin = (self.entry_price * size) / self.leverage
-            close_cost = (size * price) * self.commission_rate
-            # 计算开仓手续费（开仓时已经扣除，但需要在pnl中体现，以便CSV中记录的是净盈亏）
-            # 开仓手续费 = (entry_price * size / leverage) * commission_rate
-            open_cost = entry_margin * self.commission_rate
-            # 净盈亏 = 毛盈亏 - 平仓手续费 - 开仓手续费（用于CSV记录）
-            pnl = gross_pnl - close_cost - open_cost
-            # 余额计算：收回保证金 + 毛盈亏 - 平仓手续费（开仓手续费已在开仓时扣除）
-            self.balance += entry_margin + gross_pnl - close_cost
+        
+        # 计算该持仓的盈亏
+        size = abs(pos['size'])
+        entry_price = pos['entry_price']
+        
+        if pos['size'] > 0:  # 平多
+            gross_pnl = (price - entry_price) * size
         else:  # 平空
-            # 空头：开仓价 entry_price（正数），平仓价 price
-            # 做空时已经扣除了保证金
-            # 平仓时：如果价格下跌，盈利；如果价格上涨，亏损
-            # 盈亏 = (entry_price - price) * size
-            size = abs(self.position_size)  # 获取数量（正数）
-            entry_price = self.entry_price  # entry_price已经是正数，不需要abs
             gross_pnl = (entry_price - price) * size
-
-            # 平仓时：收回保证金 + 盈亏，扣除平仓手续费
-            # 开仓时扣除了：margin * (1 + commission_rate) = margin + margin * commission_rate
-            # 平仓时收回：margin + gross_pnl - close_cost
-            entry_margin = (entry_price * size) / self.leverage
-            close_cost = (size * price) * self.commission_rate
-            # 计算开仓手续费（开仓时已经扣除，但需要在pnl中体现，以便CSV中记录的是净盈亏）
-            # 开仓手续费 = (entry_price * size / leverage) * commission_rate
-            open_cost = entry_margin * self.commission_rate
-            # 净盈亏 = 毛盈亏 - 平仓手续费 - 开仓手续费（用于CSV记录）
-            pnl = gross_pnl - close_cost - open_cost
-            # 余额计算：收回保证金 + 毛盈亏 - 平仓手续费（开仓手续费已在开仓时扣除）
-            self.balance += entry_margin + gross_pnl - close_cost
-
-        # 记录交易（保存平仓前的entry_price，确保是正数）
-        trade_type = 'close_long' if self.position_size > 0 else 'close_short'
-        # 保存entry_price（确保是正数）
-        saved_entry_price = abs(self.entry_price) if self.entry_price < 0 else self.entry_price
+        
+        # 计算手续费
+        entry_margin = (entry_price * size) / self.leverage
+        close_cost = (size * price) * self.commission_rate
+        open_cost = entry_margin * self.commission_rate
+        pnl = gross_pnl - close_cost - open_cost
+        
+        # 更新余额
+        self.balance += entry_margin + gross_pnl - close_cost
+        
+        # 记录交易
+        trade_type = 'close_long' if pos['size'] > 0 else 'close_short'
         self.trades.append({
             'type': trade_type,
             'price': price,
-            'size': abs(self.position_size),
+            'size': size,
             'idx': current_idx,
-            'entry_price': saved_entry_price,  # 确保是正数
-            'pnl': pnl,  # 记录净盈亏（已扣除平仓手续费和开仓手续费）
+            'entry_price': entry_price,
+            'pnl': pnl,
             'balance': self.balance,
-            'equity': self.balance,  # 平仓后无持仓，权益=余额
+            'equity': self.balance,
             'reason': reason,
-            'entry_count': self.entry_count
+            'entry_count': pos['entry_count'],
+            'position_id': position_id
         })
-
-        # 重置持仓
-        self.position_size = 0.0
-        self.position_value = 0.0
-        self.entry_price = 0.0
-        self.entry_idx = -1
-        self.entry_count = 0
-
+        
+        # 从持仓列表中移除
+        self.positions = [p for p in self.positions if p['position_id'] != position_id]
+        
         return pnl
 
     def update_equity(self, current_price: float):
         """
-        更新权益（未实现盈亏）
+        更新权益（未实现盈亏，统一使用多持仓模式）
 
         Args:
             current_price: 当前价格
         """
-        if self.position_size == 0:
-            self.equity = self.balance
-        elif self.position_size > 0:  # 多头
-            unrealized_pnl = (current_price - self.entry_price) * self.position_size
-            self.equity = self.balance + unrealized_pnl
-            self.position_value = self.position_size * current_price
-        else:  # 空头
-            # 做空：entry_price是正数（开仓价），position_size是负数
-            # 未实现盈亏 = (开仓价 - 当前价) * 数量
-            size = abs(self.position_size)  # 获取数量（正数）
-            entry_price = self.entry_price  # entry_price已经是正数，不需要abs
-            unrealized_pnl = (entry_price - current_price) * size
-            self.equity = self.balance + unrealized_pnl
-            self.position_value = size * current_price
+        # 计算所有持仓的未实现盈亏
+        total_unrealized_pnl = 0.0
+        total_position_value = 0.0
+        
+        for pos in self.positions:
+            size = abs(pos['size'])
+            entry_price = pos['entry_price']
+            
+            if pos['size'] > 0:  # 多头
+                unrealized_pnl = (current_price - entry_price) * size
+            else:  # 空头
+                unrealized_pnl = (entry_price - current_price) * size
+            
+            total_unrealized_pnl += unrealized_pnl
+            total_position_value += size * current_price
+        
+        self.equity = self.balance + total_unrealized_pnl
+        self.position_value = total_position_value
 
         # 记录权益曲线：交易账户权益 + 未投入资金（与最终权益计算保持一致）
         total_equity = self.equity + (self.initial_capital - self.available_capital)
@@ -1206,10 +1272,14 @@ class BacktestSystem:
             # 多策略模式：初始化所有策略
             for regime_type, strategy in self.strategies.items():
                 strategy.initialize(self.data)
+                # 设置回测引擎引用（用于策略查询持仓信息）
+                strategy.engine = self.engine
             self.strategy = None  # 当前策略将在循环中动态选择
         else:
             # 单策略模式
             self.strategy.initialize(self.data)
+            # 设置回测引擎引用（用于策略查询持仓信息）
+            self.strategy.engine = self.engine
 
             print(f"\n开始回测...")
             print(f"初始资金: {self.engine.initial_capital}")
@@ -1248,115 +1318,169 @@ class BacktestSystem:
             self.engine.update_equity(current_price)
 
             # 如果有持仓，使用开仓时的策略（即使当前市场状态变化）
-            if self.engine.position_size != 0:
-                # 使用开仓时记录的策略
-                current_strategy = self.entry_strategy if self.entry_strategy is not None else self.strategy
+            if self.engine.has_positions():
+                # 检查是否是网格策略（网格策略需要特殊处理，因为它需要遍历所有网格）
+                is_grid_strategy = False
+                if self.strategy and hasattr(self.strategy, '__class__'):
+                    is_grid_strategy = self.strategy.__class__.__name__ == 'GridStrategy'
                 
-                if current_strategy is None:
-                    # 如果开仓策略也不存在，强制平仓
-                    pnl = self.engine.close_position(current_price, idx, "策略不可用，强制平仓")
-                    if pnl is not None and self.entry_strategy:
-                        self.entry_strategy.update_trade_result(pnl)
-                    continue
-                
-                # 检查止损（移动止盈）
-                stop_signal = current_strategy.check_stop_loss(
-                    self.data, idx,
-                    self.engine.position_size,
-                    self.engine.entry_price
-                )
-                if stop_signal:
-                    pnl = self.engine.close_position(
-                        stop_signal['price'],
-                        idx,
-                        stop_signal['reason']
-                    )
-                    if pnl is not None:
-                        current_strategy.update_trade_result(pnl)
-                    self.entry_strategy = None  # 清除开仓策略记录
-                    continue
-
-                # 检查均线交叉退出和反向开仓
-                signal = current_strategy.generate_signals(self.data, idx, self.engine.position_size)
-                if signal['signal'] in ['close_long', 'close_short']:
-                    pnl = self.engine.close_position(current_price, idx, signal['reason'])
-                    if pnl is not None:
-                        current_strategy.update_trade_result(pnl)
-                    self.entry_strategy = None  # 清除开仓策略记录
-                    
-                    # 检查是否需要反向开仓
-                    if 'reverse_signal' in signal and signal['reverse_signal']:
-                        reverse_signal = {
-                            'signal': signal['reverse_signal'],
-                            'price': signal.get('reverse_price', current_price),
-                            'reason': signal['reason']
-                        }
-                        # 立即执行反向开仓
-                        if reverse_signal['signal'] == 'long':
-                            position_size = current_strategy.get_position_size(
-                                self.engine.balance,
-                                reverse_signal['price'],
-                                self.engine.leverage
-                            )
-                            self.engine.open_position(
-                                'long',
-                                reverse_signal['price'],
-                                position_size,
-                                idx,
-                                reverse_signal['reason']
-                            )
-                            self.entry_strategy = current_strategy
-                        elif reverse_signal['signal'] == 'short':
-                            position_size = current_strategy.get_position_size(
-                                self.engine.balance,
-                                reverse_signal['price'],
-                                self.engine.leverage
-                            )
-                            self.engine.open_position(
-                                'short',
-                                reverse_signal['price'],
-                                position_size,
-                                idx,
-                                reverse_signal['reason']
-                            )
-                            self.entry_strategy = current_strategy
-                    continue
-
-                # 检查加仓
-                if self.engine.entry_count < max_entries:
-                    add_signal = current_strategy.check_add_position(
-                        self.data, idx,
-                        self.engine.position_size,
-                        self.engine.entry_price
-                    )
-                    if add_signal:
-                        # 计算加仓数量
-                        add_size = current_strategy.get_position_size(
+                # 对于网格策略，只调用一次generate_signals，让它遍历所有网格
+                if is_grid_strategy and self.strategy:
+                    signal = self.strategy.generate_signals(self.data, idx, 0)
+                    if signal['signal'] in ['close_long', 'close_short']:
+                        # 检查信号中是否包含position_id（网格策略会提供）
+                        close_position_id = signal.get('position_id', None)
+                        if close_position_id:
+                            pnl = self.engine.close_position(current_price, idx, signal['reason'], close_position_id)
+                            if pnl is not None:
+                                self.strategy.update_trade_result(pnl)
+                        continue
+                    elif signal['signal'] in ['long', 'short']:
+                        # 网格策略的开仓信号
+                        position_size = self.strategy.get_position_size(
                             self.engine.balance,
-                            add_signal['price'],
+                            signal['price'],
                             self.engine.leverage
                         )
-                        # 限制加仓数量不超过最大可开仓位
-                        max_add_value = self.engine.balance * self.engine.leverage
-                        max_add_size = max_add_value / add_signal['price'] if add_signal['price'] > 0 else 0
-                        actual_add_size = min(add_size, max_add_size) if max_add_size > 0 else 0
-                        if actual_add_size > 0:
-                            self.engine.add_position(
-                                add_signal['signal'],
+                        position_id = signal.get('position_id', None)
+                        self.engine.open_position(
+                            signal['signal'],
+                            signal['price'],
+                            position_size,
+                            idx,
+                            signal['reason'],
+                            position_id,
+                            self.strategy
+                        )
+                        continue
+                
+                # 对于非网格策略，遍历所有持仓
+                positions_to_check = list(self.engine.positions)  # 复制列表，避免在迭代时修改
+                for pos in positions_to_check:
+                    position_id = pos['position_id']
+                    # 获取该持仓的策略
+                    pos_strategy = pos.get('strategy') or self.entry_strategy or self.strategy
+                    if pos_strategy is None:
+                        # 如果策略不存在，强制平仓
+                        pnl = self.engine.close_position(current_price, idx, "策略不可用，强制平仓", position_id)
+                        if pnl is not None:
+                            # 尝试更新策略结果（如果entry_strategy存在）
+                            if self.entry_strategy:
+                                self.entry_strategy.update_trade_result(pnl)
+                        continue
+                    
+                    # 检查止损（移动止盈）
+                    stop_signal = pos_strategy.check_stop_loss(
+                        self.data, idx,
+                        pos['size'],
+                        pos['entry_price']
+                    )
+                    if stop_signal:
+                        pnl = self.engine.close_position(
+                            stop_signal['price'],
+                            idx,
+                            stop_signal['reason'],
+                            position_id
+                        )
+                        if pnl is not None:
+                            pos_strategy.update_trade_result(pnl)
+                        continue  # 该持仓已平仓，继续检查下一个持仓
+                    
+                    # 检查信号（传入该持仓的信息）
+                    signal = pos_strategy.generate_signals(self.data, idx, pos['size'])
+                    if signal['signal'] in ['close_long', 'close_short']:
+                        # 检查信号中是否包含position_id（网格策略会提供）
+                        close_position_id = signal.get('position_id', position_id)
+                        pnl = self.engine.close_position(current_price, idx, signal['reason'], close_position_id)
+                        if pnl is not None:
+                            pos_strategy.update_trade_result(pnl)
+                        
+                        # 检查是否需要反向开仓
+                        if 'reverse_signal' in signal and signal['reverse_signal']:
+                            reverse_signal = {
+                                'signal': signal['reverse_signal'],
+                                'price': signal.get('reverse_price', current_price),
+                                'reason': signal['reason']
+                            }
+                            # 立即执行反向开仓
+                            if reverse_signal['signal'] == 'long':
+                                position_size = pos_strategy.get_position_size(
+                                    self.engine.balance,
+                                    reverse_signal['price'],
+                                    self.engine.leverage
+                                )
+                                # 网格策略会提供position_id
+                                new_position_id = signal.get('position_id', None)
+                                self.engine.open_position(
+                                    'long',
+                                    reverse_signal['price'],
+                                    position_size,
+                                    idx,
+                                    reverse_signal['reason'],
+                                    new_position_id,
+                                    pos_strategy
+                                )
+                            elif reverse_signal['signal'] == 'short':
+                                position_size = pos_strategy.get_position_size(
+                                    self.engine.balance,
+                                    reverse_signal['price'],
+                                    self.engine.leverage
+                                )
+                                new_position_id = signal.get('position_id', None)
+                                self.engine.open_position(
+                                    'short',
+                                    reverse_signal['price'],
+                                    position_size,
+                                    idx,
+                                    reverse_signal['reason'],
+                                    new_position_id,
+                                    pos_strategy
+                                )
+                        continue
+                    
+                    # 检查加仓（针对该持仓）
+                    if pos['entry_count'] < max_entries:
+                        add_signal = pos_strategy.check_add_position(
+                            self.data, idx,
+                            pos['size'],
+                            pos['entry_price']
+                        )
+                        if add_signal:
+                            # 计算加仓数量
+                            add_size = pos_strategy.get_position_size(
+                                self.engine.balance,
                                 add_signal['price'],
-                                actual_add_size,
-                                idx,
-                                add_signal['reason']
+                                self.engine.leverage
                             )
-                    continue
+                            # 限制加仓数量不超过最大可开仓位
+                            max_add_value = self.engine.balance * self.engine.leverage
+                            max_add_size = max_add_value / add_signal['price'] if add_signal['price'] > 0 else 0
+                            actual_add_size = min(add_size, max_add_size) if max_add_size > 0 else 0
+                            if actual_add_size > 0:
+                                self.engine.add_position(
+                                    add_signal['signal'],
+                                    add_signal['price'],
+                                    actual_add_size,
+                                    idx,
+                                    add_signal['reason'],
+                                    position_id
+                                )
+                continue
             
             # 如果没有可用策略，跳过开仓逻辑
             if self.strategy is None:
                 continue
 
             # 检查入场信号
-            if self.engine.position_size == 0:
-                signal = self.strategy.generate_signals(self.data, idx, 0)
+            # 对于单一持仓策略（使用'default'），只在无持仓时开仓；对于多持仓策略（如网格策略），允许同时持有多个持仓
+            default_pos = self.engine.get_position_by_id('default')
+            is_grid_strategy = self.strategy and hasattr(self.strategy, '__class__') and self.strategy.__class__.__name__ == 'GridStrategy'
+            
+            # 网格策略可以随时开新仓（只要网格价位触发），单一持仓策略只在无'default'持仓时开仓
+            can_open_new = default_pos is None or is_grid_strategy
+            
+            if can_open_new:
+                signal = self.strategy.generate_signals(self.data, idx, self.engine.get_total_position_size())
 
                 if signal['signal'] == 'long':
                     # 计算仓位大小
@@ -1365,15 +1489,20 @@ class BacktestSystem:
                         signal['price'],
                         self.engine.leverage
                     )
+                    # 检查信号中是否包含position_id（网格策略会提供）
+                    position_id = signal.get('position_id', None)
                     self.engine.open_position(
                         'long',
                         signal['price'],
                         position_size,
                         idx,
-                        signal['reason']
+                        signal['reason'],
+                        position_id,
+                        self.strategy
                     )
-                    # 记录开仓时使用的策略
-                    self.entry_strategy = self.strategy
+                    # 记录开仓时使用的策略（用于单一持仓策略，即使用'default'的）
+                    if position_id == 'default' or position_id is None:
+                        self.entry_strategy = self.strategy
 
                 elif signal['signal'] == 'short':
                     # 计算仓位大小
@@ -1382,29 +1511,36 @@ class BacktestSystem:
                         signal['price'],
                         self.engine.leverage
                     )
+                    # 检查信号中是否包含position_id（网格策略会提供）
+                    position_id = signal.get('position_id', None)
                     self.engine.open_position(
                         'short',
                         signal['price'],
                         position_size,
                         idx,
-                        signal['reason']
+                        signal['reason'],
+                        position_id,
+                        self.strategy
                     )
-                    # 记录开仓时使用的策略
-                    self.entry_strategy = self.strategy
+                    # 记录开仓时使用的策略（用于单一持仓策略，即使用'default'的）
+                    if position_id == 'default' or position_id is None:
+                        self.entry_strategy = self.strategy
 
         # 最后平仓（如果有持仓）
-        if self.engine.position_size != 0:
+        if self.engine.has_positions():
             last_price = self.data.iloc[-1]['close']
-            # 使用开仓时的策略
-            final_strategy = self.entry_strategy if self.entry_strategy is not None else self.strategy
-            pnl = self.engine.close_position(last_price, len(self.data) - 1, "回测结束平仓")
-            if pnl is not None and final_strategy:
-                final_strategy.update_trade_result(pnl)
+            # 逐个平仓
+            positions_to_close = list(self.engine.positions)
+            for pos in positions_to_close:
+                pos_strategy = pos.get('strategy') or self.entry_strategy or self.strategy
+                pnl = self.engine.close_position(last_price, len(self.data) - 1, "回测结束平仓", pos['position_id'])
+                if pnl is not None and pos_strategy:
+                    pos_strategy.update_trade_result(pnl)
             self.entry_strategy = None
 
         # 计算最终权益
         # 交易账户权益（只包含投入交易的部分）
-        trading_equity = self.engine.equity if self.engine.position_size != 0 else self.engine.balance
+        trading_equity = self.engine.equity if self.engine.has_positions() else self.engine.balance
         # 最终总资产 = 交易账户权益 + 未投入资金
         final_equity = trading_equity + (self.engine.initial_capital - self.engine.available_capital)
         # 收益率计算：用总资产变化除以初始资金

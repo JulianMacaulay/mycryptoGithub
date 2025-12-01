@@ -20,6 +20,7 @@ class BaseStrategy(ABC):
         """
         self.params = params
         self.name = self.__class__.__name__
+        self.engine = None  # 回测引擎引用（由回测系统设置，用于策略查询持仓信息）
         
     @abstractmethod
     def initialize(self, data: pd.DataFrame):
