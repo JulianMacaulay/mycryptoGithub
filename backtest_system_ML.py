@@ -191,7 +191,8 @@ class MarketRegimeMLDetector:
     """
     
     def __init__(self, model_type: str = 'xgboost', train_ratio: float = 0.5,
-                 label_method: str = 'forward_looking'):
+                 label_method: str = 'forward_looking', 
+                 smooth_window: int = 5, confidence_threshold: float = 0.6):
         """
         初始化市场状态检测器
         
@@ -202,10 +203,14 @@ class MarketRegimeMLDetector:
                 - 'forward_looking': 前瞻性标签（使用未来信息）
                 - 'unsupervised': 无监督学习（K-means聚类）
                 - 'adx_slope': ADX+均线斜率（传统方法，有滞后性）
+            smooth_window: 平滑窗口大小（默认5，用于减少频繁切换）
+            confidence_threshold: 置信度阈值（默认0.6，只有置信度>0.6才切换策略）
         """
         self.model_type = model_type
         self.train_ratio = train_ratio
         self.label_method = label_method
+        self.smooth_window = smooth_window
+        self.confidence_threshold = confidence_threshold
         self.model = None
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.is_trained = False
@@ -214,6 +219,12 @@ class MarketRegimeMLDetector:
         # 无监督学习相关
         self.cluster_model = None  # 聚类模型（用于无监督学习）
         self.cluster_labels_map = None  # 聚类标签到市场状态的映射
+        
+        # 模型评估指标
+        self.test_accuracy = 0.0
+        self.test_precision = 0.0
+        self.test_recall = 0.0
+        self.test_f1 = 0.0
         
     def _generate_labels(self, data: pd.DataFrame, is_training: bool = True) -> pd.Series:
         """
@@ -248,6 +259,9 @@ class MarketRegimeMLDetector:
         - 如果未来有明显趋势 → 当前是趋势市场 (1)
         - 如果未来是震荡 → 当前是震荡市场 (0)
         
+        注意：前瞻性标签在回测时无法使用，但可以用于训练模型。
+        训练好的模型可以预测未来市场状态（虽然不如前瞻性标签准确）。
+        
         Args:
             data: 包含OHLCV数据的DataFrame
             is_training: 是否用于训练
@@ -256,9 +270,9 @@ class MarketRegimeMLDetector:
             标签序列（1=趋势，0=震荡）
         """
         if not is_training:
-            # 回测时无法使用前瞻性标签，返回全0（震荡）
-            print("警告: 回测时无法使用前瞻性标签，返回默认标签")
-            return pd.Series([0] * len(data), index=data.index)
+            # 回测时无法使用前瞻性标签，使用ADX+斜率方法作为替代
+            print("注意: 回测时无法使用前瞻性标签，改用ADX+斜率方法生成标签（仅用于参考）")
+            return self._generate_adx_slope_labels(data)
         
         close = data['close']
         lookahead = 5  # 前瞻期数（可以调整）
@@ -629,6 +643,11 @@ class MarketRegimeMLDetector:
             y_pred = (y_pred_proba > 0.5).astype(int).flatten()
         else:
             y_pred = self.model.predict(X_test_scaled)
+            # 获取预测概率（用于置信度评估）
+            try:
+                y_pred_proba = self.model.predict_proba(X_test_scaled)[:, 1]  # 趋势类的概率
+            except:
+                y_pred_proba = None
         
         # 确保y_test和y_pred都是整数类型
         if isinstance(y_test, pd.Series):
@@ -636,12 +655,36 @@ class MarketRegimeMLDetector:
         y_test = y_test.astype(int)
         y_pred = y_pred.astype(int)
         
+        # 计算评估指标
+        from sklearn.metrics import precision_score, recall_score, f1_score
+        
         accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        
+        # 保存评估指标
+        self.test_accuracy = accuracy
+        self.test_precision = precision
+        self.test_recall = recall
+        self.test_f1 = f1
         
         print(f"\n模型训练完成！")
         print(f"测试集准确率: {accuracy:.2%}")
+        print(f"精确率 (Precision): {precision:.2%}")
+        print(f"召回率 (Recall): {recall:.2%}")
+        print(f"F1分数: {f1:.2%}")
+        
+        # 如果准确率太低，给出警告
+        if accuracy < 0.55:
+            print(f"\n  警告: 模型准确率较低 ({accuracy:.2%})，可能不如不使用机器学习")
+        elif accuracy < 0.65:
+            print(f"\n  注意: 模型准确率一般 ({accuracy:.2%})，建议检查特征和标签质量")
+        else:
+            print(f"\n 模型准确率良好 ({accuracy:.2%})")
+        
         print("\n分类报告:")
-        # print(classification_report(y_test, y_pred, target_names=['震荡', '趋势']))
+        print(classification_report(y_test, y_pred, target_names=['震荡', '趋势'], zero_division=0))
         
         self.is_trained = True
     
@@ -680,15 +723,16 @@ class MarketRegimeMLDetector:
             X_seq.append(X[i-sequence_length:i])
         return np.array(X_seq)
     
-    def predict(self, data: pd.DataFrame) -> pd.Series:
+    def predict(self, data: pd.DataFrame, return_confidence: bool = False) -> pd.Series:
         """
-        预测市场状态
+        预测市场状态（带平滑和置信度）
         
         Args:
             data: 包含OHLCV数据的DataFrame
+            return_confidence: 是否返回置信度（默认False）
             
         Returns:
-            预测结果序列（'trending' 或 'ranging'）
+            预测结果序列（'trending' 或 'ranging'），如果return_confidence=True，返回(预测, 置信度)
         """
         if not self.is_trained:
             raise ValueError("模型尚未训练，请先调用train()方法")
@@ -701,7 +745,11 @@ class MarketRegimeMLDetector:
         X_valid = X[valid_mask]
         
         if len(X_valid) == 0:
-            return pd.Series(['ranging'] * len(data), index=data.index)
+            results = pd.Series(['ranging'] * len(data), index=data.index)
+            if return_confidence:
+                confidences = pd.Series([0.0] * len(data), index=data.index)
+                return results, confidences
+            return results
         
         # 标准化
         if self.scaler:
@@ -712,17 +760,82 @@ class MarketRegimeMLDetector:
         # 预测
         if self.model_type in ['lstm', 'cnn']:
             X_seq = self._prepare_lstm_input(X_scaled)
-            predictions = (self.model.predict(X_seq) > 0.5).astype(int).flatten()
+            predictions_proba = self.model.predict(X_seq).flatten()
+            predictions = (predictions_proba > 0.5).astype(int)
             # 填充前面的序列长度
             predictions = np.concatenate([[0] * 10, predictions])
+            predictions_proba = np.concatenate([[0.0] * 10, predictions_proba])
+            # 置信度计算：距离0.5越远，置信度越高
+            # 如果概率是0.5，置信度是0；如果概率是0或1，置信度是1
+            confidences = np.abs(predictions_proba - 0.5) * 2  # 转换为0-1的置信度
         else:
-            predictions = self.model.predict(X_scaled)
+            try:
+                # 获取预测概率
+                predictions_proba = self.model.predict_proba(X_valid)[:, 1]  # 趋势类的概率
+                predictions = self.model.predict(X_valid)
+                # 置信度计算：距离0.5越远，置信度越高
+                # 如果概率是0.5，置信度是0；如果概率是0或1，置信度是1
+                confidences = np.abs(predictions_proba - 0.5) * 2  # 转换为0-1的置信度
+            except:
+                # 如果模型不支持predict_proba，使用预测结果
+                predictions = self.model.predict(X_valid)
+                # 如果没有概率，假设预测是确定的（置信度为1）
+                confidences = np.ones(len(predictions))  # 默认置信度为1
         
         # 转换为字符串
         results = pd.Series(['ranging'] * len(data), index=data.index)
-        results.loc[valid_mask] = ['trending' if p == 1 else 'ranging' for p in predictions[:len(X_valid)]]
+        confidence_series = pd.Series([0.0] * len(data), index=data.index)
         
+        results.loc[valid_mask] = ['trending' if p == 1 else 'ranging' for p in predictions[:len(X_valid)]]
+        confidence_series.loc[valid_mask] = confidences[:len(X_valid)]
+        
+        # 应用平滑（减少频繁切换）
+        if self.smooth_window > 1:
+            results = self._smooth_predictions(results, confidence_series)
+        
+        if return_confidence:
+            return results, confidence_series
         return results
+    
+    def _smooth_predictions(self, predictions: pd.Series, confidences: pd.Series) -> pd.Series:
+        """
+        平滑预测结果，减少频繁切换
+        
+        Args:
+            predictions: 原始预测序列
+            confidences: 置信度序列
+            
+        Returns:
+            平滑后的预测序列
+        """
+        smoothed = predictions.copy()
+        window = self.smooth_window
+        
+        for i in range(window, len(predictions)):
+            # 获取窗口内的预测
+            window_predictions = predictions.iloc[i-window:i]
+            window_confidences = confidences.iloc[i-window:i]
+            
+            # 计算加权投票（高置信度的预测权重更大）
+            trending_votes = 0
+            ranging_votes = 0
+            
+            for j, pred in enumerate(window_predictions):
+                conf = window_confidences.iloc[j]
+                if conf >= self.confidence_threshold:  # 只考虑高置信度的预测
+                    if pred == 'trending':
+                        trending_votes += conf
+                    else:
+                        ranging_votes += conf
+            
+            # 如果投票结果明确，使用投票结果；否则保持当前预测
+            if trending_votes > ranging_votes * 1.2:  # 需要明显优势才切换
+                smoothed.iloc[i] = 'trending'
+            elif ranging_votes > trending_votes * 1.2:
+                smoothed.iloc[i] = 'ranging'
+            # 否则保持原预测（不切换）
+        
+        return smoothed
 
 
 class BacktestEngine:
@@ -731,8 +844,8 @@ class BacktestEngine:
     负责执行策略回测，记录交易，计算收益
     """
 
-    def __init__(self, initial_capital: float = 10000, commission_rate: float = 0.001,
-                 leverage: float = 5.0, position_ratio: float = 0.5):
+    def __init__(self, initial_capital: float = 10000, commission_rate: float = 0.000275,
+                 leverage: float = 1.0, position_ratio: float = 0.5):
         """
         初始化回测引擎
 
@@ -1098,7 +1211,7 @@ class BacktestSystem:
     """
 
     def __init__(self, strategy: BaseStrategy = None, strategies: Dict[str, BaseStrategy] = None,
-                 initial_capital: float = 10000, leverage: float = 5.0, position_ratio: float = 0.5,
+                 initial_capital: float = 10000, leverage: float = 1.0, position_ratio: float = 0.5,
                  market_detector: MarketRegimeMLDetector = None):
         """
         初始化回测系统
@@ -1131,7 +1244,10 @@ class BacktestSystem:
         )
         self.data = None
         self.market_regimes = None  # 存储市场状态预测结果
+        self.market_confidences = None  # 存储市场状态预测置信度
         self.entry_strategy = None  # 记录开仓时使用的策略（用于持仓管理）
+        self.regime_switch_count = 0  # 市场状态切换次数统计
+        self.strategy_usage_count = {'trending': 0, 'ranging': 0, 'none': 0}  # 策略使用统计
 
     def load_data_from_csv(self, filepath: str, symbol: str = None):
         """
@@ -1261,16 +1377,32 @@ class BacktestSystem:
         # 如果使用市场状态检测，先预测市场状态
         if self.use_market_regime and self.market_detector.is_trained:
             print("\n预测市场状态...")
-            self.market_regimes = self.market_detector.predict(self.data)
+            self.market_regimes, self.market_confidences = self.market_detector.predict(self.data, return_confidence=True)
             print(f"趋势市场占比: {(self.market_regimes == 'trending').sum() / len(self.market_regimes):.2%}")
             print(f"震荡市场占比: {(self.market_regimes == 'ranging').sum() / len(self.market_regimes):.2%}")
+            print(f"平均置信度: {self.market_confidences.mean():.4f} ({self.market_confidences.mean()*100:.2f}%)")
+            print(f"高置信度预测占比: {(self.market_confidences >= self.market_detector.confidence_threshold).sum() / len(self.market_confidences):.2%}")
+            
+            # 如果置信度普遍很低，给出警告并建议调整阈值
+            if self.market_confidences.mean() < 0.3:
+                print(f"\n⚠️  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
+                print(f"  建议: 降低置信度阈值（当前: {self.market_detector.confidence_threshold:.2f}）或检查模型质量")
+                print(f"  系统将忽略置信度阈值，直接使用预测结果")
+            
+            # 统计市场状态切换次数
+            regime_changes = (self.market_regimes != self.market_regimes.shift(1)).sum() - 1  # 减去第一个
+            print(f"市场状态切换次数: {regime_changes}")
+            print(f"平均每 {len(self.market_regimes) / max(regime_changes, 1):.1f} 根K线切换一次")
         else:
             self.market_regimes = None
+            self.market_confidences = None
 
         # 初始化策略
         if self.strategies is not None:
             # 多策略模式：初始化所有策略
+            print("\n初始化策略...")
             for regime_type, strategy in self.strategies.items():
+                print(f"  初始化{regime_type}策略: {strategy.name}")
                 strategy.initialize(self.data)
                 # 设置回测引擎引用（用于策略查询持仓信息）
                 strategy.engine = self.engine
@@ -1289,6 +1421,9 @@ class BacktestSystem:
             print(f"使用市场状态检测: 是")
             if self.strategies:
                 print(f"可用策略: {list(self.strategies.keys())}")
+        
+        # 统计实际使用的策略
+        self.strategy_usage_count = {'trending': 0, 'ranging': 0, 'none': 0}
 
         # 遍历每个K线
         for idx in range(len(self.data)):
@@ -1298,15 +1433,45 @@ class BacktestSystem:
             # 根据市场状态选择策略（如果使用市场状态检测）
             if self.use_market_regime and self.market_regimes is not None and self.strategies is not None:
                 current_regime = self.market_regimes.iloc[idx]
+                current_confidence = self.market_confidences.iloc[idx] if self.market_confidences is not None else 1.0
+                
+                # 记录市场状态切换
+                if idx > 0:
+                    prev_regime = self.market_regimes.iloc[idx-1]
+                    if prev_regime != current_regime:
+                        self.regime_switch_count += 1
                 
                 # 根据市场状态选择策略
-                if current_regime == 'trending' and 'trending' in self.strategies:
-                    self.strategy = self.strategies['trending']
-                elif current_regime == 'ranging' and 'ranging' in self.strategies:
-                    self.strategy = self.strategies['ranging']
+                # 如果平均置信度很低（<0.3），忽略置信度阈值，直接使用预测结果
+                # 否则，如果置信度足够高，使用预测结果；如果置信度低，仍然使用预测结果（因为这是模型的最佳判断）
+                avg_confidence = self.market_confidences.mean() if self.market_confidences is not None else 1.0
+                use_confidence_threshold = avg_confidence >= 0.3  # 只有平均置信度>=0.3时才使用置信度阈值
+                
+                if not use_confidence_threshold or current_confidence >= self.market_detector.confidence_threshold:
+                    # 高置信度或平均置信度很低：直接使用预测结果
+                    if current_regime == 'trending' and 'trending' in self.strategies:
+                        self.strategy = self.strategies['trending']
+                        self.strategy_usage_count['trending'] += 1
+                    elif current_regime == 'ranging' and 'ranging' in self.strategies:
+                        self.strategy = self.strategies['ranging']
+                        self.strategy_usage_count['ranging'] += 1
+                    else:
+                        # 如果当前市场状态没有对应策略，不交易
+                        self.strategy = None
+                        self.strategy_usage_count['none'] += 1
                 else:
-                    # 如果当前市场状态没有对应策略，不交易
-                    self.strategy = None
+                    # 低置信度：仍然使用预测结果（因为这是模型的最佳判断）
+                    # 根据预测的市场状态选择策略，而不是默认震荡
+                    if current_regime == 'trending' and 'trending' in self.strategies:
+                        self.strategy = self.strategies['trending']
+                        self.strategy_usage_count['trending'] += 1
+                    elif current_regime == 'ranging' and 'ranging' in self.strategies:
+                        self.strategy = self.strategies['ranging']
+                        self.strategy_usage_count['ranging'] += 1
+                    else:
+                        # 如果当前市场状态没有对应策略，不交易
+                        self.strategy = None
+                        self.strategy_usage_count['none'] += 1
             elif self.use_market_regime and self.market_regimes is not None and self.strategy is not None:
                 # 单策略模式：检查市场状态是否匹配
                 current_regime = self.market_regimes.iloc[idx]
@@ -1554,6 +1719,30 @@ class BacktestSystem:
         print(f"最终权益: {final_equity:,.2f}")
         print(f"总收益率: {total_return:.2f}%")
         print(f"总交易次数: {len([t for t in self.engine.trades if 'close' in t['type']])}")
+        
+        # 如果使用市场状态检测，输出统计信息
+        if self.use_market_regime and self.market_detector:
+            print(f"\n市场状态检测统计:")
+            print(f"  模型准确率: {self.market_detector.test_accuracy:.2%}")
+            print(f"  市场状态切换次数: {self.regime_switch_count}")
+            if self.market_confidences is not None:
+                print(f"  平均置信度: {self.market_confidences.mean():.2%}")
+                print(f"  高置信度预测占比: {(self.market_confidences >= self.market_detector.confidence_threshold).sum() / len(self.market_confidences):.2%}")
+            
+            # 输出实际使用的策略统计
+            if hasattr(self, 'strategy_usage_count'):
+                total_usage = sum(self.strategy_usage_count.values())
+                if total_usage > 0:
+                    print(f"\n实际使用的策略统计:")
+                    if 'trending' in self.strategy_usage_count:
+                        trending_pct = self.strategy_usage_count['trending'] / total_usage * 100
+                        print(f"  趋势策略使用: {self.strategy_usage_count['trending']} 次 ({trending_pct:.1f}%)")
+                    if 'ranging' in self.strategy_usage_count:
+                        ranging_pct = self.strategy_usage_count['ranging'] / total_usage * 100
+                        print(f"  震荡策略使用: {self.strategy_usage_count['ranging']} 次 ({ranging_pct:.1f}%)")
+                    if 'none' in self.strategy_usage_count and self.strategy_usage_count['none'] > 0:
+                        none_pct = self.strategy_usage_count['none'] / total_usage * 100
+                        print(f"  无策略（不交易）: {self.strategy_usage_count['none']} 次 ({none_pct:.1f}%)")
 
     def generate_report(self) -> Dict:
         """
@@ -2062,7 +2251,7 @@ def select_strategies() -> Dict[str, BaseStrategy]:
                 params = get_strategy_params(class_name)
                 
                 strategies['ranging'] = load_strategy_from_module(module_name, class_name, params)
-                print(f"✓ 已选择震荡策略: {strategy_name}")
+                print(f" 已选择震荡策略: {strategy_name}")
             else:
                 print("无效选择")
         except Exception as e:
@@ -2146,16 +2335,16 @@ def select_label_method() -> str:
             return 'forward_looking'
         
         if choice == '1':
-            print("✓ 已选择: 前瞻性标签")
+            print(" 已选择: 前瞻性标签")
             return 'forward_looking'
         elif choice == '2':
             if not SKLEARN_AVAILABLE:
                 print("错误: 无监督学习需要scikit-learn库")
                 continue
-            print("✓ 已选择: 无监督学习")
+            print(" 已选择: 无监督学习")
             return 'unsupervised'
         elif choice == '3':
-            print("✓ 已选择: ADX + 均线斜率")
+            print(" 已选择: ADX + 均线斜率")
             return 'adx_slope'
         else:
             print("无效选择，请输入 1、2 或 3")
@@ -2204,7 +2393,7 @@ def select_ml_model() -> str:
         
         for choice, model_type, _ in available_models:
             if user_choice == choice:
-                print(f"✓ 已选择: {model_type}")
+                print(f" 已选择: {model_type}")
                 return model_type
         
         print(f"无效选择，请输入 1-{len(available_models)} 之间的数字")
@@ -2249,6 +2438,220 @@ def get_train_ratio() -> float:
                 print("错误: 请输入两个数字，用逗号分隔")
         except ValueError:
             print("错误: 请输入有效的数字")
+
+
+def compare_with_without_ml(strategies: Dict[str, BaseStrategy], data: pd.DataFrame,
+                            market_detector: MarketRegimeMLDetector,
+                            initial_capital: float = 10000, leverage: float = 1.0,
+                            position_ratio: float = 0.5, max_entries: int = 3):
+    """
+    对比使用ML和不使用ML的回测结果
+    
+    Args:
+        strategies: 策略字典 {'trending': 趋势策略, 'ranging': 震荡策略}
+        data: 历史数据
+        market_detector: 市场状态检测器
+        initial_capital: 初始资金
+        leverage: 杠杆倍数
+        position_ratio: 仓位比例
+        max_entries: 最大加仓次数
+    """
+    print("\n" + "=" * 80)
+    print("对比分析：使用ML vs 不使用ML")
+    print("=" * 80)
+    
+    # 1. 使用ML的回测
+    print("\n【回测1】使用机器学习市场状态检测")
+    print("-" * 80)
+    backtest_ml = BacktestSystem(
+        strategies=strategies,
+        initial_capital=initial_capital,
+        leverage=leverage,
+        position_ratio=position_ratio,
+        market_detector=market_detector
+    )
+    backtest_ml.data = data
+    backtest_ml.run_backtest(max_entries=max_entries)
+    report_ml = backtest_ml.generate_report()
+    
+    # 2. 不使用ML的回测（分别回测每个策略）
+    reports_no_ml = {}
+    backtests_no_ml = {}
+    
+    # 回测趋势策略（如果存在）
+    if 'trending' in strategies:
+        print("\n【回测2a】不使用机器学习 - 仅使用趋势策略")
+        print("-" * 80)
+        backtest_trending = BacktestSystem(
+            strategy=strategies['trending'],
+            initial_capital=initial_capital,
+            leverage=leverage,
+            position_ratio=position_ratio
+        )
+        backtest_trending.data = data
+        backtest_trending.run_backtest(max_entries=max_entries)
+        reports_no_ml['trending'] = backtest_trending.generate_report()
+        backtests_no_ml['trending'] = backtest_trending
+    
+    # 回测震荡策略（如果存在）
+    if 'ranging' in strategies:
+        print("\n【回测2b】不使用机器学习 - 仅使用震荡策略")
+        print("-" * 80)
+        backtest_ranging = BacktestSystem(
+            strategy=strategies['ranging'],
+            initial_capital=initial_capital,
+            leverage=leverage,
+            position_ratio=position_ratio
+        )
+        backtest_ranging.data = data
+        backtest_ranging.run_backtest(max_entries=max_entries)
+        reports_no_ml['ranging'] = backtest_ranging.generate_report()
+        backtests_no_ml['ranging'] = backtest_ranging
+    
+    if not reports_no_ml:
+        print("错误: 没有可用策略")
+        return
+    
+    # 3. 对比结果
+    print("\n" + "=" * 80)
+    print("对比结果")
+    print("=" * 80)
+    
+    metrics = [
+        ('总收益率 (%)', 'total_return', '{:.2f}%'),
+        ('最终权益', 'final_equity', '{:,.2f}'),
+        ('总交易次数', 'total_trades', '{:d}'),
+        ('胜率 (%)', 'win_rate', '{:.1f}%'),
+        ('最大回撤 (%)', 'max_drawdown_pct', '{:.2f}%'),
+        ('盈亏比', 'profit_factor', '{:.2f}'),
+        ('夏普比率', 'sharpe_ratio', '{:.2f}'),
+    ]
+    
+    # 如果有两个策略，分别对比
+    if len(reports_no_ml) == 2:
+        # 对比趋势策略
+        print("\n【对比1】使用ML vs 仅使用趋势策略")
+        print("-" * 80)
+        print(f"{'指标':<20} {'使用ML':>15} {'仅趋势策略':>15} {'差异':>15}")
+        print("-" * 80)
+        
+        report_trending = reports_no_ml['trending']
+        for metric_name, metric_key, format_str in metrics:
+            ml_value = report_ml.get(metric_key, 0)
+            no_ml_value = report_trending.get(metric_key, 0)
+            diff = ml_value - no_ml_value
+            
+            if metric_key == 'total_return':
+                diff_str = f"{diff:+.2f}%"
+            elif metric_key in ['final_equity']:
+                diff_str = f"{diff:+,.2f}"
+            elif metric_key in ['total_trades']:
+                diff_str = f"{diff:+d}"
+            elif metric_key in ['win_rate', 'max_drawdown_pct']:
+                diff_str = f"{diff:+.2f}%"
+            else:
+                diff_str = f"{diff:+.2f}"
+            
+            print(f"{metric_name:<20} {format_str.format(ml_value):>15} {format_str.format(no_ml_value):>15} {diff_str:>15}")
+        
+        # 对比震荡策略
+        print("\n【对比2】使用ML vs 仅使用震荡策略")
+        print("-" * 80)
+        print(f"{'指标':<20} {'使用ML':>15} {'仅震荡策略':>15} {'差异':>15}")
+        print("-" * 80)
+        
+        report_ranging = reports_no_ml['ranging']
+        for metric_name, metric_key, format_str in metrics:
+            ml_value = report_ml.get(metric_key, 0)
+            no_ml_value = report_ranging.get(metric_key, 0)
+            diff = ml_value - no_ml_value
+            
+            if metric_key == 'total_return':
+                diff_str = f"{diff:+.2f}%"
+            elif metric_key in ['final_equity']:
+                diff_str = f"{diff:+,.2f}"
+            elif metric_key in ['total_trades']:
+                diff_str = f"{diff:+d}"
+            elif metric_key in ['win_rate', 'max_drawdown_pct']:
+                diff_str = f"{diff:+.2f}%"
+            else:
+                diff_str = f"{diff:+.2f}"
+            
+            print(f"{metric_name:<20} {format_str.format(ml_value):>15} {format_str.format(no_ml_value):>15} {diff_str:>15}")
+        
+        # 综合判断
+        print("\n" + "-" * 80)
+        trending_better = report_ml['total_return'] > report_trending['total_return']
+        ranging_better = report_ml['total_return'] > report_ranging['total_return']
+        
+        if trending_better and ranging_better:
+            print(" 使用ML在两个策略上都提升了收益率")
+        elif trending_better:
+            print(" 使用ML相比趋势策略提升了收益率，但相比震荡策略降低了")
+        elif ranging_better:
+            print(" 使用ML相比震荡策略提升了收益率，但相比趋势策略降低了")
+        else:
+            print(" 使用ML在两个策略上都降低了收益率")
+            print(f"  建议: 检查模型准确率 ({market_detector.test_accuracy:.2%})，如果低于65%，建议不使用ML")
+        
+    else:
+        # 只有一个策略，简单对比
+        strategy_name = list(reports_no_ml.keys())[0]
+        report_no_ml = reports_no_ml[strategy_name]
+        
+        print(f"{'指标':<20} {'使用ML':>15} {'不使用ML':>15} {'差异':>15}")
+        print("-" * 80)
+        
+        for metric_name, metric_key, format_str in metrics:
+            ml_value = report_ml.get(metric_key, 0)
+            no_ml_value = report_no_ml.get(metric_key, 0)
+            diff = ml_value - no_ml_value
+            
+            if metric_key == 'total_return':
+                diff_str = f"{diff:+.2f}%"
+            elif metric_key in ['final_equity']:
+                diff_str = f"{diff:+,.2f}"
+            elif metric_key in ['total_trades']:
+                diff_str = f"{diff:+d}"
+            elif metric_key in ['win_rate', 'max_drawdown_pct']:
+                diff_str = f"{diff:+.2f}%"
+            else:
+                diff_str = f"{diff:+.2f}"
+            
+            print(f"{metric_name:<20} {format_str.format(ml_value):>15} {format_str.format(no_ml_value):>15} {diff_str:>15}")
+        
+        # 判断ML是否有效
+        print("\n" + "-" * 80)
+        if report_ml['total_return'] > report_no_ml['total_return']:
+            improvement = ((report_ml['total_return'] - report_no_ml['total_return']) / abs(report_no_ml['total_return']) * 100) if report_no_ml['total_return'] != 0 else 0
+            print(f"✓ 使用ML提升了 {improvement:.1f}% 的收益率")
+        else:
+            degradation = ((report_no_ml['total_return'] - report_ml['total_return']) / abs(report_ml['total_return']) * 100) if report_ml['total_return'] != 0 else 0
+            print(f"✗ 使用ML降低了 {degradation:.1f}% 的收益率")
+            print(f"  建议: 检查模型准确率 ({market_detector.test_accuracy:.2%})，如果低于65%，建议不使用ML")
+    
+    # 输出模型评估信息
+    if market_detector.is_trained:
+        print(f"\n模型评估:")
+        print(f"  准确率: {market_detector.test_accuracy:.2%}")
+        print(f"  精确率: {market_detector.test_precision:.2%}")
+        print(f"  召回率: {market_detector.test_recall:.2%}")
+        print(f"  F1分数: {market_detector.test_f1:.2%}")
+        print(f"  市场状态切换次数: {backtest_ml.regime_switch_count}")
+        if hasattr(backtest_ml, 'strategy_usage_count'):
+            total_usage = sum(backtest_ml.strategy_usage_count.values())
+            if total_usage > 0:
+                print(f"\n实际使用的策略统计:")
+                if 'trending' in backtest_ml.strategy_usage_count:
+                    trending_pct = backtest_ml.strategy_usage_count['trending'] / total_usage * 100
+                    print(f"  趋势策略使用: {backtest_ml.strategy_usage_count['trending']} 次 ({trending_pct:.1f}%)")
+                if 'ranging' in backtest_ml.strategy_usage_count:
+                    ranging_pct = backtest_ml.strategy_usage_count['ranging'] / total_usage * 100
+                    print(f"  震荡策略使用: {backtest_ml.strategy_usage_count['ranging']} 次 ({ranging_pct:.1f}%)")
+    
+    print("=" * 80)
+    
+    return report_ml, reports_no_ml
 
 
 def main():
@@ -2389,16 +2792,52 @@ def main():
     max_entries_input = input("最大加仓次数 (默认3): ").strip()
     max_entries = int(max_entries_input) if max_entries_input else 3
     
-    backtest.run_backtest(max_entries=max_entries)
-    
-    # 8. 生成报告
-    backtest.print_report()
+    # 询问是否进行对比分析
+    do_compare = False
+    if use_ml:
+        compare_input = input("\n是否进行对比分析（使用ML vs 不使用ML）? (y/n, 默认y): ").strip().lower()
+        do_compare = compare_input != 'n'
+        
+        if do_compare:
+            # 进行对比分析
+            compare_with_without_ml(
+                strategies=strategies,
+                data=backtest.data,
+                market_detector=backtest.market_detector,
+                initial_capital=10000,
+                leverage=backtest.engine.leverage,
+                position_ratio=backtest.engine.position_ratio,
+                max_entries=max_entries
+            )
+        else:
+            # 只运行ML回测
+            backtest.run_backtest(max_entries=max_entries)
+            backtest.print_report()
+    else:
+        # 单策略模式，直接运行
+        backtest.run_backtest(max_entries=max_entries)
+        backtest.print_report()
 
-    # 9. 绘制结果
+    # 8. 绘制结果
     save_path = input("\n保存图表路径（直接回车使用默认）: ").strip()
     if not save_path:
         save_path = 'backtest_result_ML.png'
-    backtest.plot_results(save_path=save_path)
+    
+    if use_ml and do_compare:
+        # 对比模式下，重新运行ML回测以绘制结果
+        backtest_ml = BacktestSystem(
+            strategies=strategies,
+            initial_capital=10000,
+            market_detector=backtest.market_detector
+        )
+        backtest_ml.data = backtest.data
+        backtest_ml.run_backtest(max_entries=max_entries)
+        backtest_ml.plot_results(save_path=save_path)
+    else:
+        # 如果没有运行过回测，先运行
+        if not hasattr(backtest, 'engine') or len(backtest.engine.trades) == 0:
+            backtest.run_backtest(max_entries=max_entries)
+        backtest.plot_results(save_path=save_path)
     
     print(f"\n回测完成！结果已保存到: {save_path}")
 
