@@ -3,9 +3,11 @@
 ## 目录
 1. [系统概述](#系统概述)
 2. [程序运行流程](#程序运行流程)
-3. [机器学习模型详解](#机器学习模型详解)
-4. [机器学习信号在回测中的应用](#机器学习信号在回测中的应用)
-5. [核心类和方法说明](#核心类和方法说明)
+3. [机器学习市场状态检测详解](#机器学习市场状态检测详解)
+4. [根据市场状态选择策略的逻辑](#根据市场状态选择策略的逻辑)
+5. [参数优化系统详解](#参数优化系统详解)
+6. [机器学习信号在回测中的应用](#机器学习信号在回测中的应用)
+7. [核心类和方法说明](#核心类和方法说明)
 
 ---
 
@@ -212,6 +214,833 @@ if __name__ == "__main__":
     backtest.plot_results(save_path=save_path)
     
     print(f"\n回测完成！结果已保存到: {save_path}")
+```
+
+---
+
+## 机器学习市场状态检测详解
+
+### 1. 市场状态检测的核心思想
+
+**问题定义**：
+- 市场状态分为两类：**趋势市场（Trending）** 和 **震荡市场（Ranging）**
+- 趋势市场：价格朝一个方向持续移动，适合趋势跟踪策略（如突破策略、均线策略）
+- 震荡市场：价格在一定范围内波动，适合均值回归策略（如RSI策略、网格策略）
+
+**解决方案**：
+使用机器学习模型自动识别市场状态，根据预测结果动态选择相应的交易策略。
+
+### 2. 市场状态检测流程
+
+#### 2.1 完整流程图
+
+```
+数据加载
+    ↓
+特征提取（技术指标、价格特征等）
+    ↓
+标签生成（三种方法：前瞻性、无监督、ADX+斜率）
+    ↓
+数据划分（训练集/测试集）
+    ↓
+模型训练（XGBoost/Random Forest/LSTM/CNN）
+    ↓
+模型评估（准确率、精确率、召回率、F1分数）
+    ↓
+市场状态预测（对整个数据集预测）
+    ↓
+预测平滑（减少频繁切换）
+    ↓
+置信度计算（评估预测的可靠性）
+    ↓
+策略选择（根据市场状态选择相应策略）
+```
+
+#### 2.2 预测与置信度计算
+
+**预测方法**：
+```python
+def predict(self, data: pd.DataFrame, return_confidence: bool = False):
+    # 1. 提取特征
+    X = self._extract_features(data)
+    
+    # 2. 标准化
+    X_scaled = self.scaler.transform(X)
+    
+    # 3. 模型预测
+    if self.model_type in ['lstm', 'cnn']:
+        # LSTM/CNN输出概率值
+        predictions_proba = self.model.predict(X_scaled)
+        predictions = (predictions_proba > 0.5).astype(int)
+    else:
+        # XGBoost/Random Forest输出类别和概率
+        predictions = self.model.predict(X_scaled)
+        predictions_proba = self.model.predict_proba(X_scaled)[:, 1]
+    
+    # 4. 计算置信度
+    # 置信度 = |概率 - 0.5| * 2
+    # 如果概率是0.5（最不确定），置信度是0
+    # 如果概率是0或1（最确定），置信度是1
+    confidences = np.abs(predictions_proba - 0.5) * 2
+    
+    # 5. 应用平滑（减少频繁切换）
+    if self.smooth_window > 1:
+        results = self._smooth_predictions(results, confidences)
+    
+    return results, confidences
+```
+
+**置信度计算公式**：
+```
+confidence = |P(trending) - 0.5| * 2
+
+其中：
+- P(trending) 是模型预测为趋势市场的概率（0到1之间）
+- confidence 是置信度（0到1之间）
+- confidence = 0 表示最不确定（概率接近0.5）
+- confidence = 1 表示最确定（概率接近0或1）
+```
+
+**示例**：
+- 如果模型预测概率为 0.8（80%是趋势市场），置信度 = |0.8 - 0.5| * 2 = 0.6
+- 如果模型预测概率为 0.5（50%是趋势市场），置信度 = |0.5 - 0.5| * 2 = 0（最不确定）
+- 如果模型预测概率为 0.95（95%是趋势市场），置信度 = |0.95 - 0.5| * 2 = 0.9（高置信度）
+
+#### 2.3 预测平滑机制
+
+**目的**：减少市场状态的频繁切换，提高策略稳定性
+
+**方法**：使用滑动窗口加权投票
+
+```python
+def _smooth_predictions(self, predictions, confidences):
+    smoothed = predictions.copy()
+    window = self.smooth_window  # 默认5
+    
+    for i in range(window, len(predictions)):
+        # 获取窗口内的预测和置信度
+        window_predictions = predictions.iloc[i-window:i]
+        window_confidences = confidences.iloc[i-window:i]
+        
+        # 加权投票（高置信度的预测权重更大）
+        trending_votes = 0
+        ranging_votes = 0
+        
+        for j, pred in enumerate(window_predictions):
+            conf = window_confidences.iloc[j]
+            # 只考虑高置信度的预测（>= confidence_threshold）
+            if conf >= self.confidence_threshold:
+                if pred == 'trending':
+                    trending_votes += conf  # 置信度作为权重
+                else:
+                    ranging_votes += conf
+        
+        # 如果投票结果明确（需要明显优势才切换），使用投票结果
+        if trending_votes > ranging_votes * 1.2:  # 需要20%的优势
+            smoothed.iloc[i] = 'trending'
+        elif ranging_votes > trending_votes * 1.2:
+            smoothed.iloc[i] = 'ranging'
+        # 否则保持原预测（不切换）
+    
+    return smoothed
+```
+
+**平滑参数**：
+- `smooth_window`：平滑窗口大小（默认5），窗口越大，切换越不频繁
+- `confidence_threshold`：置信度阈值（默认0.6），只有置信度>=阈值的预测才参与投票
+- 切换条件：需要20%的优势才切换（`trending_votes > ranging_votes * 1.2`）
+
+---
+
+## 根据市场状态选择策略的逻辑
+
+### 1. 策略选择的核心逻辑
+
+**设计理念**：
+- **动态策略切换**：根据每个K线的市场状态预测，动态选择相应的策略
+- **持仓策略锁定**：一旦开仓，使用开仓时的策略管理持仓，即使市场状态变化也不切换
+- **置信度过滤**：如果预测置信度太低，可以忽略预测或使用默认策略
+
+### 2. 策略选择流程
+
+#### 2.1 回测开始前的市场状态预测
+
+```python
+# 在 run_backtest() 开始时
+if self.use_market_regime and self.market_detector.is_trained:
+    print("\n预测市场状态...")
+    # 预测整个数据集的市场状态和置信度
+    self.market_regimes, self.market_confidences = self.market_detector.predict(
+        self.data, 
+        return_confidence=True
+    )
+    
+    # 统计信息
+    print(f"趋势市场占比: {(self.market_regimes == 'trending').sum() / len(self.market_regimes):.2%}")
+    print(f"震荡市场占比: {(self.market_regimes == 'ranging').sum() / len(self.market_regimes):.2%}")
+    print(f"平均置信度: {self.market_confidences.mean():.4f} ({self.market_confidences.mean()*100:.2f}%)")
+    
+    # 如果置信度普遍很低，给出警告
+    if self.market_confidences.mean() < 0.3:
+        print(f"\n  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
+        print(f"  建议: 降低置信度阈值或检查模型质量")
+        print(f"  系统将忽略置信度阈值，直接使用预测结果")
+```
+
+#### 2.2 每个K线的策略选择逻辑
+
+**完整代码逻辑**：
+
+```python
+# 遍历每个K线
+for idx in range(len(self.data)):
+    current_bar = self.data.iloc[idx]
+    current_price = current_bar['close']
+    
+    # 1. 获取当前市场状态和置信度
+    if self.use_market_regime and self.market_regimes is not None:
+        current_regime = self.market_regimes.iloc[idx]
+        current_confidence = self.market_confidences.iloc[idx] if self.market_confidences is not None else 1.0
+        
+        # 记录市场状态切换
+        if idx > 0:
+            prev_regime = self.market_regimes.iloc[idx-1]
+            if prev_regime != current_regime:
+                self.regime_switch_count += 1
+        
+        # 2. 策略选择逻辑
+        # 如果平均置信度很低（<0.3），忽略置信度阈值，直接使用预测结果
+        # 否则，如果置信度足够高，使用预测结果；如果置信度低，仍然使用预测结果
+        avg_confidence = self.market_confidences.mean() if self.market_confidences is not None else 1.0
+        use_confidence_threshold = avg_confidence >= 0.3  # 只有平均置信度>=0.3时才使用置信度阈值
+        
+        if not use_confidence_threshold or current_confidence >= self.market_detector.confidence_threshold:
+            # 高置信度或平均置信度很低：直接使用预测结果
+            if current_regime == 'trending' and 'trending' in self.strategies:
+                self.strategy = self.strategies['trending']
+                self.strategy_usage_count['trending'] += 1
+            elif current_regime == 'ranging' and 'ranging' in self.strategies:
+                self.strategy = self.strategies['ranging']
+                self.strategy_usage_count['ranging'] += 1
+            else:
+                # 如果当前市场状态没有对应策略，不交易
+                self.strategy = None
+                self.strategy_usage_count['none'] += 1
+        else:
+            # 低置信度：仍然使用预测结果（因为这是模型的最佳判断）
+            # 根据预测的市场状态选择策略，而不是默认震荡
+            if current_regime == 'trending' and 'trending' in self.strategies:
+                self.strategy = self.strategies['trending']
+                self.strategy_usage_count['trending'] += 1
+            elif current_regime == 'ranging' and 'ranging' in self.strategies:
+                self.strategy = self.strategies['ranging']
+                self.strategy_usage_count['ranging'] += 1
+            else:
+                self.strategy = None
+                self.strategy_usage_count['none'] += 1
+    
+    # 3. 如果有持仓，使用开仓时的策略（即使当前市场状态变化）
+    if self.engine.has_positions():
+        # 遍历所有持仓
+        for pos in self.engine.positions:
+            position_id = pos['position_id']
+            # 获取该持仓的策略（优先使用开仓时记录的策略）
+            pos_strategy = pos.get('strategy') or self.entry_strategy or self.strategy
+            
+            # 使用开仓时的策略管理持仓（止损、止盈、加仓等）
+            # ...持仓管理逻辑...
+    
+    # 4. 如果没有持仓，使用当前选择的策略生成开仓信号
+    if self.strategy is None:
+        continue  # 没有可用策略，跳过开仓逻辑
+    
+    # 检查入场信号
+    signal = self.strategy.generate_signals(self.data, idx, ...)
+    if signal['signal'] in ['long', 'short']:
+        # 开仓时记录使用的策略
+        self.engine.open_position(..., strategy=self.strategy)
+        if position_id == 'default' or position_id is None:
+            self.entry_strategy = self.strategy  # 记录开仓策略
+```
+
+#### 2.3 策略选择决策树
+
+```
+开始
+  ↓
+是否有市场状态预测？
+  ├─ 否 → 使用单一策略（如果提供）
+  └─ 是 → 获取当前市场状态和置信度
+           ↓
+      计算平均置信度
+           ↓
+      平均置信度 < 0.3？
+           ├─ 是 → 忽略置信度阈值，直接使用预测结果
+           └─ 否 → 检查当前置信度 >= 阈值？
+                    ├─ 是 → 使用预测结果
+                    └─ 否 → 仍然使用预测结果（模型最佳判断）
+           ↓
+      根据市场状态选择策略
+           ├─ trending → 使用趋势策略（如果存在）
+           ├─ ranging → 使用震荡策略（如果存在）
+           └─ 无对应策略 → 不交易（strategy = None）
+           ↓
+      是否有持仓？
+           ├─ 是 → 使用开仓时的策略管理持仓（不切换）
+           └─ 否 → 使用当前选择的策略生成开仓信号
+```
+
+#### 2.4 关键设计决策
+
+**1. 为什么即使置信度低也使用预测结果？**
+
+- **原因**：即使置信度低，这也是模型在当前数据下的最佳判断
+- **替代方案**：如果置信度低就默认使用震荡策略，可能导致在趋势市场错过机会
+- **权衡**：相信模型的判断，即使不确定也比随机选择好
+
+**2. 为什么持仓时使用开仓时的策略？**
+
+- **原因**：策略切换可能导致持仓管理逻辑混乱
+- **示例**：用趋势策略开仓后，如果市场状态变为震荡，不应该立即切换到震荡策略平仓
+- **设计**：开仓时锁定策略，直到平仓
+
+**3. 置信度阈值的作用**
+
+- **作用**：过滤掉低置信度的预测，只在有把握时才切换策略
+- **问题**：如果平均置信度很低（<0.3），说明模型整体不确定，此时阈值意义不大
+- **解决**：当平均置信度很低时，忽略阈值，直接使用预测结果
+
+### 3. 策略使用统计
+
+系统会统计每个策略的使用情况：
+
+```python
+self.strategy_usage_count = {'trending': 0, 'ranging': 0, 'none': 0}
+
+# 在策略选择时更新
+if current_regime == 'trending':
+    self.strategy_usage_count['trending'] += 1
+elif current_regime == 'ranging':
+    self.strategy_usage_count['ranging'] += 1
+else:
+    self.strategy_usage_count['none'] += 1
+
+# 回测结束后输出统计
+total_usage = sum(self.strategy_usage_count.values())
+if total_usage > 0:
+    print(f"\n实际使用的策略统计:")
+    trending_pct = self.strategy_usage_count['trending'] / total_usage * 100
+    ranging_pct = self.strategy_usage_count['ranging'] / total_usage * 100
+    print(f"  趋势策略使用: {self.strategy_usage_count['trending']} 次 ({trending_pct:.1f}%)")
+    print(f"  震荡策略使用: {self.strategy_usage_count['ranging']} 次 ({ranging_pct:.1f}%)")
+```
+
+---
+
+## 参数优化系统详解
+
+### 1. 参数优化概述
+
+**目的**：自动寻找最优的策略参数、ML参数和系统参数，提高回测性能
+
+**优化类型**：
+- **策略参数优化**：优化策略本身的参数（如RSI周期、止损止盈、EMA周期等）
+- **ML参数优化**：优化市场状态检测器的参数（如平滑窗口、置信度阈值等）
+- **系统参数优化**：优化回测系统参数（如杠杆、仓位比例等）
+- **联合优化**：同时优化策略、ML和系统参数
+
+**优化方法**：
+- **网格搜索（Grid Search）**：分层搜索（粗粒度 + 细粒度）
+- **随机搜索（Random Search）**：随机采样参数组合
+- **贝叶斯优化（Bayesian Optimization）**：智能搜索，效率高
+
+### 2. 参数空间定义
+
+#### 2.1 自动参数识别
+
+系统会根据策略类型自动识别可优化的参数：
+
+```python
+def _get_strategy_param_space(self, strategy_name: str, strategy_instance=None):
+    """根据策略名称和实例自动识别参数空间"""
+    
+    # 1. 根据策略名称匹配预设参数空间
+    if 'RSI' in strategy_name:
+        base_space = {
+            'rsi_period': {'type': 'int', 'coarse': [10, 14, 20, 30], 'fine_step': 2, ...},
+            'oversold_level': {'type': 'float', 'coarse': [20, 30, 40], 'fine_step': 5, ...},
+            ...
+        }
+    elif 'Multiple' in strategy_name or 'Period' in strategy_name:
+        base_space = {
+            'ema_lens': {'type': 'list', 'coarse': [[5,10,20,30], [5,10,15,20]], ...},
+            'ma_len_daily': {'type': 'int', 'coarse': [20, 25, 30, 35], 'fine_step': 5, ...},
+            'tp_pct': {'type': 'float', 'coarse': [0.02, 0.03, 0.05, 0.10], 'fine_step': 0.01, ...},
+            'vol_factor': {'type': 'float', 'coarse': [1.0, 1.2, 1.5, 2.0], 'fine_step': 0.1, ...},
+            'watch_bars': {'type': 'int', 'coarse': [3, 5, 7, 10], 'fine_step': 1, ...},
+        }
+    ...
+    
+    # 2. 如果有策略实例，从实例中获取所有参数并补充
+    if strategy_instance is not None:
+        instance_params = {}
+        # 使用 __dict__ 获取所有属性
+        for attr_name, attr_value in strategy_instance.__dict__.items():
+            if (not attr_name.startswith('_') and 
+                not callable(attr_value) and
+                not isinstance(attr_value, (pd.Series, np.ndarray))):
+                instance_params[attr_name] = attr_value
+        
+        # 对于不在base_space中的参数，添加默认参数空间
+        for param_name, param_value in instance_params.items():
+            if param_name not in base_space:
+                # 根据参数类型和值推断参数空间
+                if isinstance(param_value, int):
+                    base_space[param_name] = {
+                        'type': 'int',
+                        'coarse': [max(1, param_value - 10), param_value, param_value + 10, param_value + 20],
+                        'fine_step': 2,
+                        'description': f'{param_name}（自动识别）'
+                    }
+                elif isinstance(param_value, float):
+                    base_space[param_name] = {
+                        'type': 'float',
+                        'coarse': [max(0.01, param_value * 0.5), param_value, param_value * 1.5, param_value * 2.0],
+                        'fine_step': param_value * 0.1,
+                        'description': f'{param_name}（自动识别）'
+                    }
+                ...
+    
+    return base_space
+```
+
+#### 2.2 参数空间结构
+
+每个参数的定义包含：
+- **type**：参数类型（'int', 'float', 'list'）
+- **coarse**：粗粒度搜索值列表（用于快速筛选）
+- **fine_step**：细粒度搜索步长（用于精细优化）
+- **description**：参数描述（用于用户提示）
+
+**示例**：
+```python
+{
+    'rsi_period': {
+        'type': 'int',
+        'coarse': [10, 14, 20, 30],  # 粗粒度：测试这几个值
+        'fine_step': 2,              # 细粒度：在最佳值附近±2搜索
+        'description': 'RSI周期'
+    },
+    'tp_pct': {
+        'type': 'float',
+        'coarse': [0.02, 0.03, 0.05, 0.10],  # 粗粒度
+        'fine_step': 0.01,                    # 细粒度：±0.01搜索
+        'description': '止盈百分比'
+    }
+}
+```
+
+#### 2.3 ML参数空间
+
+```python
+self.ml_param_space = {
+    'smooth_window': {
+        'type': 'int',
+        'coarse': [3, 5, 10, 20],
+        'fine_step': 2,
+        'description': '平滑窗口大小（K线数）'
+    },
+    'confidence_threshold': {
+        'type': 'float',
+        'coarse': [0.5, 0.6, 0.7, 0.8],
+        'fine_step': 0.05,
+        'description': '置信度阈值（0-1）'
+    },
+}
+```
+
+#### 2.4 系统参数空间
+
+```python
+self.system_param_space = {
+    'leverage': {
+        'type': 'int',
+        'coarse': [1, 3, 5, 10],
+        'fine_step': 1,
+        'description': '杠杆倍数'
+    },
+    'position_ratio': {
+        'type': 'float',
+        'coarse': [0.3, 0.5, 0.7, 0.9],
+        'fine_step': 0.1,
+        'description': '仓位比例（0-1）'
+    },
+}
+```
+
+### 3. 用户参数选择
+
+系统允许用户选择哪些参数参与优化：
+
+```python
+def select_strategy_params_to_optimize(strategy_param_space, strategy_name=""):
+    """让用户选择哪些策略参数参与优化"""
+    
+    print("\n可优化的参数:")
+    param_list = list(strategy_param_space.items())
+    
+    for i, (param_name, param_def) in enumerate(param_list, 1):
+        desc = param_def.get('description', '')
+        coarse_values = param_def.get('coarse', [])
+        print(f"\n  {i}. {param_name} ({desc})")
+        print(f"     类型: {param_def['type']}")
+        print(f"     搜索值: {coarse_values[:3]}... (共{len(coarse_values)}个值)")
+    
+    print(f"\n  {len(param_list) + 1}. 全选")
+    print(f"  {len(param_list) + 2}. 全不选")
+    
+    # 用户输入选择
+    choice = input("请选择要优化的参数 (输入数字，多个用逗号分隔): ").strip()
+    
+    # 解析选择并返回
+    ...
+```
+
+### 4. 优化方法详解
+
+#### 4.1 网格搜索（Grid Search）
+
+**特点**：分层搜索，先粗粒度后细粒度
+
+**流程**：
+1. **粗粒度搜索**：测试所有粗粒度参数组合
+2. **细粒度搜索**：在最佳参数附近进行精细搜索
+
+**代码实现**：
+
+```python
+def grid_search(self, optimize_type='strategy', coarse_first=True, 
+                fine_search_around_best=True, max_coarse_combinations=100):
+    # 1. 粗粒度搜索
+    if coarse_first:
+        # 生成所有粗粒度参数组合
+        coarse_combinations = list(itertools.product(*coarse_values))
+        
+        # 限制组合数量
+        if len(coarse_combinations) > max_coarse_combinations:
+            coarse_combinations = random.sample(coarse_combinations, max_coarse_combinations)
+        
+        # 测试每个组合
+        for combination in coarse_combinations:
+            params = dict(zip(param_names, combination))
+            result = self.evaluate_params(params, optimize_type)
+            if result['score'] > best_score:
+                best_score = result['score']
+                best_result = result
+    
+    # 2. 细粒度搜索（在最佳参数附近）
+    if fine_search_around_best and best_result:
+        best_params = best_result['params']
+        
+        # 为每个参数生成细粒度搜索范围
+        for param_name, base_value in best_params.items():
+            fine_step = space_def['fine_step']
+            if space_def['type'] == 'int':
+                # 整数：在基础值附近生成几个值
+                fine_values = [base_value + i * fine_step for i in range(-2, 3)]
+            else:
+                # 浮点：在基础值附近生成几个值
+                fine_values = [base_value + i * fine_step for i in range(-2, 3)]
+        
+        # 测试细粒度组合
+        ...
+```
+
+**优势**：
+- 全面搜索，不会遗漏最优解
+- 分层搜索，先快后精
+
+**劣势**：
+- 计算量大，参数多时组合数爆炸
+- 需要限制组合数量
+
+#### 4.2 随机搜索（Random Search）
+
+**特点**：随机采样参数组合，快速探索参数空间
+
+**流程**：
+1. 随机生成参数组合
+2. 评估每个组合
+3. 返回最佳组合
+
+**代码实现**：
+
+```python
+def random_search(self, optimize_type='strategy', n_iter=100):
+    for i in range(n_iter):
+        # 随机生成参数
+        params = {}
+        for param_name, space_def in param_space.items():
+            if space_def['type'] == 'int':
+                base = random.choice(space_def['coarse'])
+                step = space_def['fine_step']
+                params[param_name] = base + random.randint(-int(step), int(step))
+            else:
+                base = random.choice(space_def['coarse'])
+                step = space_def['fine_step']
+                params[param_name] = base + random.uniform(-step, step)
+        
+        # 评估参数
+        result = self.evaluate_params(params, optimize_type)
+        if result['score'] > best_score:
+            best_score = result['score']
+            best_result = result
+```
+
+**优势**：
+- 计算量可控（通过n_iter控制）
+- 适合参数空间大的情况
+
+**劣势**：
+- 可能错过最优解
+- 需要足够多的迭代次数
+
+#### 4.3 贝叶斯优化（Bayesian Optimization）
+
+**特点**：智能搜索，利用历史评估结果指导下一步搜索
+
+**原理**：
+1. 使用高斯过程（Gaussian Process）建模目标函数
+2. 使用采集函数（Acquisition Function）选择下一个评估点
+3. 平衡探索（exploration）和利用（exploitation）
+
+**代码实现**：
+
+```python
+def bayesian_optimization(self, optimize_type='strategy', n_calls=50):
+    from skopt import gp_minimize
+    from skopt.space import Real, Integer
+    
+    # 定义搜索空间
+    dimensions = []
+    for param_name, space_def in param_space.items():
+        if space_def['type'] == 'int':
+            dimensions.append(Integer(min(space_def['coarse']), max(space_def['coarse'])))
+        else:
+            dimensions.append(Real(min(space_def['coarse']), max(space_def['coarse'])))
+    
+    # 定义目标函数
+    @use_named_args(dimensions=dimensions)
+    def objective(**params):
+        result = self.evaluate_params(params, optimize_type, verbose=False)
+        return -result['score']  # 最小化负得分（即最大化得分）
+    
+    # 执行贝叶斯优化
+    result_bo = gp_minimize(
+        func=objective,
+        dimensions=dimensions,
+        n_calls=n_calls,
+        random_state=42,
+        acq_func='EI'  # Expected Improvement
+    )
+    
+    # 提取最佳参数
+    best_params = dict(zip(param_names, result_bo.x))
+    best_score = -result_bo.fun
+```
+
+**优势**：
+- 效率高，通常比随机搜索快
+- 智能探索，自动平衡探索和利用
+
+**劣势**：
+- 需要安装scikit-optimize库
+- 对高维参数空间效果可能不佳
+
+### 5. 参数评估
+
+#### 5.1 评估流程
+
+```python
+def evaluate_params(self, params, optimize_type='strategy', verbose=False):
+    # 1. 提取参数（根据优化类型）
+    strategy_params = {...}
+    ml_params = {...}
+    system_params = {...}
+    
+    # 2. 创建策略实例（使用优化参数）
+    optimized_strategies = {}
+    for regime_type, original_strategy in self.strategies.items():
+        # 获取原策略的所有参数
+        original_params = {}
+        for attr_name, attr_value in original_strategy.__dict__.items():
+            if (not attr_name.startswith('_') and 
+                not callable(attr_value) and
+                not isinstance(attr_value, (pd.Series, np.ndarray))):
+                original_params[attr_name] = attr_value
+        
+        # 更新优化参数
+        original_params.update(strategy_params.get(regime_type, {}))
+        
+        # 创建新策略实例
+        optimized_strategies[regime_type] = original_strategy.__class__(original_params)
+    
+    # 3. 创建ML检测器（如果需要）
+    if optimize_type in ['ml', 'joint']:
+        optimized_detector = MarketRegimeMLDetector(...)
+        optimized_detector.train(self.data)
+    
+    # 4. 创建回测系统
+    backtest = BacktestSystem(
+        strategies=optimized_strategies,
+        market_detector=optimized_detector,
+        leverage=system_params.get('leverage', self.leverage),
+        ...
+    )
+    backtest.data = self.data.copy()
+    
+    # 5. 运行回测
+    backtest.run_backtest(max_entries=3)
+    report = backtest.generate_report()
+    
+    # 6. 计算得分
+    if self.objective == 'sharpe_ratio':
+        score = report.get('sharpe_ratio', 0)
+    elif self.objective == 'total_return':
+        score = report.get('total_return', 0)
+    elif self.objective == 'return_drawdown_ratio':
+        max_dd = report.get('max_drawdown_pct', 1)
+        score = report.get('total_return', 0) / max_dd if max_dd > 0 else 0
+    
+    return {
+        'params': params.copy(),
+        'score': score,
+        'total_return': report.get('total_return', 0),
+        'sharpe_ratio': report.get('sharpe_ratio', 0),
+        ...
+    }
+```
+
+#### 5.2 优化目标
+
+**可选目标**：
+- **sharpe_ratio**：夏普比率（风险调整后的收益率，推荐）
+- **total_return**：总收益率（绝对收益率）
+- **return_drawdown_ratio**：收益率/回撤比（收益率与最大回撤的比值）
+
+**计算公式**：
+```python
+# 夏普比率
+sharpe_ratio = mean(returns) / std(returns) * sqrt(periods_per_year)
+
+# 收益率/回撤比
+return_drawdown_ratio = total_return / max_drawdown_pct
+```
+
+### 6. 参数稳定性测试（过拟合检测）
+
+**目的**：检测优化后的参数是否过拟合
+
+**方法**：对参数进行小幅扰动，重新评估性能
+
+```python
+def test_parameter_stability(self, params, optimize_type='strategy', 
+                             perturbation_ratio=0.1, num_tests=5):
+    # 1. 评估原始参数
+    base_result = self.evaluate_params(params, optimize_type, verbose=False)
+    base_score = base_result['score']
+    
+    # 2. 对参数进行扰动并重新评估
+    perturbed_scores = []
+    for _ in range(num_tests):
+        perturbed_params = params.copy()
+        for param_name, param_value in params.items():
+            # 找到对应的参数空间定义
+            space_def = ...
+            
+            # 根据参数类型进行扰动
+            if space_def['type'] == 'int':
+                step = max(1, int(space_def['fine_step'] * perturbation_ratio))
+                perturbed_params[param_name] = param_value + random.randint(-step, step)
+            else:
+                step = space_def['fine_step'] * perturbation_ratio
+                perturbed_params[param_name] = param_value + random.uniform(-step, step)
+        
+        result = self.evaluate_params(perturbed_params, optimize_type, verbose=False)
+        perturbed_scores.append(result['score'])
+    
+    # 3. 计算稳定性指标
+    avg_perturbed_score = np.mean(perturbed_scores)
+    score_drop_ratio = (base_score - avg_perturbed_score) / abs(base_score)
+    score_cv = np.std(perturbed_scores) / abs(avg_perturbed_score)
+    
+    # 4. 判断是否稳定
+    is_stable = score_drop_ratio < 0.2 and score_cv < 0.3
+    
+    return {
+        'is_stable': is_stable,
+        'base_score': base_score,
+        'avg_perturbed_score': avg_perturbed_score,
+        'score_drop_ratio': score_drop_ratio,
+        'score_coefficient_of_variation': score_cv,
+    }
+```
+
+**稳定性判断标准**：
+- **score_drop_ratio < 0.2**：参数扰动后得分下降不超过20%
+- **score_cv < 0.3**：得分变异系数小于0.3（相对稳定）
+
+### 7. 优化流程示例
+
+**完整优化流程**：
+
+```
+1. 用户选择优化类型（策略/ML/系统/联合）
+   ↓
+2. 系统自动识别参数空间
+   ↓
+3. 用户选择要优化的参数（可选）
+   ↓
+4. 系统显示参数搜索空间
+   ↓
+5. 用户确认是否继续
+   ↓
+6. 选择优化方法（网格搜索/随机搜索/贝叶斯优化）
+   ↓
+7. 执行优化
+   ├─ 网格搜索：粗粒度 → 细粒度
+   ├─ 随机搜索：随机采样n_iter次
+   └─ 贝叶斯优化：智能搜索n_calls次
+   ↓
+8. 参数稳定性测试（过拟合检测）
+   ↓
+9. 显示优化结果
+   ↓
+10. 用户选择是否应用优化后的参数
+```
+
+### 8. 优化结果应用
+
+优化完成后，用户可以选择是否应用优化后的参数：
+
+```python
+# 应用策略参数
+if optimize_type in ['strategy', 'joint']:
+    for regime_type, original_strategy in strategies.items():
+        strategy_params = {...}  # 从优化结果中提取
+        original_params = {...}  # 获取原策略的所有参数
+        original_params.update(strategy_params)  # 更新优化参数
+        strategies[regime_type] = original_strategy.__class__(original_params)
+
+# 应用ML参数
+if optimize_type in ['ml', 'joint']:
+    backtest.market_detector.smooth_window = ml_params.get('smooth_window', ...)
+    backtest.market_detector.confidence_threshold = ml_params.get('confidence_threshold', ...)
+
+# 应用系统参数
+if optimize_type in ['system', 'joint']:
+    backtest.engine.leverage = system_params.get('leverage', ...)
+    backtest.engine.position_ratio = system_params.get('position_ratio', ...)
 ```
 
 ---

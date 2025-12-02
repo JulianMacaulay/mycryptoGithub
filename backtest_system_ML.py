@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import os
 import sys
 import requests
@@ -18,6 +18,9 @@ import time
 import warnings
 import importlib
 import inspect
+import itertools
+import random
+from collections import defaultdict
 
 warnings.filterwarnings('ignore')
 
@@ -56,6 +59,16 @@ try:
 except ImportError:
     TENSORFLOW_AVAILABLE = False
     print("警告: tensorflow未安装，LSTM和CNN功能将不可用。可以使用: pip install tensorflow")
+
+# 尝试导入贝叶斯优化库
+try:
+    from skopt import gp_minimize
+    from skopt.space import Real, Integer
+    from skopt.utils import use_named_args
+    BAYESIAN_OPT_AVAILABLE = True
+except ImportError:
+    BAYESIAN_OPT_AVAILABLE = False
+    print("警告: scikit-optimize未安装，贝叶斯优化功能将不可用。可以使用: pip install scikit-optimize")
 
 
 # ==================== 技术指标计算函数 ====================
@@ -838,6 +851,1004 @@ class MarketRegimeMLDetector:
         return smoothed
 
 
+# ==================== 参数优化器 ====================
+
+class StrategyParameterOptimizer:
+    """
+    策略参数优化器（分层优化）
+    支持三种优化方法：网格搜索、随机搜索、贝叶斯优化
+    支持分层优化：策略参数、ML参数、系统参数、联合优化
+    """
+    
+    def __init__(self, data: pd.DataFrame, strategies: Dict[str, BaseStrategy] = None,
+                 strategy: BaseStrategy = None, market_detector: MarketRegimeMLDetector = None,
+                 initial_capital: float = 10000, leverage: float = 1.0, position_ratio: float = 0.5,
+                 objective: str = 'sharpe_ratio', stability_test: bool = True):
+        """
+        初始化参数优化器
+        
+        Args:
+            data: 历史数据
+            strategies: 策略字典（多策略模式）
+            strategy: 单一策略（单策略模式）
+            market_detector: 市场状态检测器（可选）
+            initial_capital: 初始资金
+            leverage: 杠杆倍数
+            position_ratio: 仓位比例
+            objective: 优化目标 ('sharpe_ratio', 'total_return', 'return_drawdown_ratio')
+            stability_test: 是否进行稳定性测试
+        """
+        self.data = data
+        self.strategies = strategies
+        self.strategy = strategy
+        self.market_detector = market_detector
+        self.initial_capital = initial_capital
+        self.leverage = leverage
+        self.position_ratio = position_ratio
+        self.objective = objective
+        self.stability_test = stability_test
+        
+        # 存储评估历史
+        self.evaluation_history = []
+        self.best_params = None
+        self.best_score = float('-inf')
+        
+        # 定义参数空间（根据策略类型动态生成）
+        self._define_param_spaces()
+    
+    def _define_param_spaces(self):
+        """定义参数搜索空间（自动识别）"""
+        # 策略参数空间（根据策略类型自动识别）
+        self.strategy_param_space = {}
+        
+        if self.strategies:
+            # 多策略模式：为每个策略定义参数空间
+            for regime_type, strategy in self.strategies.items():
+                strategy_name = strategy.__class__.__name__
+                self.strategy_param_space[regime_type] = self._get_strategy_param_space(strategy_name, strategy)
+        elif self.strategy:
+            # 单策略模式
+            strategy_name = self.strategy.__class__.__name__
+            self.strategy_param_space['default'] = self._get_strategy_param_space(strategy_name, self.strategy)
+        
+        # ML检测器参数空间
+        self.ml_param_space = {
+            'smooth_window': {'type': 'int', 'coarse': [3, 5, 10, 20], 'fine_step': 2, 'description': '平滑窗口大小（K线数）'},
+            'confidence_threshold': {'type': 'float', 'coarse': [0.5, 0.6, 0.7, 0.8], 'fine_step': 0.05, 'description': '置信度阈值（0-1）'},
+        }
+        
+        # 回测系统参数空间
+        self.system_param_space = {
+            'leverage': {'type': 'int', 'coarse': [1, 3, 5, 10], 'fine_step': 1, 'description': '杠杆倍数'},
+            'position_ratio': {'type': 'float', 'coarse': [0.3, 0.5, 0.7, 0.9], 'fine_step': 0.1, 'description': '仓位比例（0-1）'},
+        }
+    
+    def display_param_space(self, optimize_type: str = 'strategy'):
+        """
+        显示参数搜索空间（哪些参数参与优化）
+        
+        Args:
+            optimize_type: 优化类型 ('strategy', 'ml', 'system', 'joint')
+        """
+        print("\n" + "=" * 80)
+        print("参数搜索空间（自动识别）")
+        print("=" * 80)
+        
+        if optimize_type == 'strategy':
+            print("\n【策略参数】（根据策略类型自动识别）")
+            if self.strategies:
+                for regime_type, strategy in self.strategies.items():
+                    strategy_name = strategy.__class__.__name__
+                    print(f"\n  {regime_type.upper()}策略 ({strategy_name}):")
+                    if regime_type in self.strategy_param_space:
+                        space = self.strategy_param_space[regime_type]
+                        for param_name, space_def in space.items():
+                            coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                            desc = space_def.get('description', '')
+                            desc_text = f" ({desc})" if desc else ""
+                            print(f"    - {param_name}{desc_text}:")
+                            print(f"        类型: {space_def['type']}")
+                            print(f"        粗粒度搜索值: [{coarse_str}]")
+                            print(f"        细粒度步长: {space_def['fine_step']}")
+            elif self.strategy:
+                strategy_name = self.strategy.__class__.__name__
+                print(f"\n  策略 ({strategy_name}):")
+                if 'default' in self.strategy_param_space:
+                    space = self.strategy_param_space['default']
+                    for param_name, space_def in space.items():
+                        coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                        print(f"    - {param_name}:")
+                        print(f"        类型: {space_def['type']}")
+                        print(f"        粗粒度搜索值: [{coarse_str}]")
+                        print(f"        细粒度步长: {space_def['fine_step']}")
+        
+        elif optimize_type == 'ml':
+            print("\n【ML检测器参数】")
+            for param_name, space_def in self.ml_param_space.items():
+                coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                desc = space_def.get('description', '')
+                print(f"  - {param_name} ({desc}):")
+                print(f"      类型: {space_def['type']}")
+                print(f"      粗粒度搜索值: [{coarse_str}]")
+                print(f"      细粒度步长: {space_def['fine_step']}")
+        
+        elif optimize_type == 'system':
+            print("\n【回测系统参数】")
+            for param_name, space_def in self.system_param_space.items():
+                coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                desc = space_def.get('description', '')
+                print(f"  - {param_name} ({desc}):")
+                print(f"      类型: {space_def['type']}")
+                print(f"      粗粒度搜索值: [{coarse_str}]")
+                print(f"      细粒度步长: {space_def['fine_step']}")
+        
+        else:  # joint
+            print("\n【联合优化：所有参数】")
+            
+            # 策略参数
+            if self.strategies:
+                for regime_type, strategy in self.strategies.items():
+                    strategy_name = strategy.__class__.__name__
+                    print(f"\n  {regime_type.upper()}策略参数 ({strategy_name}):")
+                    if regime_type in self.strategy_param_space:
+                        space = self.strategy_param_space[regime_type]
+                        for param_name, space_def in space.items():
+                            full_name = f"{regime_type}_{param_name}"
+                            coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                            desc = space_def.get('description', '')
+                            desc_text = f" ({desc})" if desc else ""
+                            print(f"    - {full_name}{desc_text}:")
+                            print(f"        类型: {space_def['type']}")
+                            print(f"        粗粒度搜索值: [{coarse_str}]")
+                            print(f"        细粒度步长: {space_def['fine_step']}")
+            elif self.strategy:
+                strategy_name = self.strategy.__class__.__name__
+                print(f"\n  策略参数 ({strategy_name}):")
+                if 'default' in self.strategy_param_space:
+                    space = self.strategy_param_space['default']
+                    for param_name, space_def in space.items():
+                        coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                        desc = space_def.get('description', '')
+                        desc_text = f" ({desc})" if desc else ""
+                        print(f"    - {param_name}{desc_text}:")
+                        print(f"        类型: {space_def['type']}")
+                        print(f"        粗粒度搜索值: [{coarse_str}]")
+                        print(f"        细粒度步长: {space_def['fine_step']}")
+            
+            # ML参数
+            print("\n  ML检测器参数:")
+            for param_name, space_def in self.ml_param_space.items():
+                coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                desc = space_def.get('description', '')
+                print(f"    - {param_name} ({desc}):")
+                print(f"        类型: {space_def['type']}")
+                print(f"        粗粒度搜索值: [{coarse_str}]")
+                print(f"        细粒度步长: {space_def['fine_step']}")
+            
+            # 系统参数
+            print("\n  回测系统参数:")
+            for param_name, space_def in self.system_param_space.items():
+                coarse_str = ', '.join([str(v) for v in space_def['coarse']])
+                desc = space_def.get('description', '')
+                print(f"    - {param_name} ({desc}):")
+                print(f"        类型: {space_def['type']}")
+                print(f"        粗粒度搜索值: [{coarse_str}]")
+                print(f"        细粒度步长: {space_def['fine_step']}")
+        
+        # 计算总组合数
+        total_combinations = self._calculate_total_combinations(optimize_type)
+        print(f"\n预计粗粒度参数组合数: {total_combinations:,}")
+        if total_combinations > 1000:
+            print("  注意: 组合数较多，建议使用随机搜索或贝叶斯优化")
+        
+        print("=" * 80)
+    
+    def _calculate_total_combinations(self, optimize_type: str) -> int:
+        """计算总参数组合数"""
+        if optimize_type == 'strategy':
+            param_space = self.strategy_param_space
+        elif optimize_type == 'ml':
+            param_space = {'default': self.ml_param_space}
+        elif optimize_type == 'system':
+            param_space = {'default': self.system_param_space}
+        else:
+            # joint: 合并所有参数空间
+            joint_space = {}
+            if self.strategies:
+                for regime_type, space in self.strategy_param_space.items():
+                    for param_name, space_def in space.items():
+                        full_name = f"{regime_type}_{param_name}"
+                        joint_space[full_name] = space_def
+            elif self.strategy and 'default' in self.strategy_param_space:
+                joint_space.update(self.strategy_param_space['default'])
+            for param_name, space_def in self.ml_param_space.items():
+                joint_space[param_name] = space_def
+            for param_name, space_def in self.system_param_space.items():
+                joint_space[param_name] = space_def
+            param_space = {'default': joint_space}
+        
+        total = 1
+        for regime_type, space in param_space.items():
+            for param_name, space_def in space.items():
+                total *= len(space_def['coarse'])
+        
+        return total
+    
+    def _get_strategy_param_space(self, strategy_name: str, strategy_instance=None) -> Dict:
+        """
+        根据策略名称和实例自动识别参数空间（参考cointegration_windows_RLS_5_zscore_backtest.py）
+        
+        Args:
+            strategy_name: 策略类名称
+            strategy_instance: 策略实例（用于获取实际参数值）
+        """
+        # 首先尝试根据策略名称匹配预设参数空间
+        base_space = {}
+        if 'RSI' in strategy_name or 'rsi' in strategy_name.lower():
+            base_space = {
+                'rsi_period': {'type': 'int', 'coarse': [10, 14, 20, 30], 'fine_step': 2, 'description': 'RSI周期'},
+                'oversold_level': {'type': 'float', 'coarse': [20, 30, 40], 'fine_step': 5, 'description': '超卖阈值'},
+                'overbought_level': {'type': 'float', 'coarse': [60, 70, 80], 'fine_step': 5, 'description': '超买阈值'},
+                'stop_loss_pct': {'type': 'float', 'coarse': [0.03, 0.05, 0.08, 0.10], 'fine_step': 0.01, 'description': '止损百分比'},
+                'take_profit_pct': {'type': 'float', 'coarse': [0.05, 0.10, 0.15, 0.20], 'fine_step': 0.02, 'description': '止盈百分比'},
+            }
+        elif 'Multiple' in strategy_name or 'Period' in strategy_name:
+            base_space = {
+                'ema_lens': {'type': 'list', 'coarse': [[5, 10, 20, 30], [5, 10, 15, 20], [10, 20, 30, 40]], 'fine_step': None, 'description': 'EMA周期列表'},
+                'ma_len_daily': {'type': 'int', 'coarse': [20, 25, 30, 35], 'fine_step': 5, 'description': '日线EMA周期'},
+                'tp_pct': {'type': 'float', 'coarse': [0.02, 0.03, 0.05, 0.10], 'fine_step': 0.01, 'description': '止盈百分比'},
+                'vol_factor': {'type': 'float', 'coarse': [1.0, 1.2, 1.5, 2.0], 'fine_step': 0.1, 'description': '成交量放大因子'},
+                'watch_bars': {'type': 'int', 'coarse': [3, 5, 7, 10], 'fine_step': 1, 'description': '观察窗口K线数'},
+            }
+        elif 'Turtle' in strategy_name:
+            base_space = {
+                'atr_length': {'type': 'int', 'coarse': [14, 20, 30], 'fine_step': 5, 'description': 'ATR周期'},
+                'bo_length': {'type': 'int', 'coarse': [14, 20, 30], 'fine_step': 5, 'description': '突破周期'},
+            }
+        else:
+            # 默认参数空间（通用）
+            base_space = {
+                'stop_loss_pct': {'type': 'float', 'coarse': [0.03, 0.05, 0.08, 0.10], 'fine_step': 0.01, 'description': '止损百分比'},
+                'take_profit_pct': {'type': 'float', 'coarse': [0.05, 0.10, 0.15, 0.20], 'fine_step': 0.02, 'description': '止盈百分比'},
+            }
+        
+        # 如果有策略实例，从实例中获取所有参数并补充到参数空间
+        if strategy_instance is not None:
+            instance_params = {}
+            if hasattr(strategy_instance, '__dict__'):
+                for attr_name, attr_value in strategy_instance.__dict__.items():
+                    # 排除私有属性、方法、运行时计算的指标
+                    if (not attr_name.startswith('_') and 
+                        not callable(attr_value) and
+                        not isinstance(attr_value, (pd.Series, np.ndarray, type(None)))):
+                        if isinstance(attr_value, (int, float, str, bool, list, dict)):
+                            instance_params[attr_name] = attr_value
+            
+            # 对于不在base_space中的参数，添加默认参数空间
+            for param_name, param_value in instance_params.items():
+                if param_name not in base_space:
+                    # 根据参数类型和值推断参数空间
+                    if isinstance(param_value, int):
+                        if param_value > 0:
+                            # 整数参数：在值的附近生成搜索空间
+                            base_val = param_value
+                            base_space[param_name] = {
+                                'type': 'int',
+                                'coarse': [max(1, base_val - 10), base_val, base_val + 10, base_val + 20],
+                                'fine_step': 2,
+                                'description': f'{param_name}（自动识别）'
+                            }
+                    elif isinstance(param_value, float):
+                        if param_value > 0:
+                            # 浮点参数：在值的附近生成搜索空间
+                            base_val = param_value
+                            base_space[param_name] = {
+                                'type': 'float',
+                                'coarse': [max(0.01, base_val * 0.5), base_val, base_val * 1.5, base_val * 2.0],
+                                'fine_step': base_val * 0.1,
+                                'description': f'{param_name}（自动识别）'
+                            }
+                    elif isinstance(param_value, list) and len(param_value) > 0:
+                        # 列表参数：提供几个不同的列表选项
+                        # 对于ema_lens这样的列表，提供几个不同的组合
+                        if all(isinstance(x, int) for x in param_value):
+                            # 整数列表：生成几个变体
+                            variants = [
+                                param_value,  # 原值
+                                [max(1, x - 2) for x in param_value],  # 减2
+                                [x + 2 for x in param_value],  # 加2
+                            ]
+                            base_space[param_name] = {
+                                'type': 'list',
+                                'coarse': variants,
+                                'fine_step': None,
+                                'description': f'{param_name}（自动识别）'
+                            }
+        
+        return base_space
+    
+    def evaluate_params(self, params: Dict[str, Any], optimize_type: str = 'strategy',
+                       verbose: bool = False) -> Dict[str, Any]:
+        """
+        评估参数组合
+        
+        Args:
+            params: 参数字典
+            optimize_type: 优化类型 ('strategy', 'ml', 'system', 'joint')
+            verbose: 是否打印详细信息
+            
+        Returns:
+            评估结果字典
+        """
+        try:
+            # 根据优化类型提取参数
+            strategy_params = {}
+            ml_params = {}
+            system_params = {}
+            
+            if optimize_type in ['strategy', 'joint']:
+                # 提取策略参数
+                if self.strategies:
+                    for regime_type in self.strategies.keys():
+                        if regime_type in self.strategy_param_space:
+                            strategy_params[regime_type] = {}
+                            for param_name in self.strategy_param_space[regime_type].keys():
+                                # 联合优化时，参数名可能是"trending_rsi_period"或"rsi_period"
+                                # 非联合优化时，参数名就是"rsi_period"
+                                if optimize_type == 'joint':
+                                    # 尝试两种格式：带前缀和不带前缀
+                                    key_with_prefix = f"{regime_type}_{param_name}"
+                                    if key_with_prefix in params:
+                                        strategy_params[regime_type][param_name] = params[key_with_prefix]
+                                    elif param_name in params:
+                                        # 如果没有前缀，说明是单策略模式，所有策略共享参数
+                                        strategy_params[regime_type][param_name] = params[param_name]
+                                else:
+                                    # 非联合优化，直接使用参数名
+                                    if param_name in params:
+                                        strategy_params[regime_type][param_name] = params[param_name]
+                elif self.strategy:
+                    if 'default' in self.strategy_param_space:
+                        for param_name in self.strategy_param_space['default'].keys():
+                            if param_name in params:
+                                strategy_params['default'] = strategy_params.get('default', {})
+                                strategy_params['default'][param_name] = params[param_name]
+            
+            if optimize_type in ['ml', 'joint']:
+                # 提取ML参数
+                for param_name in self.ml_param_space.keys():
+                    if param_name in params:
+                        ml_params[param_name] = params[param_name]
+            
+            if optimize_type in ['system', 'joint']:
+                # 提取系统参数
+                for param_name in self.system_param_space.keys():
+                    if param_name in params:
+                        system_params[param_name] = params[param_name]
+            
+            # 创建策略实例
+            optimized_strategies = None
+            optimized_strategy = None
+            
+            if self.strategies:
+                optimized_strategies = {}
+                for regime_type, original_strategy in self.strategies.items():
+                    strategy_params_dict = strategy_params.get(regime_type, {})
+                    # 获取原策略的所有参数（不仅仅是优化参数）
+                    # 使用 __dict__ 获取实例属性，更可靠
+                    original_params = {}
+                    if hasattr(original_strategy, '__dict__'):
+                        for attr_name, attr_value in original_strategy.__dict__.items():
+                            # 排除私有属性、方法和特殊属性
+                            if not attr_name.startswith('_') and not callable(attr_value):
+                                # 只包含基本类型（int, float, str, bool, list, dict, type(None)）
+                                if isinstance(attr_value, (int, float, str, bool, list, dict, type(None), pd.Series, np.ndarray)):
+                                    # 跳过pandas Series和numpy数组（这些是运行时计算的指标）
+                                    if not isinstance(attr_value, (pd.Series, np.ndarray)):
+                                        original_params[attr_name] = attr_value
+                    # 如果 __dict__ 方法不可用，尝试使用 getattr
+                    if not original_params:
+                        # 获取参数空间中的参数
+                        param_keys = list(self.strategy_param_space.get(regime_type, {}).keys())
+                        for key in param_keys:
+                            if hasattr(original_strategy, key):
+                                try:
+                                    original_params[key] = getattr(original_strategy, key)
+                                except:
+                                    pass
+                    # 更新优化参数（覆盖原参数）
+                    original_params.update(strategy_params_dict)
+                    # 创建新策略实例
+                    strategy_class = original_strategy.__class__
+                    try:
+                        optimized_strategies[regime_type] = strategy_class(original_params)
+                    except Exception as e:
+                        if verbose:
+                            print(f"创建策略实例失败: {str(e)}, 使用原始策略")
+                        optimized_strategies[regime_type] = original_strategy
+            elif self.strategy:
+                strategy_params_dict = strategy_params.get('default', {})
+                original_params = {}
+                # 使用 __dict__ 获取实例属性
+                if hasattr(self.strategy, '__dict__'):
+                    for attr_name, attr_value in self.strategy.__dict__.items():
+                        # 排除私有属性、方法和特殊属性
+                        if not attr_name.startswith('_') and not callable(attr_value):
+                            # 只包含基本类型
+                            if isinstance(attr_value, (int, float, str, bool, list, dict, type(None), pd.Series, np.ndarray)):
+                                # 跳过pandas Series和numpy数组
+                                if not isinstance(attr_value, (pd.Series, np.ndarray)):
+                                    original_params[attr_name] = attr_value
+                # 如果 __dict__ 方法不可用，尝试使用 getattr
+                if not original_params:
+                    # 获取参数空间中的参数
+                    param_keys = list(self.strategy_param_space.get('default', {}).keys())
+                    for key in param_keys:
+                        if hasattr(self.strategy, key):
+                            try:
+                                original_params[key] = getattr(self.strategy, key)
+                            except:
+                                pass
+                # 更新优化参数（覆盖原参数）
+                original_params.update(strategy_params_dict)
+                try:
+                    optimized_strategy = self.strategy.__class__(original_params)
+                except Exception as e:
+                    if verbose:
+                        print(f"创建策略实例失败: {str(e)}, 使用原始策略")
+                    optimized_strategy = self.strategy
+            
+            # 创建ML检测器（如果需要）
+            optimized_detector = None
+            if self.market_detector and optimize_type in ['ml', 'joint']:
+                detector_params = {
+                    'model_type': self.market_detector.model_type,
+                    'train_ratio': self.market_detector.train_ratio,
+                    'label_method': self.market_detector.label_method,
+                    'smooth_window': ml_params.get('smooth_window', self.market_detector.smooth_window),
+                    'confidence_threshold': ml_params.get('confidence_threshold', self.market_detector.confidence_threshold),
+                }
+                optimized_detector = MarketRegimeMLDetector(**detector_params)
+            
+            # 创建回测系统
+            leverage = system_params.get('leverage', self.leverage)
+            position_ratio = system_params.get('position_ratio', self.position_ratio)
+            
+            if optimized_strategies:
+                backtest = BacktestSystem(
+                    strategies=optimized_strategies,
+                    initial_capital=self.initial_capital,
+                    leverage=leverage,
+                    position_ratio=position_ratio,
+                    market_detector=optimized_detector
+                )
+            elif optimized_strategy:
+                backtest = BacktestSystem(
+                    strategy=optimized_strategy,
+                    initial_capital=self.initial_capital,
+                    leverage=leverage,
+                    position_ratio=position_ratio,
+                    market_detector=optimized_detector
+                )
+            else:
+                # 如果没有策略，使用原始策略
+                if self.strategies:
+                    backtest = BacktestSystem(
+                        strategies=self.strategies,
+                        initial_capital=self.initial_capital,
+                        leverage=leverage,
+                        position_ratio=position_ratio,
+                        market_detector=optimized_detector
+                    )
+                elif self.strategy:
+                    backtest = BacktestSystem(
+                        strategy=self.strategy,
+                        initial_capital=self.initial_capital,
+                        leverage=leverage,
+                        position_ratio=position_ratio,
+                        market_detector=optimized_detector
+                    )
+                else:
+                    raise ValueError("没有可用的策略")
+            
+            backtest.data = self.data.copy()
+            
+            # 训练ML模型（如果需要）
+            if optimized_detector:
+                optimized_detector.train(backtest.data)
+            
+            # 运行回测（静默模式）
+            backtest.run_backtest(max_entries=3)
+            report = backtest.generate_report()
+            
+            # 计算得分
+            if self.objective == 'sharpe_ratio':
+                score = report.get('sharpe_ratio', 0)
+            elif self.objective == 'total_return':
+                score = report.get('total_return', 0)
+            elif self.objective == 'return_drawdown_ratio':
+                max_dd = report.get('max_drawdown_pct', 1)
+                score = report.get('total_return', 0) / max_dd if max_dd > 0 else 0
+            else:
+                score = report.get('sharpe_ratio', 0)
+            
+            evaluation_result = {
+                'params': params.copy(),
+                'score': score,
+                'total_return': report.get('total_return', 0),
+                'sharpe_ratio': report.get('sharpe_ratio', 0),
+                'max_drawdown_pct': report.get('max_drawdown_pct', 0),
+                'win_rate': report.get('win_rate', 0),
+                'total_trades': report.get('total_trades', 0),
+            }
+            
+            self.evaluation_history.append(evaluation_result)
+            
+            if verbose:
+                print(f"参数评估: 得分={score:.4f}, 收益率={report.get('total_return', 0):.2f}%, "
+                      f"夏普={report.get('sharpe_ratio', 0):.4f}")
+            
+            return evaluation_result
+            
+        except Exception as e:
+            if verbose:
+                print(f"参数评估失败: {str(e)}")
+            return {
+                'params': params.copy(),
+                'score': float('-inf'),
+                'error': str(e)
+            }
+    
+    def test_parameter_stability(self, params: Dict[str, Any], optimize_type: str = 'strategy',
+                                 perturbation_ratio: float = 0.1, num_tests: int = 5) -> Dict[str, Any]:
+        """测试参数稳定性（过拟合检测）"""
+        base_result = self.evaluate_params(params, optimize_type, verbose=False)
+        base_score = base_result['score']
+        
+        perturbed_scores = []
+        
+        # 确定参数空间
+        if optimize_type == 'strategy':
+            param_space = self.strategy_param_space
+        elif optimize_type == 'ml':
+            param_space = {'default': self.ml_param_space}
+        elif optimize_type == 'system':
+            param_space = {'default': self.system_param_space}
+        else:
+            param_space = {'default': {**self.strategy_param_space.get('default', {}), 
+                                       **self.ml_param_space, **self.system_param_space}}
+        
+        for _ in range(num_tests):
+            perturbed_params = params.copy()
+            for param_name, param_value in params.items():
+                # 找到对应的参数空间定义
+                space_def = None
+                for regime_space in param_space.values():
+                    if param_name in regime_space:
+                        space_def = regime_space[param_name]
+                        break
+                
+                if space_def:
+                    if space_def['type'] == 'int':
+                        step = max(1, int(space_def['fine_step'] * perturbation_ratio))
+                        perturbed_params[param_name] = param_value + random.randint(-step, step)
+                    else:
+                        step = space_def['fine_step'] * perturbation_ratio
+                        perturbed_params[param_name] = param_value + random.uniform(-step, step)
+            
+            result = self.evaluate_params(perturbed_params, optimize_type, verbose=False)
+            perturbed_scores.append(result['score'])
+        
+        avg_perturbed_score = np.mean(perturbed_scores) if perturbed_scores else base_score
+        score_drop_ratio = (base_score - avg_perturbed_score) / abs(base_score) if base_score != 0 else 0
+        score_std = np.std(perturbed_scores) if perturbed_scores else 0
+        score_cv = score_std / abs(avg_perturbed_score) if avg_perturbed_score != 0 else float('inf')
+        
+        is_stable = score_drop_ratio < 0.2 and score_cv < 0.3
+        
+        return {
+            'is_stable': is_stable,
+            'base_score': base_score,
+            'avg_perturbed_score': avg_perturbed_score,
+            'score_drop_ratio': score_drop_ratio,
+            'score_coefficient_of_variation': score_cv,
+        }
+    
+    def grid_search(self, optimize_type: str = 'strategy', coarse_first: bool = True,
+                   fine_search_around_best: bool = True, max_coarse_combinations: int = 100) -> Dict[str, Any]:
+        """
+        网格搜索优化（分层：粗粒度 + 细粒度）
+        
+        Args:
+            optimize_type: 优化类型 ('strategy', 'ml', 'system', 'joint')
+            coarse_first: 是否先进行粗粒度搜索
+            fine_search_around_best: 是否在最佳参数附近进行细粒度搜索
+            max_coarse_combinations: 粗粒度搜索最大组合数
+            
+        Returns:
+            优化结果
+        """
+        # 显示参数搜索空间
+        self.display_param_space(optimize_type)
+        
+        print("\n" + "=" * 80)
+        print(f"开始网格搜索优化（优化类型: {optimize_type}）")
+        print("=" * 80)
+        
+        # 确定参数空间
+        if optimize_type == 'strategy':
+            param_space = self.strategy_param_space
+        elif optimize_type == 'ml':
+            param_space = {'default': self.ml_param_space}
+        elif optimize_type == 'system':
+            param_space = {'default': self.system_param_space}
+        else:  # joint
+            # 联合优化：合并所有参数空间
+            joint_space = {}
+            # 添加策略参数（如果有多个策略，需要区分）
+            if self.strategies:
+                for regime_type, space in self.strategy_param_space.items():
+                    for param_name, space_def in space.items():
+                        full_name = f"{regime_type}_{param_name}"
+                        joint_space[full_name] = space_def
+            elif self.strategy and 'default' in self.strategy_param_space:
+                # 单策略模式，直接添加
+                joint_space.update(self.strategy_param_space['default'])
+            # 添加ML参数
+            for param_name, space_def in self.ml_param_space.items():
+                joint_space[param_name] = space_def
+            # 添加系统参数
+            for param_name, space_def in self.system_param_space.items():
+                joint_space[param_name] = space_def
+            param_space = {'default': joint_space}
+        
+        best_result = None
+        best_score = float('-inf')
+        
+        # 第一阶段：粗粒度搜索
+        if coarse_first:
+            print("\n第一阶段：粗粒度网格搜索")
+            print("-" * 80)
+            
+            # 生成所有粗粒度参数组合
+            param_names = []
+            coarse_values = []
+            for regime_type, space in param_space.items():
+                for param_name, space_def in space.items():
+                    full_name = f"{regime_type}_{param_name}" if optimize_type == 'joint' and regime_type != 'default' else param_name
+                    param_names.append(full_name)
+                    coarse_values.append(space_def['coarse'])
+            
+            coarse_combinations = list(itertools.product(*coarse_values))
+            
+            # 限制组合数量
+            if len(coarse_combinations) > max_coarse_combinations:
+                print(f"粗粒度组合数过多({len(coarse_combinations)})，随机采样{max_coarse_combinations}个")
+                coarse_combinations = random.sample(coarse_combinations, max_coarse_combinations)
+            
+            print(f"测试 {len(coarse_combinations)} 个粗粒度参数组合...")
+            
+            for i, combination in enumerate(coarse_combinations):
+                params = dict(zip(param_names, combination))
+                result = self.evaluate_params(params, optimize_type, verbose=(i % 10 == 0))
+                
+                if (i + 1) % 10 == 0 or i == len(coarse_combinations) - 1:
+                    progress_pct = 100 * (i + 1) / len(coarse_combinations)
+                    print(f"  进度: {i + 1}/{len(coarse_combinations)} ({progress_pct:.1f}%), "
+                          f"当前最佳得分: {best_score:.4f}")
+                
+                if result['score'] > best_score:
+                    best_score = result['score']
+                    best_result = result
+                    print(f"   找到更好的参数组合 #{i + 1}: 得分={best_score:.4f}")
+            
+            print(f"\n粗粒度搜索完成，最佳得分: {best_score:.4f}")
+        
+        # 第二阶段：细粒度搜索（在最佳参数附近）
+        if fine_search_around_best and best_result:
+            print("\n第二阶段：细粒度网格搜索（在最佳参数附近）")
+            print("-" * 80)
+            
+            best_params = best_result['params']
+            fine_combinations = []
+            
+            # 为每个参数生成细粒度搜索范围
+            for regime_type, space in param_space.items():
+                for param_name, space_def in space.items():
+                    full_name = f"{regime_type}_{param_name}" if optimize_type == 'joint' and regime_type != 'default' else param_name
+                    if full_name in best_params:
+                        base_value = best_params[full_name]
+                        fine_step = space_def['fine_step']
+                        
+                        if space_def['type'] == 'int':
+                            # 整数：在基础值附近生成几个值
+                            fine_values = [base_value + i * fine_step for i in range(-2, 3)]
+                            fine_values = [v for v in fine_values if v > 0]
+                        else:
+                            # 浮点：在基础值附近生成几个值
+                            fine_values = [base_value + i * fine_step for i in range(-2, 3)]
+                            fine_values = [max(0.01, v) for v in fine_values]
+                        
+                        fine_combinations.append(fine_values)
+            
+            # 生成细粒度组合（限制数量）
+            fine_product = list(itertools.product(*fine_combinations))
+            if len(fine_product) > 200:
+                fine_product = random.sample(fine_product, 200)
+            
+            print(f"测试 {len(fine_product)} 个细粒度参数组合...")
+            
+            # 重新生成param_names（只包含在best_params中的参数）
+            fine_param_names = []
+            for regime_type, space in param_space.items():
+                for param_name, space_def in space.items():
+                    full_name = f"{regime_type}_{param_name}" if optimize_type == 'joint' and regime_type != 'default' else param_name
+                    if full_name in best_params:
+                        fine_param_names.append(full_name)
+            
+            for i, combination in enumerate(fine_product):
+                params = dict(zip(fine_param_names, combination))
+                result = self.evaluate_params(params, optimize_type, verbose=(i % 20 == 0))
+                
+                if (i + 1) % 20 == 0 or i == len(fine_product) - 1:
+                    progress_pct = 100 * (i + 1) / len(fine_product)
+                    print(f"  进度: {i + 1}/{len(fine_product)} ({progress_pct:.1f}%), "
+                          f"当前最佳得分: {best_score:.4f}")
+                
+                if result['score'] > best_score:
+                    best_score = result['score']
+                    best_result = result
+                    print(f"   找到更好的参数组合 #{i + 1}: 得分={best_score:.4f}")
+            
+            print(f"\n细粒度搜索完成，最终最佳得分: {best_score:.4f}")
+        
+        # 稳定性测试
+        if self.stability_test and best_result:
+            print("\n进行参数稳定性测试（过拟合检测）...")
+            stability = self.test_parameter_stability(best_result['params'], optimize_type)
+            
+            if stability['is_stable']:
+                print(f"  参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            else:
+                print(f"  参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            
+            best_result['stability'] = stability
+        
+        self.best_params = best_result['params'] if best_result else None
+        self.best_score = best_score
+        
+        return {
+            'method': 'grid_search',
+            'optimize_type': optimize_type,
+            'best_params': best_result['params'] if best_result else None,
+            'best_score': best_score,
+            'best_result': best_result,
+            'total_evaluations': len(self.evaluation_history)
+        }
+    
+    def random_search(self, optimize_type: str = 'strategy', n_iter: int = 100) -> Dict[str, Any]:
+        """随机搜索优化"""
+        # 显示参数搜索空间
+        self.display_param_space(optimize_type)
+        
+        print("\n" + "=" * 80)
+        print(f"开始随机搜索优化（优化类型: {optimize_type}）")
+        print("=" * 80)
+        print(f"迭代次数: {n_iter}")
+        
+        # 确定参数空间
+        if optimize_type == 'strategy':
+            param_space = self.strategy_param_space
+        elif optimize_type == 'ml':
+            param_space = {'default': self.ml_param_space}
+        elif optimize_type == 'system':
+            param_space = {'default': self.system_param_space}
+        else:
+            param_space = {'default': {**self.strategy_param_space.get('default', {}), 
+                                       **self.ml_param_space, **self.system_param_space}}
+        
+        best_result = None
+        best_score = float('-inf')
+        
+        for i in range(n_iter):
+            # 随机生成参数
+            params = {}
+            for regime_type, space in param_space.items():
+                for param_name, space_def in space.items():
+                    full_name = f"{regime_type}_{param_name}" if optimize_type == 'joint' and regime_type != 'default' else param_name
+                    
+                    if space_def['type'] == 'int':
+                        base = random.choice(space_def['coarse'])
+                        step = space_def['fine_step']
+                        params[full_name] = base + random.randint(-int(step), int(step))
+                        params[full_name] = max(1, params[full_name])
+                    else:
+                        base = random.choice(space_def['coarse'])
+                        step = space_def['fine_step']
+                        params[full_name] = base + random.uniform(-step, step)
+                        params[full_name] = max(0.01, params[full_name])
+            
+            result = self.evaluate_params(params, optimize_type, verbose=(i % 10 == 0))
+            
+            if (i + 1) % 10 == 0 or i == n_iter - 1:
+                progress_pct = 100 * (i + 1) / n_iter
+                print(f"  进度: {i + 1}/{n_iter} ({progress_pct:.1f}%), 当前最佳得分: {best_score:.4f}")
+            
+            if result['score'] > best_score:
+                best_score = result['score']
+                best_result = result
+                print(f"   迭代 {i + 1}/{n_iter}: 找到更好的参数，得分={best_score:.4f}")
+        
+        # 稳定性测试
+        if self.stability_test and best_result:
+            print("\n进行参数稳定性测试（过拟合检测）...")
+            stability = self.test_parameter_stability(best_result['params'], optimize_type)
+            
+            if stability['is_stable']:
+                print(f"  参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            else:
+                print(f"  参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            
+            best_result['stability'] = stability
+        
+        self.best_params = best_result['params'] if best_result else None
+        self.best_score = best_score
+        
+        return {
+            'method': 'random_search',
+            'optimize_type': optimize_type,
+            'best_params': best_result['params'] if best_result else None,
+            'best_score': best_score,
+            'best_result': best_result,
+            'total_evaluations': len(self.evaluation_history)
+        }
+    
+    def bayesian_optimization(self, optimize_type: str = 'strategy', n_calls: int = 50) -> Dict[str, Any]:
+        """
+        贝叶斯优化
+        
+        Args:
+            optimize_type: 优化类型 ('strategy', 'ml', 'system', 'joint')
+            n_calls: 评估次数
+            
+        Returns:
+            优化结果
+        """
+        if not BAYESIAN_OPT_AVAILABLE:
+            print("错误: scikit-optimize未安装，无法使用贝叶斯优化")
+            return {'error': 'Bayesian optimization not available'}
+        
+        # 显示参数搜索空间
+        self.display_param_space(optimize_type)
+        
+        print("\n" + "=" * 80)
+        print(f"开始贝叶斯优化（优化类型: {optimize_type}）")
+        print("=" * 80)
+        print(f"评估次数: {n_calls}")
+        
+        # 确定参数空间
+        if optimize_type == 'strategy':
+            param_space = self.strategy_param_space
+        elif optimize_type == 'ml':
+            param_space = {'default': self.ml_param_space}
+        elif optimize_type == 'system':
+            param_space = {'default': self.system_param_space}
+        else:
+            param_space = {'default': {**self.strategy_param_space.get('default', {}), 
+                                       **self.ml_param_space, **self.system_param_space}}
+        
+        # 定义搜索空间
+        dimensions = []
+        param_names = []
+        for regime_type, space in param_space.items():
+            for param_name, space_def in space.items():
+                full_name = f"{regime_type}_{param_name}" if optimize_type == 'joint' and regime_type != 'default' else param_name
+                param_names.append(full_name)
+                
+                if space_def['type'] == 'int':
+                    min_val = min(space_def['coarse'])
+                    max_val = max(space_def['coarse'])
+                    dimensions.append(Integer(min_val, max_val, name=full_name))
+                else:
+                    min_val = min(space_def['coarse'])
+                    max_val = max(space_def['coarse'])
+                    dimensions.append(Real(min_val, max_val, name=full_name))
+        
+        # 定义目标函数
+        @use_named_args(dimensions=dimensions)
+        def objective(**params):
+            # 确保整数参数为整数
+            for param_name, param_value in params.items():
+                for regime_type, space in param_space.items():
+                    for space_param_name, space_def in space.items():
+                        full_name = f"{regime_type}_{space_param_name}" if optimize_type == 'joint' and regime_type != 'default' else space_param_name
+                        if full_name == param_name and space_def['type'] == 'int':
+                            params[param_name] = int(round(param_value))
+            
+            result = self.evaluate_params(params, optimize_type, verbose=False)
+            return -result['score']  # 最小化负得分（即最大化得分）
+        
+        # 执行贝叶斯优化
+        result_bo = gp_minimize(
+            func=objective,
+            dimensions=dimensions,
+            n_calls=n_calls,
+            random_state=42,
+            acq_func='EI'  # Expected Improvement
+        )
+        
+        # 提取最佳参数并确保整数参数为整数
+        best_params = {}
+        for i, param_name in enumerate(param_names):
+            param_value = result_bo.x[i]
+            # 找到对应的参数空间定义
+            for regime_type, space in param_space.items():
+                for space_param_name, space_def in space.items():
+                    full_name = f"{regime_type}_{space_param_name}" if optimize_type == 'joint' and regime_type != 'default' else space_param_name
+                    if full_name == param_name:
+                        if space_def['type'] == 'int':
+                            best_params[param_name] = int(round(param_value))
+                            # 确保在合理范围内
+                            if 'period' in param_name.lower() or 'length' in param_name.lower():
+                                best_params[param_name] = max(1, min(200, best_params[param_name]))
+                            elif 'window' in param_name.lower():
+                                best_params[param_name] = max(1, min(50, best_params[param_name]))
+                        else:
+                            best_params[param_name] = float(param_value)
+                            # 确保在合理范围内
+                            if 'threshold' in param_name.lower():
+                                best_params[param_name] = max(0.1, min(5.0, best_params[param_name]))
+                            elif 'pct' in param_name.lower() or 'ratio' in param_name.lower():
+                                best_params[param_name] = max(0.01, min(1.0, best_params[param_name]))
+                        break
+        
+        best_score = -result_bo.fun
+        
+        # 重新评估最佳参数以获取完整结果
+        best_result = self.evaluate_params(best_params, optimize_type, verbose=True)
+        
+        # 稳定性测试
+        if self.stability_test:
+            print("\n进行参数稳定性测试（过拟合检测）...")
+            stability = self.test_parameter_stability(best_params, optimize_type)
+            
+            if stability['is_stable']:
+                print(f"  参数稳定性良好 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            else:
+                print(f"  参数可能不稳定 (CV={stability['score_coefficient_of_variation']:.3f}, "
+                      f"下降比例={stability['score_drop_ratio']:.3f})")
+            
+            best_result['stability'] = stability
+        
+        self.best_params = best_params
+        self.best_score = best_score
+        
+        return {
+            'method': 'bayesian_optimization',
+            'optimize_type': optimize_type,
+            'best_params': best_params,
+            'best_score': best_score,
+            'best_result': best_result,
+            'total_evaluations': len(self.evaluation_history)
+        }
+    
+    def optimize(self, optimize_type: str = 'strategy', method: str = 'random_search', **kwargs) -> Dict[str, Any]:
+        """执行优化"""
+        if method == 'grid_search':
+            return self.grid_search(optimize_type, **kwargs)
+        elif method == 'random_search':
+            return self.random_search(optimize_type, **kwargs)
+        elif method == 'bayesian_optimization':
+            return self.bayesian_optimization(optimize_type, **kwargs)
+        else:
+            raise ValueError(f"不支持的优化方法: {method}")
+
+
 class BacktestEngine:
     """
     回测引擎
@@ -1385,7 +2396,7 @@ class BacktestSystem:
             
             # 如果置信度普遍很低，给出警告并建议调整阈值
             if self.market_confidences.mean() < 0.3:
-                print(f"\n⚠️  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
+                print(f"\n  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
                 print(f"  建议: 降低置信度阈值（当前: {self.market_detector.confidence_threshold:.2f}）或检查模型质量")
                 print(f"  系统将忽略置信度阈值，直接使用预测结果")
             
@@ -2023,7 +3034,7 @@ class BacktestSystem:
 
     def export_trades_to_csv(self, filepath: str = None):
         """
-        导出交易记录到CSV文件
+        导出交易记录到CSV文件（包含ML相关信息）
 
         Args:
             filepath: 保存路径，如果为None则自动生成
@@ -2035,10 +3046,11 @@ class BacktestSystem:
         # 准备交易记录数据
         trades_data = []
         for trade in self.engine.trades:
+            trade_idx = trade['idx']
             trade_record = {
                 '交易类型': trade['type'],
-                '时间索引': trade['idx'],
-                '时间': self.data.index[trade['idx']] if self.data is not None and trade['idx'] < len(
+                '时间索引': trade_idx,
+                '时间': self.data.index[trade_idx] if self.data is not None and trade_idx < len(
                     self.data) else 'N/A',
                 '价格': trade['price'],
                 '数量': trade['size'],
@@ -2058,6 +3070,45 @@ class BacktestSystem:
             # 权益：该笔交易后的账户总价值（余额 + 未实现盈亏）
             # 说明：如果有持仓，权益 = 余额 + 未实现盈亏；如果无持仓，权益 = 余额
             trade_record['权益'] = trade.get('equity', trade.get('balance', 0))
+            
+            # 添加ML相关信息（如果使用市场状态检测）
+            if self.use_market_regime and self.market_regimes is not None and trade_idx < len(self.market_regimes):
+                # 市场状态
+                market_regime = self.market_regimes.iloc[trade_idx] if hasattr(self.market_regimes, 'iloc') else self.market_regimes[trade_idx]
+                trade_record['市场状态'] = market_regime
+                
+                # 置信度
+                if self.market_confidences is not None and trade_idx < len(self.market_confidences):
+                    confidence = self.market_confidences.iloc[trade_idx] if hasattr(self.market_confidences, 'iloc') else self.market_confidences[trade_idx]
+                    trade_record['ML置信度'] = f"{confidence:.2%}"
+                else:
+                    trade_record['ML置信度'] = 'N/A'
+                
+                # 使用的策略（如果是多策略模式）
+                if self.strategies is not None:
+                    if market_regime == 'trending' and 'trending' in self.strategies:
+                        trade_record['使用的策略'] = self.strategies['trending'].name
+                    elif market_regime == 'ranging' and 'ranging' in self.strategies:
+                        trade_record['使用的策略'] = self.strategies['ranging'].name
+                    else:
+                        trade_record['使用的策略'] = 'N/A'
+                elif self.strategy is not None:
+                    trade_record['使用的策略'] = self.strategy.name
+                else:
+                    trade_record['使用的策略'] = 'N/A'
+            else:
+                # 不使用ML，只显示策略名称
+                if self.strategies is not None:
+                    # 多策略模式但未使用ML，显示所有策略
+                    strategy_names = ", ".join([s.name for s in self.strategies.values()])
+                    trade_record['使用的策略'] = strategy_names
+                elif self.strategy is not None:
+                    trade_record['使用的策略'] = self.strategy.name
+                else:
+                    trade_record['使用的策略'] = 'N/A'
+                
+                trade_record['市场状态'] = 'N/A'
+                trade_record['ML置信度'] = 'N/A'
 
             trades_data.append(trade_record)
 
@@ -2070,9 +3121,11 @@ class BacktestSystem:
             # 处理多策略模式
             if self.strategies is not None:
                 strategy_names = "_".join([s.name for s in self.strategies.values()])
-                filepath = f"trades_{strategy_names}_{timestamp}.csv"
+                prefix = "ML_" if self.use_market_regime else ""
+                filepath = f"trades_{prefix}{strategy_names}_{timestamp}.csv"
             elif self.strategy is not None:
-                filepath = f"trades_{self.strategy.name}_{timestamp}.csv"
+                prefix = "ML_" if self.use_market_regime else ""
+                filepath = f"trades_{prefix}{self.strategy.name}_{timestamp}.csv"
             else:
                 filepath = f"trades_ML_{timestamp}.csv"
 
@@ -2080,6 +3133,8 @@ class BacktestSystem:
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         print(f"\n交易记录已保存到: {filepath}")
         print(f"共 {len(trades_data)} 笔交易记录")
+        if self.use_market_regime:
+            print(f"包含ML信息: 市场状态、置信度、使用的策略")
 
         return filepath
 
@@ -2649,9 +3704,220 @@ def compare_with_without_ml(strategies: Dict[str, BaseStrategy], data: pd.DataFr
                     ranging_pct = backtest_ml.strategy_usage_count['ranging'] / total_usage * 100
                     print(f"  震荡策略使用: {backtest_ml.strategy_usage_count['ranging']} 次 ({ranging_pct:.1f}%)")
     
+    # 导出ML回测的交易记录
+    print("\n" + "=" * 80)
+    print("导出交易记录")
+    print("=" * 80)
+    ml_csv_path = backtest_ml.export_trades_to_csv()
+    if ml_csv_path:
+        print(f" ML回测交易记录已导出: {ml_csv_path}")
+    
+    # 导出不使用ML的回测交易记录（如果有多个策略，导出每个策略的记录）
+    if len(reports_no_ml) > 1:
+        print("\n导出不使用ML的回测交易记录:")
+        for strategy_name, backtest_no_ml in backtests_no_ml.items():
+            csv_path = backtest_no_ml.export_trades_to_csv()
+            if csv_path:
+                print(f" {strategy_name}策略交易记录已导出: {csv_path}")
+    elif len(reports_no_ml) == 1:
+        strategy_name = list(backtests_no_ml.keys())[0]
+        backtest_no_ml = backtests_no_ml[strategy_name]
+        csv_path = backtest_no_ml.export_trades_to_csv()
+        if csv_path:
+            print(f"✓ 不使用ML的回测交易记录已导出: {csv_path}")
+    
     print("=" * 80)
     
     return report_ml, reports_no_ml
+
+
+# ==================== 参数优化相关函数 ====================
+
+def select_strategy_params_to_optimize(strategy_param_space: Dict, strategy_name: str = "") -> Dict:
+    """
+    让用户选择哪些策略参数参与优化（参考cointegration_windows_RLS_5_zscore_backtest.py）
+    
+    Args:
+        strategy_param_space: 策略参数空间字典
+        strategy_name: 策略名称（用于显示）
+        
+    Returns:
+        用户选择的参数空间字典
+    """
+    if not strategy_param_space:
+        return {}
+    
+    print("\n" + "=" * 80)
+    print(f"选择策略参数参与优化{f' ({strategy_name})' if strategy_name else ''}")
+    print("=" * 80)
+    print("\n可优化的参数:")
+    
+    param_list = list(strategy_param_space.items())
+    selected_params = {}
+    
+    for i, (param_name, param_def) in enumerate(param_list, 1):
+        desc = param_def.get('description', '')
+        param_type = param_def.get('type', 'unknown')
+        coarse_values = param_def.get('coarse', [])
+        coarse_str = ', '.join([str(v) for v in coarse_values[:3]])  # 只显示前3个值
+        if len(coarse_values) > 3:
+            coarse_str += f", ... (共{len(coarse_values)}个值)"
+        
+        print(f"\n  {i}. {param_name} ({desc})")
+        print(f"     类型: {param_type}")
+        print(f"     搜索值: [{coarse_str}]")
+    
+    print(f"\n  {len(param_list) + 1}. 全选")
+    print(f"  {len(param_list) + 2}. 全不选")
+    
+    while True:
+        choice = input(f"\n请选择要优化的参数 (输入数字，多个用逗号分隔，如: 1,3,5 或 {len(param_list) + 1} 全选): ").strip()
+        
+        if not choice:
+            # 默认全选
+            return strategy_param_space
+        
+        if choice == str(len(param_list) + 1):
+            # 全选
+            print(" 已选择: 所有参数")
+            return strategy_param_space
+        elif choice == str(len(param_list) + 2):
+            # 全不选
+            print(" 已选择: 不优化任何参数")
+            return {}
+        else:
+            # 解析选择
+            try:
+                selected_indices = [int(x.strip()) for x in choice.split(',')]
+                # 验证索引范围
+                valid_indices = [idx for idx in selected_indices if 1 <= idx <= len(param_list)]
+                
+                if not valid_indices:
+                    print(f"无效选择，请输入 1-{len(param_list)} 之间的数字")
+                    continue
+                
+                # 构建选择的参数空间
+                for idx in valid_indices:
+                    param_name, param_def = param_list[idx - 1]
+                    selected_params[param_name] = param_def
+                
+                # 显示选择结果
+                selected_names = [param_list[idx - 1][0] for idx in valid_indices]
+                print(f" 已选择: {', '.join(selected_names)}")
+                return selected_params
+                
+            except ValueError:
+                print("输入格式错误，请输入数字，多个用逗号分隔")
+
+
+def select_optimize_type() -> str:
+    """
+    让用户选择优化类型
+    
+    Returns:
+        优化类型字符串 ('strategy', 'ml', 'system', 'joint', 'none')
+    """
+    print("\n" + "=" * 60)
+    print("选择参数优化类型")
+    print("=" * 60)
+    print("1. 策略参数优化（优化策略本身的参数，如RSI周期、止损止盈等）")
+    print("2. ML参数优化（优化市场状态检测器的参数，如平滑窗口、置信度阈值等）")
+    print("3. 系统参数优化（优化回测系统参数，如杠杆、仓位比例等）")
+    print("4. 联合优化（同时优化策略、ML和系统参数）")
+    print("5. 不进行参数优化")
+    
+    while True:
+        choice = input("\n请选择优化类型 (1-5, 默认5): ").strip()
+        
+        if not choice:
+            return 'none'
+        
+        if choice == '1':
+            print(" 已选择: 策略参数优化")
+            return 'strategy'
+        elif choice == '2':
+            print(" 已选择: ML参数优化")
+            return 'ml'
+        elif choice == '3':
+            print(" 已选择: 系统参数优化")
+            return 'system'
+        elif choice == '4':
+            print(" 已选择: 联合优化")
+            return 'joint'
+        elif choice == '5':
+            print(" 已选择: 不进行参数优化")
+            return 'none'
+        else:
+            print("无效选择，请输入 1-5")
+
+
+def select_optimize_method() -> str:
+    """
+    让用户选择优化方法
+    
+    Returns:
+        优化方法字符串 ('grid_search', 'random_search', 'bayesian_optimization')
+    """
+    print("\n" + "=" * 60)
+    print("选择优化方法")
+    print("=" * 60)
+    
+    available_methods = []
+    
+    available_methods.append(('1', 'grid_search', '网格搜索（分层：粗粒度+细粒度，推荐）'))
+    available_methods.append(('2', 'random_search', '随机搜索（快速，适合参数空间大）'))
+    
+    if BAYESIAN_OPT_AVAILABLE:
+        available_methods.append(('3', 'bayesian_optimization', '贝叶斯优化（智能搜索，效率高）'))
+    else:
+        print("  3. 贝叶斯优化（不可用：需要安装 scikit-optimize）")
+    
+    print("\n可用方法:")
+    for choice, method_type, description in available_methods:
+        print(f"  {choice}. {description}")
+    
+    while True:
+        user_choice = input(f"\n请选择优化方法 (1-{len(available_methods)}): ").strip()
+        
+        for choice, method_type, _ in available_methods:
+            if user_choice == choice:
+                print(f" 已选择: {method_type}")
+                return method_type
+        
+        print(f"无效选择，请输入 1-{len(available_methods)} 之间的数字")
+
+
+def select_optimize_objective() -> str:
+    """
+    让用户选择优化目标
+    
+    Returns:
+        优化目标字符串 ('sharpe_ratio', 'total_return', 'return_drawdown_ratio')
+    """
+    print("\n" + "=" * 60)
+    print("选择优化目标")
+    print("=" * 60)
+    print("1. 夏普比率（推荐，风险调整后的收益率）")
+    print("2. 总收益率（绝对收益率）")
+    print("3. 收益率/回撤比（收益率与最大回撤的比值）")
+    
+    while True:
+        choice = input("\n请选择优化目标 (1-3, 默认1): ").strip()
+        
+        if not choice:
+            return 'sharpe_ratio'
+        
+        if choice == '1':
+            print(" 已选择: 夏普比率")
+            return 'sharpe_ratio'
+        elif choice == '2':
+            print(" 已选择: 总收益率")
+            return 'total_return'
+        elif choice == '3':
+            print(" 已选择: 收益率/回撤比")
+            return 'return_drawdown_ratio'
+        else:
+            print("无效选择，请输入 1、2 或 3")
 
 
 def main():
@@ -2784,6 +4050,144 @@ def main():
         print("训练市场状态检测模型")
         print("=" * 60)
         backtest.market_detector.train(backtest.data)
+    
+    # 6.5. 参数优化（可选）
+    optimize_type = select_optimize_type()
+    if optimize_type != 'none':
+        print("\n" + "=" * 60)
+        print("参数优化")
+        print("=" * 60)
+        
+        # 选择优化方法
+        optimize_method = select_optimize_method()
+        
+        # 选择优化目标
+        optimize_objective = select_optimize_objective()
+        
+        # 创建优化器（先创建以获取参数空间）
+        print("\n创建参数优化器...")
+        print("注意: 参数空间是根据策略类型自动识别的")
+        optimizer = StrategyParameterOptimizer(
+            data=backtest.data,
+            strategies=strategies if use_ml else None,
+            strategy=strategy if not use_ml else None,
+            market_detector=backtest.market_detector if use_ml else None,
+            initial_capital=10000,
+            leverage=backtest.engine.leverage,
+            position_ratio=backtest.engine.position_ratio,
+            objective=optimize_objective,
+            stability_test=True
+        )
+        
+        # 如果优化策略参数，让用户选择哪些参数参与优化
+        if optimize_type in ['strategy', 'joint']:
+            if optimizer.strategies:
+                # 多策略模式：为每个策略选择参数
+                for regime_type, strategy in optimizer.strategies.items():
+                    strategy_name = strategy.__class__.__name__
+                    if regime_type in optimizer.strategy_param_space:
+                        original_space = optimizer.strategy_param_space[regime_type]
+                        selected_space = select_strategy_params_to_optimize(
+                            original_space, 
+                            f"{regime_type.upper()}策略: {strategy_name}"
+                        )
+                        optimizer.strategy_param_space[regime_type] = selected_space
+            elif optimizer.strategy:
+                # 单策略模式
+                strategy_name = optimizer.strategy.__class__.__name__
+                if 'default' in optimizer.strategy_param_space:
+                    original_space = optimizer.strategy_param_space['default']
+                    selected_space = select_strategy_params_to_optimize(
+                        original_space,
+                        strategy_name
+                    )
+                    optimizer.strategy_param_space['default'] = selected_space
+        
+        # 显示参数搜索空间（在优化开始前，用户选择后）
+        print("\n" + "=" * 80)
+        print("参数搜索空间预览（用户选择后）")
+        print("=" * 80)
+        optimizer.display_param_space(optimize_type)
+        
+        # 确认是否继续
+        confirm = input("\n是否继续优化? (y/n, 默认y): ").strip().lower()
+        if confirm == 'n':
+            print("已取消优化")
+        else:
+            # 执行优化
+            if optimize_method == 'random_search':
+                n_iter_input = input("随机搜索迭代次数 (默认50): ").strip()
+                n_iter = int(n_iter_input) if n_iter_input else 50
+                result = optimizer.optimize(optimize_type=optimize_type, method='random_search', n_iter=n_iter)
+            elif optimize_method == 'bayesian_optimization':
+                n_calls_input = input("贝叶斯优化评估次数 (默认30): ").strip()
+                n_calls = int(n_calls_input) if n_calls_input else 30
+                result = optimizer.optimize(optimize_type=optimize_type, method='bayesian_optimization', n_calls=n_calls)
+            else:
+                result = optimizer.optimize(optimize_type=optimize_type, method=optimize_method)
+            
+            if 'error' not in result and result.get('best_params'):
+                print("\n" + "=" * 80)
+                print("优化完成！")
+                print("=" * 80)
+                print(f"最佳得分: {result['best_score']:.4f}")
+                print(f"最佳参数:")
+                for param_name, param_value in result['best_params'].items():
+                    print(f"  {param_name}: {param_value}")
+                
+                # 询问是否使用优化后的参数
+                use_optimized = input("\n是否使用优化后的参数进行回测? (y/n, 默认y): ").strip().lower()
+                if use_optimized != 'n':
+                    # 应用优化后的参数
+                    if optimize_type in ['strategy', 'joint']:
+                        if strategies:
+                            for regime_type, original_strategy in strategies.items():
+                                strategy_params = {}
+                                param_keys = list(optimizer.strategy_param_space.get(regime_type, {}).keys())
+                                for key in param_keys:
+                                    param_key = f"{regime_type}_{key}" if optimize_type == 'joint' else key
+                                    if param_key in result['best_params']:
+                                        strategy_params[key] = result['best_params'][param_key]
+                                if strategy_params:
+                                    original_params = {}
+                                    for k in param_keys:
+                                        if hasattr(original_strategy, k):
+                                            original_params[k] = getattr(original_strategy, k)
+                                    original_params.update(strategy_params)
+                                    strategies[regime_type] = original_strategy.__class__(original_params)
+                        elif strategy:
+                            strategy_params = {}
+                            param_keys = list(optimizer.strategy_param_space.get('default', {}).keys())
+                            for key in param_keys:
+                                if key in result['best_params']:
+                                    strategy_params[key] = result['best_params'][key]
+                            if strategy_params:
+                                original_params = {}
+                                for k in param_keys:
+                                    if hasattr(strategy, k):
+                                        original_params[k] = getattr(strategy, k)
+                                original_params.update(strategy_params)
+                                strategy = strategy.__class__(original_params)
+                    
+                    if optimize_type in ['ml', 'joint'] and backtest.market_detector:
+                        ml_params = {}
+                        for key in optimizer.ml_param_space.keys():
+                            if key in result['best_params']:
+                                ml_params[key] = result['best_params'][key]
+                        if ml_params:
+                            backtest.market_detector.smooth_window = ml_params.get('smooth_window', backtest.market_detector.smooth_window)
+                            backtest.market_detector.confidence_threshold = ml_params.get('confidence_threshold', backtest.market_detector.confidence_threshold)
+                    
+                    if optimize_type in ['system', 'joint']:
+                        if 'leverage' in result['best_params']:
+                            backtest.engine.leverage = result['best_params']['leverage']
+                        if 'position_ratio' in result['best_params']:
+                            backtest.engine.position_ratio = result['best_params']['position_ratio']
+                            backtest.engine.available_capital = backtest.engine.initial_capital * backtest.engine.position_ratio
+                    
+                    print("✓ 已应用优化后的参数")
+            else:
+                print("\n优化失败或未找到最佳参数")
     
     # 7. 运行回测
     print("\n" + "=" * 60)

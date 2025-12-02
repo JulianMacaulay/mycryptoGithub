@@ -43,9 +43,9 @@ class MartingaleStrategy(BaseStrategy):
         self.max_multiplier = params.get('max_multiplier', 8.0)
         self.ma_short = params.get('ma_short', 10)
         self.ma_long = params.get('ma_long', 20)
-        self.use_trend_filter = params.get('use_trend_filter', True)
-        self.stop_loss_pct = params.get('stop_loss_pct', 0.05)
-        self.take_profit_pct = params.get('take_profit_pct', 0.10)
+        self.use_trend_filter = params.get('use_trend_filter', False)
+        self.stop_loss_pct = params.get('stop_loss_pct', 0.01)
+        self.take_profit_pct = params.get('take_profit_pct', 0.01)
         
         # 策略状态
         self.current_multiplier = 1.0  # 当前仓位倍数
@@ -237,4 +237,5 @@ class MartingaleStrategy(BaseStrategy):
         """
         # 马丁策略通常不在持仓中加仓，而是通过倍数调整下次开仓
         return None
+
 

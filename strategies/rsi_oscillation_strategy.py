@@ -11,7 +11,7 @@ from .base_strategy import BaseStrategy
 # 尝试导入talib，如果失败则使用自定义函数
 try:
     import talib
-    TALIB_AVAILABLE = T
+    TALIB_AVAILABLE = False
 except ImportError:
     TALIB_AVAILABLE = False
 
@@ -272,4 +272,5 @@ class RSIOscillationStrategy(BaseStrategy):
         # RSI震荡策略可以在这里记录交易结果，用于后续优化
         # 目前不需要特殊处理，但方法必须存在以兼容回测系统
         pass
+
 
