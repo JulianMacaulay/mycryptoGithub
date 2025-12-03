@@ -299,7 +299,7 @@ class MarketRegimeMLDetector:
         future_cumulative_return = abs(close.shift(-lookahead) / close - 1)
         
         # 方法2：计算未来N期的价格波动（低波动=趋势，高波动=震荡）
-        future_volatility = close.rolling(window=lookahead).std().shift(-lookahead) / close
+        # future_volatility = close.rolling(window=lookahead).std().shift(-lookahead) / close
         
         # 方法3：计算未来N期的价格方向一致性
         future_returns = close.pct_change().shift(-lookahead)
@@ -312,13 +312,13 @@ class MarketRegimeMLDetector:
         
         return_threshold = 0.02  # 未来5期累计收益率阈值（2%）
         direction_threshold = 0.015  # 方向一致性阈值
-        volatility_threshold = 0.03  # 波动率阈值（相对价格）
+        # volatility_threshold = 0.03  # 波动率阈值（相对价格）
         
         # 趋势市场：收益率大 且 方向一致 且 波动率不太高
         is_trending = (
             (future_cumulative_return > return_threshold) &
-            (future_directional_strength > direction_threshold) &
-            (future_volatility < volatility_threshold)
+            (future_directional_strength > direction_threshold)
+            # (future_volatility < volatility_threshold)
         )
         
         labels = is_trending.astype(int)
