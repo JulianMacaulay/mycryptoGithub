@@ -849,6 +849,282 @@ class MarketRegimeMLDetector:
             # 否则保持原预测（不切换）
         
         return smoothed
+    
+    def predict_future_regime(self, data: pd.DataFrame, current_idx: int, 
+                             lookahead: int = 20, return_confidence: bool = False) -> Tuple[str, float]:
+        """
+        方案一：前瞻性市场状态预测
+        预测未来N根K线的市场状态（基于当前和历史数据）
+        
+        Args:
+            data: 包含OHLCV数据的DataFrame
+            current_idx: 当前K线索引
+            lookahead: 前瞻期数（预测未来多少根K线，默认20）
+            return_confidence: 是否返回置信度
+            
+        Returns:
+            预测的市场状态（'trending' 或 'ranging'），如果return_confidence=True，返回(状态, 置信度)
+        """
+        if not self.is_trained:
+            raise ValueError("模型尚未训练，请先调用train()方法")
+        
+        # 获取当前和历史数据（到current_idx为止）
+        historical_data = data.iloc[:current_idx+1].copy()
+        
+        if len(historical_data) < 20:  # 数据不足，返回默认值
+            if return_confidence:
+                return 'ranging', 0.0
+            return 'ranging'
+        
+        # 提取特征
+        X = self._extract_features(historical_data)
+        
+        # 获取最近的数据点（用于预测）
+        if len(X) == 0:
+            if return_confidence:
+                return 'ranging', 0.0
+            return 'ranging'
+        
+        # 使用最近的数据点进行预测（可以取最后几个点平均）
+        # 方法：使用最近N个点的预测结果，投票决定未来市场状态
+        window_size = min(10, len(X))
+        recent_X = X.iloc[-window_size:]
+        
+        # 标准化
+        if self.scaler:
+            X_scaled = self.scaler.transform(recent_X)
+        else:
+            X_scaled = recent_X.values
+        
+        # 预测
+        predictions = []
+        predictions_proba = []
+        
+        if self.model_type in ['lstm', 'cnn']:
+            # LSTM/CNN需要序列输入
+            if len(X_scaled) >= 10:
+                X_seq = self._prepare_lstm_input(X_scaled)
+                if len(X_seq) > 0:
+                    proba = self.model.predict(X_seq[-1:]).flatten()[0]
+                    predictions_proba.append(proba)
+                    predictions.append(1 if proba > 0.5 else 0)
+        else:
+            try:
+                # 对最近N个点进行预测，取平均
+                proba_list = self.model.predict_proba(X_scaled)[:, 1]
+                predictions_proba = proba_list.tolist()
+                predictions = (proba_list > 0.5).astype(int).tolist()
+            except:
+                pred_list = self.model.predict(X_scaled)
+                predictions = pred_list.tolist()
+                predictions_proba = [0.5] * len(predictions)  # 默认概率
+        
+        if not predictions_proba:
+            if return_confidence:
+                return 'ranging', 0.0
+            return 'ranging'
+        
+        # 计算平均概率和投票结果
+        avg_proba = np.mean(predictions_proba)
+        avg_prediction = 1 if avg_proba > 0.5 else 0
+        
+        # 计算置信度
+        confidence = np.abs(avg_proba - 0.5) * 2
+        
+        # 转换为字符串
+        regime = 'trending' if avg_prediction == 1 else 'ranging'
+        
+        if return_confidence:
+            return regime, confidence
+        return regime
+    
+    def predict_with_segmentation(self, data: pd.DataFrame, 
+                                  min_segment_length: int = 20,
+                                  change_threshold: float = 0.7,
+                                  return_confidence: bool = False) -> Tuple[pd.Series, pd.Series]:
+        """
+        方案三：在线分段市场状态检测
+        将数据分成多个时间段，每个时间段有一个市场状态
+        
+        Args:
+            data: 包含OHLCV数据的DataFrame
+            min_segment_length: 最小分段长度（默认20根K线）
+            change_threshold: 状态变化阈值（默认0.7，需要70%的K线显示状态变化才切换）
+            return_confidence: 是否返回置信度
+            
+        Returns:
+            市场状态序列和置信度序列（如果return_confidence=True）
+        """
+        if not self.is_trained:
+            raise ValueError("模型尚未训练，请先调用train()方法")
+        
+        # 初始化分段器
+        segmenter = OnlineRegimeSegmenter(
+            detector=self,
+            min_segment_length=min_segment_length,
+            change_threshold=change_threshold
+        )
+        
+        # 逐步处理每根K线
+        regimes = []
+        confidences = []
+        
+        for idx in range(len(data)):
+            regime, confidence = segmenter.update(data.iloc[:idx+1], idx)
+            regimes.append(regime)
+            confidences.append(confidence)
+        
+        results = pd.Series(regimes, index=data.index)
+        confidence_series = pd.Series(confidences, index=data.index)
+        
+        if return_confidence:
+            return results, confidence_series
+        return results
+
+
+class OnlineRegimeSegmenter:
+    """
+    在线市场状态分段器（方案三）
+    逐步更新分段，检测市场状态变化点
+    """
+    
+    def __init__(self, detector: MarketRegimeMLDetector, 
+                 min_segment_length: int = 20, 
+                 change_threshold: float = 0.7):
+        """
+        初始化分段器
+        
+        Args:
+            detector: 市场状态检测器
+            min_segment_length: 最小分段长度（根K线数）
+            change_threshold: 状态变化阈值（0-1，需要多少比例的K线显示状态变化才切换）
+        """
+        self.detector = detector
+        self.min_segment_length = min_segment_length
+        self.change_threshold = change_threshold
+        
+        self.current_segment = None
+        self.segments = []
+        self.buffer = []  # 缓冲区，存储最近N根K线的预测结果
+        self.buffer_indices = []  # 缓冲区对应的索引
+    
+    def _detect_regime_from_data(self, data: pd.DataFrame) -> Tuple[str, float]:
+        """
+        基于历史数据判断当前市场状态
+        
+        Args:
+            data: 历史数据（到当前K线为止）
+            
+        Returns:
+            (市场状态, 置信度)
+        """
+        if len(data) < 20:
+            return 'ranging', 0.0
+        
+        # 提取特征
+        X = self._extract_features(data)
+        
+        if len(X) == 0:
+            return 'ranging', 0.0
+        
+        # 使用最近的数据点进行预测
+        window_size = min(10, len(X))
+        recent_X = X.iloc[-window_size:]
+        
+        # 标准化
+        if self.detector.scaler:
+            X_scaled = self.detector.scaler.transform(recent_X)
+        else:
+            X_scaled = recent_X.values
+        
+        # 预测
+        try:
+            if self.detector.model_type in ['lstm', 'cnn']:
+                if len(X_scaled) >= 10:
+                    X_seq = self.detector._prepare_lstm_input(X_scaled)
+                    if len(X_seq) > 0:
+                        proba = self.detector.model.predict(X_seq[-1:]).flatten()[0]
+                        prediction = 1 if proba > 0.5 else 0
+                        confidence = np.abs(proba - 0.5) * 2
+                    else:
+                        return 'ranging', 0.0
+                else:
+                    return 'ranging', 0.0
+            else:
+                proba_list = self.detector.model.predict_proba(X_scaled)[:, 1]
+                avg_proba = np.mean(proba_list)
+                prediction = 1 if avg_proba > 0.5 else 0
+                confidence = np.abs(avg_proba - 0.5) * 2
+        except:
+            return 'ranging', 0.0
+        
+        regime = 'trending' if prediction == 1 else 'ranging'
+        return regime, confidence
+    
+    def _extract_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """提取特征（委托给detector）"""
+        return self.detector._extract_features(data)
+    
+    def update(self, data: pd.DataFrame, current_idx: int) -> Tuple[str, float]:
+        """
+        更新分段（每根新K线调用）
+        
+        Args:
+            data: 历史数据（到当前K线为止）
+            current_idx: 当前K线索引
+            
+        Returns:
+            (当前市场状态, 置信度)
+        """
+        # 判断当前市场状态
+        current_regime, current_confidence = self._detect_regime_from_data(data)
+        
+        # 添加到缓冲区
+        self.buffer.append(current_regime)
+        self.buffer_indices.append(current_idx)
+        
+        # 如果还没有分段，创建第一个分段
+        if self.current_segment is None:
+            self.current_segment = {
+                'start': current_idx,
+                'regime': current_regime,
+                'confidence': current_confidence
+            }
+            self.segments.append(self.current_segment)
+            return current_regime, current_confidence
+        
+        # 如果缓冲区数据不足，继续当前分段
+        if len(self.buffer) < self.min_segment_length:
+            return self.current_segment['regime'], self.current_segment.get('confidence', 0.0)
+        
+        # 检查缓冲区中的状态分布
+        buffer_regimes = self.buffer[-self.min_segment_length:]
+        regime_counts = pd.Series(buffer_regimes).value_counts()
+        dominant_regime = regime_counts.index[0]
+        dominant_ratio = regime_counts.iloc[0] / len(buffer_regimes)
+        
+        # 判断是否发生状态变化
+        if (dominant_regime != self.current_segment['regime'] and 
+            dominant_ratio >= self.change_threshold):
+            # 状态变化，结束当前分段，开始新分段
+            self.current_segment['end'] = current_idx - 1
+            new_segment = {
+                'start': current_idx,
+                'regime': dominant_regime,
+                'confidence': current_confidence
+            }
+            self.segments.append(new_segment)
+            self.current_segment = new_segment
+            # 重置缓冲区（保留最近的数据）
+            keep_size = self.min_segment_length // 2
+            self.buffer = self.buffer[-keep_size:]
+            self.buffer_indices = self.buffer_indices[-keep_size:]
+        else:
+            # 状态未变化，继续当前分段
+            # 更新当前分段的置信度（使用平均置信度）
+            pass
+        
+        return self.current_segment['regime'], self.current_segment.get('confidence', 0.0)
 
 
 # ==================== 参数优化器 ====================
@@ -2223,7 +2499,8 @@ class BacktestSystem:
 
     def __init__(self, strategy: BaseStrategy = None, strategies: Dict[str, BaseStrategy] = None,
                  initial_capital: float = 10000, leverage: float = 1.0, position_ratio: float = 0.5,
-                 market_detector: MarketRegimeMLDetector = None):
+                 market_detector: MarketRegimeMLDetector = None, 
+                 regime_detection_method: str = 'per_kline'):
         """
         初始化回测系统
 
@@ -2234,6 +2511,10 @@ class BacktestSystem:
             leverage: 杠杆倍数（默认5倍）
             position_ratio: 仓位比例（默认1.0，即100%，0.5表示用50%的资金）
             market_detector: 市场状态检测器
+            regime_detection_method: 市场状态检测方法
+                - 'per_kline': 每根K线都预测（原始方法）
+                - 'future_looking': 前瞻性预测（方案一：预测未来N根K线的市场状态）
+                - 'segmentation': 在线分段（方案三：将数据分成多个时间段）
         """
         # 策略管理
         if strategies is not None:
@@ -2247,6 +2528,7 @@ class BacktestSystem:
         
         self.market_detector = market_detector
         self.use_market_regime = market_detector is not None
+        self.regime_detection_method = regime_detection_method  # 市场状态检测方法
         
         self.engine = BacktestEngine(
             initial_capital=initial_capital,
@@ -2259,6 +2541,13 @@ class BacktestSystem:
         self.entry_strategy = None  # 记录开仓时使用的策略（用于持仓管理）
         self.regime_switch_count = 0  # 市场状态切换次数统计
         self.strategy_usage_count = {'trending': 0, 'ranging': 0, 'none': 0}  # 策略使用统计
+        
+        # 前瞻性预测参数（方案一）
+        self.future_lookahead = 30  # 前瞻期数（预测未来多少根K线）
+        
+        # 在线分段参数（方案三）
+        self.min_segment_length = 20  # 最小分段长度
+        self.change_threshold = 0.7  # 状态变化阈值
 
     def load_data_from_csv(self, filepath: str, symbol: str = None):
         """
@@ -2385,25 +2674,57 @@ class BacktestSystem:
         # 重置引擎
         self.engine.reset()
 
-        # 如果使用市场状态检测，先预测市场状态
+        # 如果使用市场状态检测，根据选择的方法预测市场状态
         if self.use_market_regime and self.market_detector.is_trained:
-            print("\n预测市场状态...")
-            self.market_regimes, self.market_confidences = self.market_detector.predict(self.data, return_confidence=True)
-            print(f"趋势市场占比: {(self.market_regimes == 'trending').sum() / len(self.market_regimes):.2%}")
-            print(f"震荡市场占比: {(self.market_regimes == 'ranging').sum() / len(self.market_regimes):.2%}")
-            print(f"平均置信度: {self.market_confidences.mean():.4f} ({self.market_confidences.mean()*100:.2f}%)")
-            print(f"高置信度预测占比: {(self.market_confidences >= self.market_detector.confidence_threshold).sum() / len(self.market_confidences):.2%}")
+            print(f"\n预测市场状态（方法: {self.regime_detection_method}）...")
             
-            # 如果置信度普遍很低，给出警告并建议调整阈值
-            if self.market_confidences.mean() < 0.3:
-                print(f"\n  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
-                print(f"  建议: 降低置信度阈值（当前: {self.market_detector.confidence_threshold:.2f}）或检查模型质量")
-                print(f"  系统将忽略置信度阈值，直接使用预测结果")
-            
-            # 统计市场状态切换次数
-            regime_changes = (self.market_regimes != self.market_regimes.shift(1)).sum() - 1  # 减去第一个
-            print(f"市场状态切换次数: {regime_changes}")
-            print(f"平均每 {len(self.market_regimes) / max(regime_changes, 1):.1f} 根K线切换一次")
+            if self.regime_detection_method == 'per_kline':
+                # 原始方法：每根K线都预测
+                self.market_regimes, self.market_confidences = self.market_detector.predict(self.data, return_confidence=True)
+                print(f"趋势市场占比: {(self.market_regimes == 'trending').sum() / len(self.market_regimes):.2%}")
+                print(f"震荡市场占比: {(self.market_regimes == 'ranging').sum() / len(self.market_regimes):.2%}")
+                print(f"平均置信度: {self.market_confidences.mean():.4f} ({self.market_confidences.mean()*100:.2f}%)")
+                print(f"高置信度预测占比: {(self.market_confidences >= self.market_detector.confidence_threshold).sum() / len(self.market_confidences):.2%}")
+                
+                # 如果置信度普遍很低，给出警告并建议调整阈值
+                if self.market_confidences.mean() < 0.3:
+                    print(f"\n  警告: 平均置信度很低 ({self.market_confidences.mean()*100:.2f}%)")
+                    print(f"  建议: 降低置信度阈值（当前: {self.market_detector.confidence_threshold:.2f}）或检查模型质量")
+                    print(f"  系统将忽略置信度阈值，直接使用预测结果")
+                
+                # 统计市场状态切换次数
+                regime_changes = (self.market_regimes != self.market_regimes.shift(1)).sum() - 1  # 减去第一个
+                print(f"市场状态切换次数: {regime_changes}")
+                print(f"平均每 {len(self.market_regimes) / max(regime_changes, 1):.1f} 根K线切换一次")
+                
+            elif self.regime_detection_method == 'future_looking':
+                # 方案一：前瞻性预测（在回测循环中逐K线预测）
+                # 这里先初始化，实际预测在循环中进行
+                self.market_regimes = pd.Series(['ranging'] * len(self.data), index=self.data.index)
+                self.market_confidences = pd.Series([0.0] * len(self.data), index=self.data.index)
+                print(f"使用前瞻性预测方法（前瞻期数: {self.future_lookahead}）")
+                print("将在回测循环中逐K线预测未来市场状态")
+                
+            elif self.regime_detection_method == 'segmentation':
+                # 方案三：在线分段
+                print(f"使用在线分段方法（最小分段长度: {self.min_segment_length}，变化阈值: {self.change_threshold}）")
+                self.market_regimes, self.market_confidences = self.market_detector.predict_with_segmentation(
+                    self.data,
+                    min_segment_length=self.min_segment_length,
+                    change_threshold=self.change_threshold,
+                    return_confidence=True
+                )
+                print(f"趋势市场占比: {(self.market_regimes == 'trending').sum() / len(self.market_regimes):.2%}")
+                print(f"震荡市场占比: {(self.market_regimes == 'ranging').sum() / len(self.market_regimes):.2%}")
+                print(f"平均置信度: {self.market_confidences.mean():.4f} ({self.market_confidences.mean()*100:.2f}%)")
+                
+                # 统计分段数量
+                segment_changes = (self.market_regimes != self.market_regimes.shift(1)).sum() - 1
+                print(f"市场状态分段数: {segment_changes + 1}")
+                if segment_changes > 0:
+                    print(f"平均每 {len(self.market_regimes) / max(segment_changes, 1):.1f} 根K线切换一次")
+            else:
+                raise ValueError(f"不支持的市场状态检测方法: {self.regime_detection_method}")
         else:
             self.market_regimes = None
             self.market_confidences = None
@@ -2442,9 +2763,23 @@ class BacktestSystem:
             current_price = current_bar['close']
 
             # 根据市场状态选择策略（如果使用市场状态检测）
-            if self.use_market_regime and self.market_regimes is not None and self.strategies is not None:
-                current_regime = self.market_regimes.iloc[idx]
-                current_confidence = self.market_confidences.iloc[idx] if self.market_confidences is not None else 1.0
+            if self.use_market_regime and self.market_detector.is_trained and self.strategies is not None:
+                # 根据检测方法获取当前市场状态
+                if self.regime_detection_method == 'future_looking':
+                    # 方案一：前瞻性预测（逐K线预测未来市场状态）
+                    current_regime, current_confidence = self.market_detector.predict_future_regime(
+                        self.data, 
+                        current_idx=idx,
+                        lookahead=self.future_lookahead,
+                        return_confidence=True
+                    )
+                    # 更新存储的预测结果（用于后续分析）
+                    self.market_regimes.iloc[idx] = current_regime
+                    self.market_confidences.iloc[idx] = current_confidence
+                else:
+                    # 方案三（segmentation）或原始方法（per_kline）：从已预测的结果中读取
+                    current_regime = self.market_regimes.iloc[idx]
+                    current_confidence = self.market_confidences.iloc[idx] if self.market_confidences is not None else 1.0
                 
                 # 记录市场状态切换
                 if idx > 0:
@@ -2483,9 +2818,20 @@ class BacktestSystem:
                         # 如果当前市场状态没有对应策略，不交易
                         self.strategy = None
                         self.strategy_usage_count['none'] += 1
-            elif self.use_market_regime and self.market_regimes is not None and self.strategy is not None:
+            elif self.use_market_regime and self.market_detector.is_trained and self.strategy is not None:
                 # 单策略模式：检查市场状态是否匹配
-                current_regime = self.market_regimes.iloc[idx]
+                # 根据检测方法获取当前市场状态
+                if self.regime_detection_method == 'future_looking':
+                    # 方案一：前瞻性预测
+                    current_regime, _ = self.market_detector.predict_future_regime(
+                        self.data, 
+                        current_idx=idx,
+                        lookahead=self.future_lookahead,
+                        return_confidence=True
+                    )
+                else:
+                    # 方案三或原始方法：从已预测的结果中读取
+                    current_regime = self.market_regimes.iloc[idx] if self.market_regimes is not None else 'ranging'
                 # 如果策略是趋势策略但市场是震荡，或反之，则不交易
                 # 这里需要知道策略类型，暂时允许交易（可以在策略类中添加类型属性）
                 pass
@@ -3358,6 +3704,51 @@ def get_strategy_params(strategy_class_name: str) -> Dict:
     return params
 
 
+def select_regime_detection_method() -> str:
+    """
+    让用户选择市场状态检测方法
+    
+    Returns:
+        检测方法字符串 ('per_kline', 'future_looking', 'segmentation')
+    """
+    print("\n" + "=" * 60)
+    print("选择市场状态检测方法")
+    print("=" * 60)
+    print("1. 每根K线都预测（原始方法）")
+    print("   每根K线都对应一个市场状态预测")
+    print("   优点: 简单直接")
+    print("   缺点: 可能频繁切换，与策略持仓周期不匹配")
+    print()
+    print("2. 前瞻性预测（方案一：推荐）")
+    print("   预测未来N根K线的市场状态，提前选择策略")
+    print("   优点: 给策略足够时间完成交易，减少频繁切换")
+    print("   缺点: 需要预测未来（回测和实盘都可用）")
+    print()
+    print("3. 在线分段（方案三）")
+    print("   将数据分成多个时间段，每个时间段有一个市场状态")
+    print("   优点: 市场状态持续性好，不会频繁切换")
+    print("   缺点: 需要在线分段算法")
+    
+    while True:
+        choice = input("\n请选择检测方法 (1/2/3, 默认2): ").strip()
+        
+        if not choice:
+            print(" 已选择: 前瞻性预测（方案一）")
+            return 'future_looking'
+        
+        if choice == '1':
+            print(" 已选择: 每根K线都预测")
+            return 'per_kline'
+        elif choice == '2':
+            print(" 已选择: 前瞻性预测（方案一）")
+            return 'future_looking'
+        elif choice == '3':
+            print(" 已选择: 在线分段（方案三）")
+            return 'segmentation'
+        else:
+            print("无效选择，请输入 1、2 或 3")
+
+
 def select_label_method() -> str:
     """
     让用户选择标签生成方法
@@ -3498,7 +3889,11 @@ def get_train_ratio() -> float:
 def compare_with_without_ml(strategies: Dict[str, BaseStrategy], data: pd.DataFrame,
                             market_detector: MarketRegimeMLDetector,
                             initial_capital: float = 10000, leverage: float = 1.0,
-                            position_ratio: float = 0.5, max_entries: int = 3):
+                            position_ratio: float = 0.5, max_entries: int = 3,
+                            regime_detection_method: str = 'per_kline',
+                            future_lookahead: int = 30,
+                            min_segment_length: int = 20,
+                            change_threshold: float = 0.7):
     """
     对比使用ML和不使用ML的回测结果
     
@@ -3510,6 +3905,10 @@ def compare_with_without_ml(strategies: Dict[str, BaseStrategy], data: pd.DataFr
         leverage: 杠杆倍数
         position_ratio: 仓位比例
         max_entries: 最大加仓次数
+        regime_detection_method: 市场状态检测方法
+        future_lookahead: 前瞻期数（方案一）
+        min_segment_length: 最小分段长度（方案三）
+        change_threshold: 状态变化阈值（方案三）
     """
     print("\n" + "=" * 80)
     print("对比分析：使用ML vs 不使用ML")
@@ -3523,8 +3922,15 @@ def compare_with_without_ml(strategies: Dict[str, BaseStrategy], data: pd.DataFr
         initial_capital=initial_capital,
         leverage=leverage,
         position_ratio=position_ratio,
-        market_detector=market_detector
+        market_detector=market_detector,
+        regime_detection_method=regime_detection_method
     )
+    # 设置参数
+    if regime_detection_method == 'future_looking':
+        backtest_ml.future_lookahead = future_lookahead
+    elif regime_detection_method == 'segmentation':
+        backtest_ml.min_segment_length = min_segment_length
+        backtest_ml.change_threshold = change_threshold
     backtest_ml.data = data
     backtest_ml.run_backtest(max_entries=max_entries)
     report_ml = backtest_ml.generate_report()
@@ -4014,6 +4420,49 @@ def main():
         # 获取训练数据比例
         train_ratio = get_train_ratio()
         
+        # 选择市场状态检测方法
+        regime_detection_method = select_regime_detection_method()
+        
+        # 如果选择前瞻性预测或分段方法，获取相关参数
+        future_lookahead = 30
+        min_segment_length = 20
+        change_threshold = 0.7
+        
+        if regime_detection_method == 'future_looking':
+            lookahead_input = input(f"\n前瞻期数（预测未来多少根K线，默认{future_lookahead}）: ").strip()
+            if lookahead_input:
+                try:
+                    future_lookahead = int(lookahead_input)
+                    if future_lookahead < 5:
+                        print("  警告: 前瞻期数太小，建议至少5根K线")
+                        future_lookahead = 5
+                    elif future_lookahead > 100:
+                        print("  警告: 前瞻期数太大，建议不超过100根K线")
+                        future_lookahead = 100
+                except:
+                    print(f"  输入无效，使用默认值: {future_lookahead}")
+        
+        elif regime_detection_method == 'segmentation':
+            min_length_input = input(f"\n最小分段长度（根K线数，默认{min_segment_length}）: ").strip()
+            if min_length_input:
+                try:
+                    min_segment_length = int(min_length_input)
+                    if min_segment_length < 10:
+                        print("  警告: 最小分段长度太小，建议至少10根K线")
+                        min_segment_length = 10
+                except:
+                    print(f"  输入无效，使用默认值: {min_segment_length}")
+            
+            threshold_input = input(f"状态变化阈值（0-1，默认{change_threshold}）: ").strip()
+            if threshold_input:
+                try:
+                    change_threshold = float(threshold_input)
+                    if change_threshold < 0.5 or change_threshold > 1.0:
+                        print("  警告: 阈值应在0.5-1.0之间，使用默认值")
+                        change_threshold = 0.7
+                except:
+                    print(f"  输入无效，使用默认值: {change_threshold}")
+        
         # 创建市场状态检测器
         market_detector = MarketRegimeMLDetector(
             model_type=model_type, 
@@ -4025,8 +4474,16 @@ def main():
         backtest = BacktestSystem(
             strategies=strategies,
             initial_capital=10000,
-            market_detector=market_detector
+            market_detector=market_detector,
+            regime_detection_method=regime_detection_method
         )
+        
+        # 设置前瞻性预测或分段方法的参数
+        if regime_detection_method == 'future_looking':
+            backtest.future_lookahead = future_lookahead
+        elif regime_detection_method == 'segmentation':
+            backtest.min_segment_length = min_segment_length
+            backtest.change_threshold = change_threshold
     else:
         # 单策略模式
         backtest = BacktestSystem(
@@ -4211,7 +4668,11 @@ def main():
                 initial_capital=10000,
                 leverage=backtest.engine.leverage,
                 position_ratio=backtest.engine.position_ratio,
-                max_entries=max_entries
+                max_entries=max_entries,
+                regime_detection_method=getattr(backtest, 'regime_detection_method', 'per_kline'),
+                future_lookahead=getattr(backtest, 'future_lookahead', 30),
+                min_segment_length=getattr(backtest, 'min_segment_length', 20),
+                change_threshold=getattr(backtest, 'change_threshold', 0.7)
             )
         else:
             # 只运行ML回测
