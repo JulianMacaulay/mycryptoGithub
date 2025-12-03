@@ -1314,7 +1314,7 @@ def input_preselected_pairs(data, default_diff_order=0):
             }
 
             selected_pairs.append(pair_info)
-            print(f"  ✓ 已添加 {pair_info['pair_name']}，对冲比率 {hedge_ratio:.6f}，价差类型 {'原始' if pair_diff_order == 0 else '一阶差分'}")
+            print(f"   已添加 {pair_info['pair_name']}，对冲比率 {hedge_ratio:.6f}，价差类型 {'原始' if pair_diff_order == 0 else '一阶差分'}")
 
     print(f"\n共选择 {len(selected_pairs)} 个币对用于后续回测/优化。")
     for pair in selected_pairs:
@@ -3024,7 +3024,7 @@ class AdvancedCointegrationTrading:
             print(f"  初始资金: {initial_capital:,.2f}")
             print(f"  投入资金: {initial_invested_capital:,.2f} (初始资金 × 仓位比例)")
             print(f"  最终资金: {capital:,.2f}")
-            print(f"  总收益率: {final_return:.2f}%")
+            print(f"  超额收益率: {final_return:.2f}%")
             print(f"  总交易次数: {total_trades / 2}")
             print(f"  盈利交易: {profitable_trades}")
             print(f"  胜率: {profitable_trades / (total_trades / 2) * 100:.1f}%" if total_trades > 0 else "  胜率: 0%")
@@ -3359,7 +3359,8 @@ class ParameterOptimizer:
     def __init__(self, data, selected_pairs, initial_capital=10000,
                  objective='sharpe_ratio', stability_test=True, z_score_strategy=None,
                  cointegration_window_size=500, diff_order=0, use_rls=True,
-                 cointegration_check_interval=500, data_period_minutes=60):
+                 cointegration_check_interval=500, data_period_minutes=60,
+                 optimize_zscore_params=True, optimize_rls_params=True):
         """
         初始化参数优化器
 
@@ -3369,12 +3370,14 @@ class ParameterOptimizer:
             initial_capital: 初始资金
             objective: 优化目标 ('sharpe_ratio', 'return', 'return_drawdown_ratio')
             stability_test: 是否进行稳定性测试（过拟合检测）
-            z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例）
+            z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例），如果为None则使用传统策略
             cointegration_window_size: 协整检验窗口大小（与初始筛选的window_size一致，默认500）
             diff_order: 价差类型，0=原始价差，1=一阶差分价差
             use_rls: 是否使用RLS动态更新对冲比率（默认True）
             cointegration_check_interval: 协整检验间隔（数据条数，使用窗口大小）
             data_period_minutes: 数据周期（分钟，用于显示，默认60）
+            optimize_zscore_params: 是否优化Z-score策略参数（默认True）
+            optimize_rls_params: 是否优化RLS参数（默认True）
         """
         self.data = data
         self.selected_pairs = selected_pairs
@@ -3386,8 +3389,19 @@ class ParameterOptimizer:
         self.use_rls = use_rls
         self.cointegration_check_interval = cointegration_check_interval
         self.data_period_minutes = data_period_minutes
+        self.optimize_zscore_params = optimize_zscore_params
+        self.optimize_rls_params = optimize_rls_params
 
-        # 定义参数搜索空间（注意：z_score_strategy不在优化范围内，需要单独设置）
+        # 设置Z-score策略（用于确定策略类型，实际参数会在优化中动态创建）
+        if z_score_strategy is not None:
+            self.z_score_strategy_type = type(z_score_strategy).__name__
+            self.base_z_score_strategy = z_score_strategy  # 保存基础策略对象用于获取默认参数
+        else:
+            # 默认使用传统策略
+            self.base_z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+            self.z_score_strategy_type = 'TraditionalZScoreStrategy' if STRATEGIES_AVAILABLE else None
+
+        # 定义基础参数搜索空间
         self.param_space = {
             'lookback_period': {'type': 'int', 'coarse': [30, 60, 90, 120], 'fine_step': 10},
             'z_threshold': {'type': 'float', 'coarse': [1.0, 1.5, 2.0, 2.5, 3.0], 'fine_step': 0.1},
@@ -3399,17 +3413,69 @@ class ParameterOptimizer:
             # 'leverage': {'type': 'int', 'coarse': [1, 3, 5, 10], 'fine_step': 1}
         }
 
+        # 根据策略类型添加Z-score策略参数
+        if optimize_zscore_params and self.z_score_strategy_type:
+            self._add_zscore_strategy_params()
+
+        # 根据是否使用RLS添加RLS参数
+        if optimize_rls_params and use_rls:
+            self._add_rls_params()
+
         # 存储所有评估结果
         self.evaluation_history = []
         self.best_params = None
         self.best_score = float('-inf')
 
-        # 设置Z-score策略
-        if z_score_strategy is not None:
-            self.z_score_strategy = z_score_strategy
-        else:
-            # 默认使用传统策略
-            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+    def _add_zscore_strategy_params(self):
+        """根据策略类型添加Z-score策略参数到搜索空间"""
+        strategy_type = self.z_score_strategy_type
+
+        if strategy_type == 'ArimaGarchZScoreStrategy':
+            # ARIMA-GARCH参数
+            self.param_space['arima_p'] = {'type': 'int', 'coarse': [0, 1, 2], 'fine_step': 1}
+            
+            # 根据diff_order设置arima_d的搜索空间
+            # 如果diff_order=0（原始价差），arima_d可以是0或1（让ARIMA决定是否需要差分）
+            # 如果diff_order=1（一阶差分价差），arima_d必须为0（因为序列已经差分过了）
+            if self.diff_order == 0:
+                # 原始价差：允许ARIMA自己决定是否需要差分
+                self.param_space['arima_d'] = {'type': 'int', 'coarse': [0, 1], 'fine_step': 1}
+            else:
+                # 一阶差分价差：ARIMA的d必须为0（序列已经差分过了）
+                self.param_space['arima_d'] = {'type': 'int', 'coarse': [0], 'fine_step': 1}
+            
+            self.param_space['arima_q'] = {'type': 'int', 'coarse': [0, 1, 2], 'fine_step': 1}
+            self.param_space['garch_p'] = {'type': 'int', 'coarse': [1, 2], 'fine_step': 1}
+            self.param_space['garch_q'] = {'type': 'int', 'coarse': [1, 2], 'fine_step': 1}
+
+        elif strategy_type == 'EcmZScoreStrategy':
+            # ECM参数
+            self.param_space['ecm_lag'] = {'type': 'int', 'coarse': [1, 2, 3], 'fine_step': 1}
+            self.param_space['ecm_min_data_length'] = {'type': 'int', 'coarse': [20, 30, 40, 50], 'fine_step': 5}
+
+        elif strategy_type == 'KalmanFilterZScoreStrategy':
+            # Kalman Filter参数
+            self.param_space['kalman_process_variance'] = {'type': 'float', 'coarse': [0.005, 0.01, 0.02, 0.05], 'fine_step': 0.005}
+            self.param_space['kalman_observation_variance'] = {'type': 'float', 'coarse': [0.05, 0.1, 0.2, 0.5], 'fine_step': 0.05}
+            self.param_space['kalman_min_data_length'] = {'type': 'int', 'coarse': [20, 30, 40], 'fine_step': 5}
+
+        elif strategy_type == 'CopulaDccGarchZScoreStrategy':
+            # Copula + DCC-GARCH参数
+            self.param_space['copula_garch_p'] = {'type': 'int', 'coarse': [1, 2], 'fine_step': 1}
+            self.param_space['copula_garch_q'] = {'type': 'int', 'coarse': [1, 2], 'fine_step': 1}
+            self.param_space['copula_type'] = {'type': 'categorical', 'coarse': ['gaussian', 'student'], 'fine_step': None}
+            self.param_space['copula_min_data_length'] = {'type': 'int', 'coarse': [40, 50, 60], 'fine_step': 5}
+
+        elif strategy_type == 'RegimeSwitchingZScoreStrategy':
+            # Regime-Switching参数
+            self.param_space['regime_n_regimes'] = {'type': 'int', 'coarse': [2, 3], 'fine_step': 1}
+            self.param_space['regime_min_data_length'] = {'type': 'int', 'coarse': [40, 50, 60], 'fine_step': 5}
+            self.param_space['regime_smoothing'] = {'type': 'categorical', 'coarse': [True, False], 'fine_step': None}
+
+    def _add_rls_params(self):
+        """添加RLS参数到搜索空间"""
+        self.param_space['rls_lambda'] = {'type': 'float', 'coarse': [0.95, 0.97, 0.99, 0.995], 'fine_step': 0.01}
+        self.param_space['rls_max_change_rate'] = {'type': 'float', 'coarse': [0.1, 0.15, 0.2, 0.25, 0.3], 'fine_step': 0.05}
 
     def set_z_score_strategy(self, z_score_strategy):
         """设置Z-score计算策略"""
@@ -3419,12 +3485,92 @@ class ParameterOptimizer:
         """设置是否使用ARIMA-GARCH（向后兼容方法）"""
         if use_arima_garch and STRATEGIES_AVAILABLE and ARIMA_AVAILABLE and GARCH_AVAILABLE:
             try:
-                self.z_score_strategy = ArimaGarchZScoreStrategy()
+                self.base_z_score_strategy = ArimaGarchZScoreStrategy()
+                self.z_score_strategy_type = 'ArimaGarchZScoreStrategy'
             except Exception as e:
                 print(f"警告: ARIMA-GARCH策略初始化失败: {str(e)}，使用传统策略")
-                self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+                self.base_z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+                self.z_score_strategy_type = 'TraditionalZScoreStrategy' if STRATEGIES_AVAILABLE else None
         else:
-            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+            self.base_z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+            self.z_score_strategy_type = 'TraditionalZScoreStrategy' if STRATEGIES_AVAILABLE else None
+
+    def _create_zscore_strategy_from_params(self, params: Dict[str, Any], verbose: bool = False):
+        """
+        根据参数创建Z-score策略实例
+
+        Args:
+            params: 参数字典
+            verbose: 是否打印详细信息
+
+        Returns:
+            BaseZScoreStrategy: 策略实例
+        """
+        if not self.optimize_zscore_params or not self.z_score_strategy_type:
+            # 如果不优化策略参数，使用基础策略
+            return self.base_z_score_strategy
+
+        strategy_type = self.z_score_strategy_type
+
+        try:
+            if strategy_type == 'ArimaGarchZScoreStrategy':
+                arima_order = (
+                    params.get('arima_p', 1),
+                    params.get('arima_d', 0),
+                    params.get('arima_q', 1)
+                )
+                garch_order = (
+                    params.get('garch_p', 1),
+                    params.get('garch_q', 1)
+                )
+                return ArimaGarchZScoreStrategy(arima_order=arima_order, garch_order=garch_order)
+
+            elif strategy_type == 'EcmZScoreStrategy':
+                ecm_lag = params.get('ecm_lag', 1)
+                min_data_length = params.get('ecm_min_data_length', 30)
+                return EcmZScoreStrategy(ecm_lag=ecm_lag, min_data_length=min_data_length)
+
+            elif strategy_type == 'KalmanFilterZScoreStrategy':
+                process_variance = params.get('kalman_process_variance', 0.01)
+                observation_variance = params.get('kalman_observation_variance', 0.1)
+                min_data_length = params.get('kalman_min_data_length', 30)
+                return KalmanFilterZScoreStrategy(
+                    process_variance=process_variance,
+                    observation_variance=observation_variance,
+                    min_data_length=min_data_length
+                )
+
+            elif strategy_type == 'CopulaDccGarchZScoreStrategy':
+                garch_order = (
+                    params.get('copula_garch_p', 1),
+                    params.get('copula_garch_q', 1)
+                )
+                copula_type = params.get('copula_type', 'gaussian')
+                min_data_length = params.get('copula_min_data_length', 50)
+                return CopulaDccGarchZScoreStrategy(
+                    garch_order=garch_order,
+                    copula_type=copula_type,
+                    min_data_length=min_data_length
+                )
+
+            elif strategy_type == 'RegimeSwitchingZScoreStrategy':
+                n_regimes = params.get('regime_n_regimes', 2)
+                min_data_length = params.get('regime_min_data_length', 50)
+                smoothing = params.get('regime_smoothing', True)
+                return RegimeSwitchingZScoreStrategy(
+                    n_regimes=n_regimes,
+                    min_data_length=min_data_length,
+                    smoothing=smoothing
+                )
+
+            else:
+                # 传统策略或其他未知策略，使用基础策略
+                return self.base_z_score_strategy
+
+        except Exception as e:
+            if verbose:
+                print(f"警告: 创建策略实例失败: {str(e)}，使用基础策略")
+            return self.base_z_score_strategy
 
     def evaluate_params(self, params: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
         """
@@ -3438,7 +3584,15 @@ class ParameterOptimizer:
             评估结果字典
         """
         try:
-            # 创建策略实例（使用策略对象）
+            # 根据参数创建Z-score策略实例
+            z_score_strategy = self._create_zscore_strategy_from_params(params, verbose)
+            
+            # 获取RLS参数
+            rls_lambda = params.get('rls_lambda', 0.99) if self.optimize_rls_params else 0.99
+            rls_max_change_rate = params.get('rls_max_change_rate', 0.2) if self.optimize_rls_params else 0.2
+            use_rls = params.get('use_rls', self.use_rls) if 'use_rls' in self.param_space else self.use_rls
+
+            # 创建策略实例（使用动态创建的策略对象）
             strategy = AdvancedCointegrationTrading(
                 lookback_period=params['lookback_period'],
                 z_threshold=params['z_threshold'],
@@ -3449,10 +3603,12 @@ class ParameterOptimizer:
                 position_ratio=params.get('position_ratio', 0.5),
                 leverage=params.get('leverage', 5),
                 trading_fee_rate=params.get('trading_fee_rate', 0.000275),
-                z_score_strategy=self.z_score_strategy,  # 使用策略对象
+                z_score_strategy=z_score_strategy,  # 使用动态创建的策略对象
                 cointegration_window_size=self.cointegration_window_size,  # 传递窗口大小
                 diff_order=self.diff_order,  # 传递价差类型
-                use_rls=self.use_rls,  # 传递RLS选择
+                use_rls=use_rls,  # 传递RLS选择
+                rls_lambda=rls_lambda,  # 传递RLS遗忘因子
+                rls_max_change_rate=rls_max_change_rate,  # 传递RLS最大变化率
                 cointegration_check_interval=self.cointegration_check_interval,  # 传递协整检验间隔
                 data_period_minutes=self.data_period_minutes  # 传递数据周期
             )
@@ -3543,7 +3699,13 @@ class ParameterOptimizer:
             for param_name, param_value in params.items():
                 if param_name in self.param_space:
                     space_def = self.param_space[param_name]
-                    if space_def['type'] == 'int':
+                    if space_def['type'] == 'categorical':
+                        # 分类参数：随机选择其他可能值
+                        possible_values = space_def['coarse']
+                        if len(possible_values) > 1:
+                            perturbed_params[param_name] = random.choice([v for v in possible_values if v != param_value])
+                        # 如果只有一个值，保持不变
+                    elif space_def['type'] == 'int':
                         # 整数参数：扰动步长
                         step = max(1, int(space_def['fine_step'] * perturbation_ratio))
                         perturbed_params[param_name] = param_value + random.randint(-step, step)
@@ -3554,6 +3716,19 @@ class ParameterOptimizer:
                             perturbed_params[param_name] = max(24, min(720, perturbed_params[param_name]))
                         elif param_name == 'leverage':
                             perturbed_params[param_name] = max(1, min(20, perturbed_params[param_name]))
+                        elif param_name == 'arima_d':
+                            # 根据diff_order限制arima_d
+                            if self.diff_order == 1:
+                                perturbed_params[param_name] = 0  # 一阶差分价差时，arima_d必须为0
+                            else:
+                                perturbed_params[param_name] = max(0, min(1, perturbed_params[param_name]))  # 原始价差时，d最多为1
+                        elif param_name in ['arima_p', 'arima_q', 'garch_p', 'garch_q', 
+                                             'copula_garch_p', 'copula_garch_q']:
+                            perturbed_params[param_name] = max(0, min(3, perturbed_params[param_name]))
+                        elif param_name in ['ecm_lag', 'regime_n_regimes']:
+                            perturbed_params[param_name] = max(1, min(5, perturbed_params[param_name]))
+                        elif param_name.endswith('_min_data_length'):
+                            perturbed_params[param_name] = max(10, min(100, perturbed_params[param_name]))
                     else:
                         # 浮点参数：按比例扰动
                         step = space_def['fine_step'] * perturbation_ratio
@@ -3563,6 +3738,12 @@ class ParameterOptimizer:
                             perturbed_params[param_name] = max(0.1, min(5.0, perturbed_params[param_name]))
                         elif param_name in ['take_profit_pct', 'stop_loss_pct', 'position_ratio']:
                             perturbed_params[param_name] = max(0.01, min(1.0, perturbed_params[param_name]))
+                        elif param_name == 'rls_lambda':
+                            perturbed_params[param_name] = max(0.9, min(1.0, perturbed_params[param_name]))
+                        elif param_name == 'rls_max_change_rate':
+                            perturbed_params[param_name] = max(0.05, min(0.5, perturbed_params[param_name]))
+                        elif param_name in ['kalman_process_variance', 'kalman_observation_variance']:
+                            perturbed_params[param_name] = max(0.001, min(1.0, perturbed_params[param_name]))
 
             # 评估扰动参数
             perturbed_result = self.evaluate_params(perturbed_params, verbose=False)
@@ -3612,8 +3793,12 @@ class ParameterOptimizer:
         """
         print("\n" + "=" * 80)
         print("开始网格搜索优化")
-        if self.z_score_strategy:
-            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
+        if self.base_z_score_strategy:
+            print(f"（使用策略: {self.base_z_score_strategy.get_strategy_description()}）")
+        if self.optimize_zscore_params:
+            print(f"（优化Z-score策略参数: 是）")
+        if self.optimize_rls_params and self.use_rls:
+            print(f"（优化RLS参数: 是）")
         print("=" * 80)
 
         best_result = None
@@ -3626,7 +3811,14 @@ class ParameterOptimizer:
 
             # 生成所有粗粒度参数组合
             param_names = list(self.param_space.keys())
-            coarse_values = [self.param_space[name]['coarse'] for name in param_names]
+            coarse_values = []
+            for name in param_names:
+                space_def = self.param_space[name]
+                if space_def['type'] == 'categorical':
+                    # 分类参数：直接使用所有可能值
+                    coarse_values.append(space_def['coarse'])
+                else:
+                    coarse_values.append(space_def['coarse'])
             coarse_combinations = list(itertools.product(*coarse_values))
 
             # 限制组合数量
@@ -3664,14 +3856,25 @@ class ParameterOptimizer:
             for param_name in param_names:
                 space_def = self.param_space[param_name]
                 base_value = best_params[param_name]
-                fine_step = space_def['fine_step']
 
-                if space_def['type'] == 'int':
+                if space_def['type'] == 'categorical':
+                    # 分类参数：保持当前值（或使用所有可能值）
+                    fine_values = [base_value]
+                elif space_def['type'] == 'int':
                     # 整数：在基础值附近生成几个值
-                    fine_values = [base_value + i * fine_step for i in range(-2, 3)]
-                    fine_values = [v for v in fine_values if v > 0]
+                    # 特殊情况：如果arima_d且diff_order=1，只能为0
+                    if param_name == 'arima_d' and self.diff_order == 1:
+                        fine_values = [0]  # 一阶差分价差时，arima_d必须为0
+                    else:
+                        fine_step = space_def['fine_step']
+                        fine_values = [base_value + i * fine_step for i in range(-2, 3)]
+                        fine_values = [v for v in fine_values if v > 0]
+                        # 对于arima_d，确保不超过合理范围
+                        if param_name == 'arima_d' and self.diff_order == 0:
+                            fine_values = [v for v in fine_values if v <= 1]  # 原始价差时，d最多为1
                 else:
                     # 浮点：在基础值附近生成几个值
+                    fine_step = space_def['fine_step']
                     fine_values = [base_value + i * fine_step for i in range(-2, 3)]
                     fine_values = [max(0.01, v) for v in fine_values]
 
@@ -3736,8 +3939,8 @@ class ParameterOptimizer:
         """
         print("\n" + "=" * 80)
         print("开始随机搜索优化")
-        if self.z_score_strategy:
-            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
+        if self.base_z_score_strategy:
+            print(f"（使用策略: {self.base_z_score_strategy.get_strategy_description()}）")
         print("=" * 80)
         print(f"迭代次数: {n_iter}")
 
@@ -3748,7 +3951,10 @@ class ParameterOptimizer:
             # 随机生成参数
             params = {}
             for param_name, space_def in self.param_space.items():
-                if space_def['type'] == 'int':
+                if space_def['type'] == 'categorical':
+                    # 分类参数：从可能值中随机选择
+                    params[param_name] = random.choice(space_def['coarse'])
+                elif space_def['type'] == 'int':
                     # 整数：从粗粒度范围中随机选择，然后添加随机扰动
                     base = random.choice(space_def['coarse'])
                     step = space_def['fine_step']
@@ -3760,6 +3966,19 @@ class ParameterOptimizer:
                         params[param_name] = max(24, min(720, params[param_name]))
                     elif param_name == 'leverage':
                         params[param_name] = max(1, min(20, params[param_name]))
+                    elif param_name == 'arima_d':
+                        # 根据diff_order限制arima_d
+                        if self.diff_order == 1:
+                            params[param_name] = 0  # 一阶差分价差时，arima_d必须为0
+                        else:
+                            params[param_name] = max(0, min(1, params[param_name]))  # 原始价差时，d最多为1
+                    elif param_name in ['arima_p', 'arima_q', 'garch_p', 'garch_q', 
+                                         'copula_garch_p', 'copula_garch_q']:
+                        params[param_name] = max(0, min(3, params[param_name]))
+                    elif param_name in ['ecm_lag', 'regime_n_regimes']:
+                        params[param_name] = max(1, min(5, params[param_name]))
+                    elif param_name.endswith('_min_data_length'):
+                        params[param_name] = max(10, min(100, params[param_name]))
                 else:
                     # 浮点：从粗粒度范围中随机选择，然后添加随机扰动
                     base = random.choice(space_def['coarse'])
@@ -3770,6 +3989,12 @@ class ParameterOptimizer:
                         params[param_name] = max(0.1, min(5.0, params[param_name]))
                     elif param_name in ['take_profit_pct', 'stop_loss_pct', 'position_ratio']:
                         params[param_name] = max(0.01, min(1.0, params[param_name]))
+                    elif param_name == 'rls_lambda':
+                        params[param_name] = max(0.9, min(1.0, params[param_name]))
+                    elif param_name == 'rls_max_change_rate':
+                        params[param_name] = max(0.05, min(0.5, params[param_name]))
+                    elif param_name in ['kalman_process_variance', 'kalman_observation_variance']:
+                        params[param_name] = max(0.001, min(1.0, params[param_name]))
 
             result = self.evaluate_params(params, verbose=(i % 10 == 0))
 
@@ -3823,29 +4048,37 @@ class ParameterOptimizer:
 
         print("\n" + "=" * 80)
         print("开始贝叶斯优化")
-        if self.z_score_strategy:
-            print(f"（使用策略: {self.z_score_strategy.get_strategy_description()}）")
+        if self.base_z_score_strategy:
+            print(f"（使用策略: {self.base_z_score_strategy.get_strategy_description()}）")
         print("=" * 80)
         print(f"评估次数: {n_calls}")
 
-        # 定义搜索空间
+        # 定义搜索空间（跳过categorical类型参数，使用默认值）
         dimensions = []
-        param_names = list(self.param_space.keys())
+        param_names = []
+        categorical_params = {}
 
-        for param_name in param_names:
-            space_def = self.param_space[param_name]
-            if space_def['type'] == 'int':
-                min_val = min(space_def['coarse'])
-                max_val = max(space_def['coarse'])
-                dimensions.append(Integer(min_val, max_val, name=param_name))
+        for param_name, space_def in self.param_space.items():
+            if space_def['type'] == 'categorical':
+                # 分类参数：使用第一个值作为默认值（在优化中保持不变）
+                categorical_params[param_name] = space_def['coarse'][0]
             else:
-                min_val = min(space_def['coarse'])
-                max_val = max(space_def['coarse'])
-                dimensions.append(Real(min_val, max_val, name=param_name))
+                param_names.append(param_name)
+                if space_def['type'] == 'int':
+                    min_val = min(space_def['coarse'])
+                    max_val = max(space_def['coarse'])
+                    dimensions.append(Integer(min_val, max_val, name=param_name))
+                else:
+                    min_val = min(space_def['coarse'])
+                    max_val = max(space_def['coarse'])
+                    dimensions.append(Real(min_val, max_val, name=param_name))
 
         # 定义目标函数
         @use_named_args(dimensions=dimensions)
         def objective(**params):
+            # 添加categorical参数
+            params.update(categorical_params)
+            
             # 确保整数参数为整数
             for param_name, param_value in params.items():
                 if param_name in self.param_space:
@@ -3866,7 +4099,7 @@ class ParameterOptimizer:
         )
 
         # 提取最佳参数并确保整数参数为整数
-        best_params = {}
+        best_params = categorical_params.copy()  # 先添加categorical参数
         for i, param_name in enumerate(param_names):
             param_value = result_bo.x[i]
             space_def = self.param_space[param_name]
@@ -3880,8 +4113,28 @@ class ParameterOptimizer:
                     best_params[param_name] = max(24, min(720, best_params[param_name]))
                 elif param_name == 'leverage':
                     best_params[param_name] = max(1, min(20, best_params[param_name]))
+                elif param_name == 'arima_d':
+                    # 根据diff_order限制arima_d
+                    if self.diff_order == 1:
+                        best_params[param_name] = 0  # 一阶差分价差时，arima_d必须为0
+                    else:
+                        best_params[param_name] = max(0, min(1, best_params[param_name]))  # 原始价差时，d最多为1
+                elif param_name in ['arima_p', 'arima_q', 'garch_p', 'garch_q', 
+                                     'copula_garch_p', 'copula_garch_q']:
+                    best_params[param_name] = max(0, min(3, best_params[param_name]))
+                elif param_name in ['ecm_lag', 'regime_n_regimes']:
+                    best_params[param_name] = max(1, min(5, best_params[param_name]))
+                elif param_name.endswith('_min_data_length'):
+                    best_params[param_name] = max(10, min(100, best_params[param_name]))
             else:
                 best_params[param_name] = float(param_value)
+                # 确保在合理范围内
+                if param_name == 'rls_lambda':
+                    best_params[param_name] = max(0.9, min(1.0, best_params[param_name]))
+                elif param_name == 'rls_max_change_rate':
+                    best_params[param_name] = max(0.05, min(0.5, best_params[param_name]))
+                elif param_name in ['kalman_process_variance', 'kalman_observation_variance']:
+                    best_params[param_name] = max(0.001, min(1.0, best_params[param_name]))
                 # 确保在合理范围内
                 if param_name in ['z_threshold', 'z_exit_threshold']:
                     best_params[param_name] = max(0.1, min(5.0, best_params[param_name]))
