@@ -4,6 +4,9 @@
 1. [系统概述](#系统概述)
 2. [程序运行流程](#程序运行流程)
 3. [机器学习市场状态检测详解](#机器学习市场状态检测详解)
+   - [市场状态检测方法选择](#3-市场状态检测方法选择)
+     - [方案一：前瞻性市场状态预测](#32-方案一前瞻性市场状态预测)
+     - [方案三：在线分段市场状态检测](#33-方案三在线分段市场状态检测)
 4. [根据市场状态选择策略的逻辑](#根据市场状态选择策略的逻辑)
 5. [参数优化系统详解](#参数优化系统详解)
 6. [机器学习信号在回测中的应用](#机器学习信号在回测中的应用)
@@ -349,6 +352,281 @@ def _smooth_predictions(self, predictions, confidences):
 - `smooth_window`：平滑窗口大小（默认5），窗口越大，切换越不频繁
 - `confidence_threshold`：置信度阈值（默认0.6），只有置信度>=阈值的预测才参与投票
 - 切换条件：需要20%的优势才切换（`trending_votes > ranging_votes * 1.2`）
+
+### 3. 市场状态检测方法选择
+
+系统支持三种市场状态检测方法，用户可以在运行时选择：
+
+#### 3.1 方法对比
+
+| 方法 | 检测方式 | 优点 | 缺点 | 适用场景 |
+|------|---------|------|------|---------|
+| **每根K线都预测**（原始方法） | 对每根K线单独预测市场状态 | 简单直接，响应快速 | 可能频繁切换，与策略持仓周期不匹配 | 适合短期交易，对市场变化敏感的场景 |
+| **前瞻性预测**（方案一） | 预测未来N根K线的市场状态 | 提前判断，给策略足够时间完成交易 | 需要预测未来（回测和实盘都可用） | **推荐使用**，适合大多数场景 |
+| **在线分段**（方案三） | 将数据分成多个时间段，每个时间段有一个市场状态 | 市场状态持续性好，不会频繁切换 | 需要在线分段算法，实现较复杂 | 适合长期持仓，追求稳定性的场景 |
+
+#### 3.2 方案一：前瞻性市场状态预测
+
+**核心思想**：
+- 市场状态（趋势/震荡）是**时间段的概念**，不是时间点的概念
+- 趋势通常持续一段时间（如几十到上百根K线）
+- 不应该每根K线都判断，而应该**预测未来一段时间**的市场状态
+
+**工作原理**：
+
+1. **预测时机**：在每根K线时，基于当前和历史数据，预测未来N根K线的市场状态
+2. **预测方法**：使用训练好的ML模型，基于当前K线及历史K线的特征，预测未来市场状态
+3. **策略选择**：根据预测的未来市场状态，提前选择相应的策略
+
+**代码实现**：
+
+```python
+def predict_future_regime(self, data: pd.DataFrame, current_idx: int, 
+                         lookahead: int = 20, return_confidence: bool = False):
+    """
+    方案一：前瞻性市场状态预测
+    预测未来N根K线的市场状态（基于当前和历史数据）
+    
+    Args:
+        data: 包含OHLCV数据的DataFrame
+        current_idx: 当前K线索引
+        lookahead: 前瞻期数（预测未来多少根K线，默认20）
+        return_confidence: 是否返回置信度
+    """
+    # 1. 获取当前和历史数据（到current_idx为止）
+    historical_data = data.iloc[:current_idx+1].copy()
+    
+    # 2. 提取特征
+    X = self._extract_features(historical_data)
+    
+    # 3. 使用最近N个数据点进行预测（取平均）
+    window_size = min(10, len(X))
+    recent_X = X.iloc[-window_size:]
+    
+    # 4. 标准化和预测
+    X_scaled = self.scaler.transform(recent_X)
+    predictions_proba = self.model.predict_proba(X_scaled)[:, 1]
+    
+    # 5. 计算平均概率和置信度
+    avg_proba = np.mean(predictions_proba)
+    confidence = np.abs(avg_proba - 0.5) * 2
+    
+    # 6. 转换为市场状态
+    regime = 'trending' if avg_proba > 0.5 else 'ranging'
+    
+    return regime, confidence
+```
+
+**在回测循环中的应用**：
+
+```python
+# 遍历每个K线
+for idx in range(len(self.data)):
+    # 方案一：前瞻性预测（逐K线预测未来市场状态）
+    if self.regime_detection_method == 'future_looking':
+        current_regime, current_confidence = self.market_detector.predict_future_regime(
+            self.data, 
+            current_idx=idx,
+            lookahead=self.future_lookahead,  # 默认20根K线
+            return_confidence=True
+        )
+    
+    # 根据预测的市场状态选择策略
+    if current_regime == 'trending':
+        self.strategy = self.strategies['trending']
+    else:
+        self.strategy = self.strategies['ranging']
+```
+
+**参数说明**：
+- `lookahead`（前瞻期数）：预测未来多少根K线的市场状态
+  - 默认值：20根K线
+  - 建议范围：5-100根K线
+  - 太小（<5）：预测时间太短，可能频繁切换
+  - 太大（>100）：预测时间太长，可能滞后于市场变化
+
+**优势**：
+1. **提前判断**：在策略需要开仓之前，就已经知道未来市场状态，可以提前选择策略
+2. **给策略时间**：策略有足够的时间完成交易（开仓、持仓、平仓），不会因为市场状态频繁切换而中断
+3. **实盘可用**：不需要未来数据，只需要模型预测能力，回测和实盘逻辑一致
+
+**示例场景**：
+```
+K线1: 预测未来20根K线是趋势 → 使用趋势策略
+K线2: 预测未来20根K线是趋势 → 继续使用趋势策略（开仓）
+K线3: 预测未来20根K线是趋势 → 继续使用趋势策略（持仓中）
+...
+K线20: 预测未来20根K线是震荡 → 切换到震荡策略（但趋势策略的持仓继续管理）
+```
+
+#### 3.3 方案三：在线分段市场状态检测
+
+**核心思想**：
+- 将整个数据集分成多个**时间段（Segment）**
+- 每个时间段有一个**持续的市场状态**（趋势或震荡）
+- 只有当检测到明显的状态变化时，才切换到新的时间段
+
+**工作原理**：
+
+1. **分段初始化**：从第一根K线开始，创建第一个时间段
+2. **状态检测**：每根新K线到来时，判断当前市场状态
+3. **变化检测**：如果连续N根K线（最小分段长度）显示状态变化，且变化比例超过阈值，则结束当前分段，开始新分段
+4. **状态持续**：在同一个时间段内，市场状态保持不变
+
+**代码实现**：
+
+```python
+class OnlineRegimeSegmenter:
+    """
+    在线市场状态分段器（方案三）
+    逐步更新分段，检测市场状态变化点
+    """
+    
+    def __init__(self, detector, min_segment_length=20, change_threshold=0.7):
+        """
+        Args:
+            detector: 市场状态检测器
+            min_segment_length: 最小分段长度（根K线数）
+            change_threshold: 状态变化阈值（0-1，需要多少比例的K线显示状态变化才切换）
+        """
+        self.detector = detector
+        self.min_segment_length = min_segment_length
+        self.change_threshold = change_threshold
+        
+        self.current_segment = None  # 当前分段
+        self.segments = []  # 所有分段
+        self.buffer = []  # 缓冲区，存储最近N根K线的预测结果
+    
+    def update(self, data: pd.DataFrame, current_idx: int):
+        """
+        更新分段（每根新K线调用）
+        
+        Args:
+            data: 历史数据（到当前K线为止）
+            current_idx: 当前K线索引
+        """
+        # 1. 判断当前市场状态
+        current_regime, current_confidence = self._detect_regime_from_data(data)
+        
+        # 2. 添加到缓冲区
+        self.buffer.append(current_regime)
+        
+        # 3. 如果还没有分段，创建第一个分段
+        if self.current_segment is None:
+            self.current_segment = {
+                'start': current_idx,
+                'regime': current_regime,
+                'confidence': current_confidence
+            }
+            self.segments.append(self.current_segment)
+            return current_regime, current_confidence
+        
+        # 4. 如果缓冲区数据不足，继续当前分段
+        if len(self.buffer) < self.min_segment_length:
+            return self.current_segment['regime'], self.current_segment.get('confidence', 0.0)
+        
+        # 5. 检查缓冲区中的状态分布
+        buffer_regimes = self.buffer[-self.min_segment_length:]
+        regime_counts = pd.Series(buffer_regimes).value_counts()
+        dominant_regime = regime_counts.index[0]  # 占主导地位的市场状态
+        dominant_ratio = regime_counts.iloc[0] / len(buffer_regimes)  # 主导状态的比例
+        
+        # 6. 判断是否发生状态变化
+        if (dominant_regime != self.current_segment['regime'] and 
+            dominant_ratio >= self.change_threshold):
+            # 状态变化，结束当前分段，开始新分段
+            self.current_segment['end'] = current_idx - 1
+            new_segment = {
+                'start': current_idx,
+                'regime': dominant_regime,
+                'confidence': current_confidence
+            }
+            self.segments.append(new_segment)
+            self.current_segment = new_segment
+            # 重置缓冲区（保留最近的数据）
+            keep_size = self.min_segment_length // 2
+            self.buffer = self.buffer[-keep_size:]
+        else:
+            # 状态未变化，继续当前分段
+            pass
+        
+        return self.current_segment['regime'], self.current_segment.get('confidence', 0.0)
+```
+
+**在回测中的应用**：
+
+```python
+# 回测开始前，对整个数据集进行分段
+if self.regime_detection_method == 'segmentation':
+    self.market_regimes, self.market_confidences = self.market_detector.predict_with_segmentation(
+        self.data,
+        min_segment_length=self.min_segment_length,  # 默认20根K线
+        change_threshold=self.change_threshold,  # 默认0.7
+        return_confidence=True
+    )
+
+# 回测循环中，从已分段的结果中读取
+for idx in range(len(self.data)):
+    # 方案三：从已分段的结果中读取
+    current_regime = self.market_regimes.iloc[idx]
+    current_confidence = self.market_confidences.iloc[idx]
+    
+    # 根据分段的市场状态选择策略
+    if current_regime == 'trending':
+        self.strategy = self.strategies['trending']
+    else:
+        self.strategy = self.strategies['ranging']
+```
+
+**参数说明**：
+
+1. **`min_segment_length`（最小分段长度）**：
+   - 默认值：20根K线
+   - 作用：确保每个分段至少有N根K线，避免分段过短
+   - 建议范围：10-50根K线
+   - 太小（<10）：分段过短，可能频繁切换
+   - 太大（>50）：分段过长，可能滞后于市场变化
+
+2. **`change_threshold`（状态变化阈值）**：
+   - 默认值：0.7（70%）
+   - 作用：需要多少比例的K线显示状态变化，才认为发生了真正的状态切换
+   - 建议范围：0.5-1.0
+   - 太小（<0.5）：容易切换，可能产生噪声
+   - 太大（>0.9）：难以切换，可能滞后
+
+**分段示例**：
+
+```
+分段1: K线0-49，市场状态=趋势
+分段2: K线50-119，市场状态=震荡
+分段3: K线120-199，市场状态=趋势
+分段4: K线200-249，市场状态=震荡
+...
+```
+
+**优势**：
+1. **状态持续性**：每个时间段内的市场状态保持不变，不会频繁切换
+2. **策略稳定性**：策略有足够的时间完成交易，不会因为状态频繁切换而中断
+3. **减少噪声**：通过最小分段长度和变化阈值，过滤掉短期的市场波动
+
+**劣势**：
+1. **滞后性**：状态变化需要等待最小分段长度的时间才能被检测到
+2. **实现复杂**：需要在线分段算法，实现相对复杂
+
+#### 3.4 方法选择建议
+
+**推荐使用方案一（前瞻性预测）**，原因：
+1. 实盘和回测都可用，逻辑一致
+2. 提前判断，给策略足够时间
+3. 实现相对简单，参数调整方便
+
+**如果追求更高的状态持续性**，可以使用方案三（在线分段）：
+1. 适合长期持仓策略
+2. 适合对市场状态切换频率要求严格的场景
+
+**原始方法（每根K线都预测）**适用于：
+1. 短期交易，对市场变化敏感
+2. 需要快速响应市场状态变化的场景
 
 ---
 
