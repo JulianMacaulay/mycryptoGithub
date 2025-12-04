@@ -29,7 +29,9 @@ from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 import os
 import sys
+import importlib
 import importlib.util
+import inspect
 
 warnings.filterwarnings('ignore')
 
@@ -67,8 +69,11 @@ except ImportError:
 
 # 尝试导入Flask（用于Web监控界面）
 try:
-    from flask import Flask, jsonify, request, render_template
+    from flask import Flask, jsonify, request, render_template, redirect, url_for, session, flash
     from flask_cors import CORS
+    from werkzeug.security import generate_password_hash, check_password_hash
+    import sqlite3
+    from functools import wraps
     FLASK_AVAILABLE = True
 except ImportError:
     FLASK_AVAILABLE = False
@@ -81,8 +86,8 @@ except ImportError:
 # ==================== 币安API配置 ====================
 
 # API配置（请修改为您的实际API密钥）
-API_KEY = "YOUR_API_KEY"
-SECRET_KEY = "YOUR_SECRET_KEY"
+API_KEY = "SdTSZxmdf61CFsze3udgLRWq0aCaVyyFjsrYKMUOWIfMkm7q3sGRkzSk6QSbM5Qk"
+SECRET_KEY = "9HZ04wgrKTy5kDPF5Kman4WSmS9D7YlTscPA7FtX2YLK7vTbpORFNB2jTABQY6HY"
 BASE_URL = "https://testnet.binancefuture.com"  # 测试网，实盘请改为 "https://fapi.binance.com"
 
 
@@ -409,8 +414,14 @@ class RealTimeDataManager:
                     time.sleep(60)
                 elif self.interval == '5m':
                     time.sleep(300)
+                elif self.interval == '15m':
+                    time.sleep(1500)
+                elif self.interval == '30m':
+                    time.sleep(3000)
                 elif self.interval == '1h':
                     time.sleep(3600)
+                elif self.interval == '4h':
+                    time.sleep(14400)
                 elif self.interval == '1d':
                     time.sleep(86400)
                 else:
@@ -451,7 +462,7 @@ class RealTimeDataManager:
                     latest_timestamp = timestamp
         return latest_timestamp
 
-    def collect_warmup_data(self, symbols, interval='1h', warmup_period=200):
+    def collect_warmup_data(self, symbols, interval='1h', warmup_period=2000):
         """
         收集预热数据
 
@@ -888,6 +899,11 @@ class LiveTradingSystem:
                     change_threshold=self.change_threshold
                 )
 
+        # 资金曲线
+        self.capital_curve = []
+
+    # def initialize_strategies(self, warmup_data: Dict[str, pd.DataFrame]):
+
     def initialize_strategies(self, warmup_data: Dict[str, pd.DataFrame]):
         """
         初始化策略（使用预热数据）
@@ -1020,6 +1036,7 @@ class LiveTradingSystem:
 
         self.running = True
         last_processed_timestamp = None
+        last_status_output = 0  # 上次输出状态的时间戳
 
         print("\n开始实盘交易...")
         print(f"初始资金: {self.engine.initial_capital}")
@@ -1035,6 +1052,102 @@ class LiveTradingSystem:
                 if not current_data or not current_prices:
                     time.sleep(10)
                     continue
+
+                # 每10秒输出一次持仓和交易信息
+                current_time = time.time()
+                if current_time - last_status_output >= 10:
+                    print(f"\n{'=' * 60}")
+                    print(f"交易状态监控 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"{'=' * 60}")
+                    
+                    # 输出账户信息
+                    print(f"账户信息:")
+                    print(f"  初始资金: {self.engine.initial_capital:.2f}")
+                    print(f"  当前余额: {self.engine.balance:.2f}")
+                    print(f"  持仓价值: {self.engine.position_value:.2f}")
+                    print(f"  总权益: {self.engine.equity:.2f}")
+                    print(f"  收益率: {(self.engine.equity / self.engine.initial_capital - self.engine.initial_capital * self.engine.position_ratio / self.engine.initial_capital) * 100:.2f}%")
+                    
+                    # 输出当前价格
+                    if len(current_prices) > 0:
+                        print(f"\n当前价格:")
+                        for symbol, price in current_prices.items():
+                            print(f"  {symbol}: {price:.4f}")
+                    
+                    # 输出持仓信息
+                    if self.engine.has_positions():
+                        print(f"\n持仓信息:")
+                        for pos in self.engine.positions:
+                            position_id = pos['position_id']
+                            entry_price = pos['entry_price']
+                            size = pos['size']
+                            entry_time = pos['entry_time']
+                            
+                            # 计算当前盈亏
+                            if len(current_prices) > 0:
+                                first_symbol = list(current_prices.keys())[0]
+                                current_price = current_prices[first_symbol]
+                                pnl = size * (current_price - entry_price)
+                                pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                                
+                                holding_time = (datetime.now() - entry_time).total_seconds() / 3600
+                                direction = "多头" if size > 0 else "空头"
+                                
+                                print(f"  持仓ID: {position_id}")
+                                print(f"    方向: {direction}")
+                                print(f"    数量: {abs(size):.6f}")
+                                print(f"    开仓价: {entry_price:.4f}")
+                                print(f"    当前价: {current_price:.4f}")
+                                print(f"    盈亏: {pnl:.2f} ({pnl_pct:+.2f}%)")
+                                print(f"    持仓时间: {holding_time:.1f} 小时")
+                                print(f"    加仓次数: {pos.get('entry_count', 1)}")
+                                
+                                # 显示使用的策略
+                                strategy_name = "未知"
+                                if pos.get('strategy'):
+                                    strategy_name = pos['strategy'].name if hasattr(pos['strategy'], 'name') else type(pos['strategy']).__name__
+                                print(f"    策略: {strategy_name}")
+                            else:
+                                print(f"  持仓ID: {position_id}, 数量: {size:.6f}, 开仓价: {entry_price:.4f}")
+                    else:
+                        print(f"\n持仓信息: 无持仓")
+                    
+                    # 输出市场状态（如果使用市场状态检测）
+                    if self.use_market_regime and self.market_detector.is_trained:
+                        if len(current_data) > 0:
+                            first_symbol = list(current_data.keys())[0]
+                            data = current_data[first_symbol]
+                            current_idx = len(data) - 1
+                            current_regime, current_confidence = self.get_current_regime(
+                                current_data, current_idx
+                            )
+                            print(f"\n市场状态:")
+                            print(f"  状态: {current_regime}")
+                            print(f"  置信度: {current_confidence:.2%}")
+                            
+                            # 显示当前使用的策略
+                            if self.strategy:
+                                strategy_name = self.strategy.name if hasattr(self.strategy, 'name') else type(self.strategy).__name__
+                                print(f"  当前策略: {strategy_name}")
+                            else:
+                                print(f"  当前策略: 无可用策略")
+                    
+                    # 输出交易统计
+                    if len(self.engine.trades) > 0:
+                        print(f"\n交易统计:")
+                        open_trades = [t for t in self.engine.trades if t.get('action') == 'OPEN']
+                        close_trades = [t for t in self.engine.trades if t.get('action') == 'CLOSE']
+                        print(f"  总交易次数: {len(self.engine.trades)}")
+                        print(f"  开仓次数: {len(open_trades)}")
+                        print(f"  平仓次数: {len(close_trades)}")
+                        
+                        if close_trades:
+                            total_pnl = sum([t.get('pnl', 0) for t in close_trades])
+                            print(f"  总盈亏: {total_pnl:.2f}")
+                    
+                    print(f"{'=' * 60}\n")
+                    
+                    last_status_output = current_time
 
                 # 检查是否有新的K线收盘
                 latest_timestamp = self.data_manager.get_latest_closed_kline_timestamp()
@@ -1062,6 +1175,9 @@ class LiveTradingSystem:
 
                     # 更新权益
                     self.engine.update_equity(current_price)
+                    
+                    # 更新资金曲线
+                    self.update_capital_curve()
 
                     # 获取当前市场状态
                     if self.use_market_regime and self.market_detector.is_trained:
@@ -1193,53 +1309,232 @@ class LiveTradingSystem:
 
         print("\n实盘交易已停止")
 
+    def update_capital_curve(self):
+        """更新资金曲线"""
+        self.capital_curve.append({
+            'timestamp': datetime.now(),
+            'capital': self.engine.equity,
+            'balance': self.engine.balance,
+            'position_value': self.engine.position_value,
+            'positions_count': len(self.engine.positions)
+        })
+
+    def get_trading_status(self):
+        """获取交易状态"""
+        return {
+            'running': self.running,
+            'current_capital': self.engine.equity,
+            'initial_capital': self.engine.initial_capital,
+            'balance': self.engine.balance,
+            'position_value': self.engine.position_value,
+            'total_return': (self.engine.equity / self.engine.initial_capital - 1) * 100 if self.engine.initial_capital > 0 else 0,
+            'positions_count': len(self.engine.positions),
+            'total_trades': len(self.engine.trades),
+            'positions': {pos['position_id']: {
+                'position_id': pos['position_id'],
+                'size': pos['size'],
+                'entry_price': pos['entry_price'],
+                'entry_time': pos['entry_time'].isoformat() if isinstance(pos['entry_time'], datetime) else str(pos['entry_time']),
+                'entry_count': pos.get('entry_count', 1)
+            } for pos in self.engine.positions},
+            'recent_trades': self.engine.trades[-5:] if self.engine.trades else []
+        }
+
 
 # ==================== 辅助函数 ====================
 
-def list_available_strategies():
-    """列出可用策略"""
-    strategies = []
+def load_strategy_from_module(module_name: str, strategy_class_name: str, params: Dict = None) -> BaseStrategy:
+    """
+    从strategies文件夹动态加载策略
+    
+    Args:
+        module_name: 模块名称（不含.py扩展名，如 'turtle_strategy'）
+        strategy_class_name: 策略类名称（如 'TurtleStrategy'）
+        params: 策略参数字典
+        
+    Returns:
+        策略实例
+    """
     try:
-        from strategies import TurtleStrategy, RSIStrategy, MovingAverageStrategy, GridStrategy
-        if TurtleStrategy:
-            strategies.append('TurtleStrategy')
-        if RSIStrategy:
-            strategies.append('RSIStrategy')
-        if MovingAverageStrategy:
-            strategies.append('MovingAverageStrategy')
-        if GridStrategy:
-            strategies.append('GridStrategy')
-    except ImportError:
-        pass
+        # 动态导入模块
+        module = importlib.import_module(f'strategies.{module_name}')
+        
+        # 获取策略类
+        strategy_class = getattr(module, strategy_class_name)
+        
+        # 检查是否是BaseStrategy的子类
+        if not issubclass(strategy_class, BaseStrategy):
+            raise ValueError(f"{strategy_class_name} 不是BaseStrategy的子类")
+        
+        # 创建策略实例
+        if params is None:
+            params = {}
+        strategy = strategy_class(params)
+        
+        return strategy
+        
+    except ImportError as e:
+        raise ImportError(f"无法导入策略模块 {module_name}: {str(e)}")
+    except AttributeError as e:
+        raise AttributeError(f"策略类 {strategy_class_name} 不存在: {str(e)}")
+    except Exception as e:
+        raise Exception(f"加载策略失败: {str(e)}")
+
+
+def list_available_strategies() -> List[str]:
+    """
+    列出strategies文件夹中所有可用的策略
+    
+    Returns:
+        策略类名称列表（格式: 'module_name.ClassName'）
+    """
+    strategies_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'strategies')
+    strategies = []
+    
+    if not os.path.exists(strategies_dir):
+        print(f"警告: strategies目录不存在: {strategies_dir}")
+        return strategies
+    
+    for filename in os.listdir(strategies_dir):
+        if filename.endswith('_strategy.py') and not filename.endswith('_strategy_bt.py'):
+            module_name = filename[:-3]  # 移除.py
+            try:
+                module = importlib.import_module(f'strategies.{module_name}')
+                # 查找所有BaseStrategy的子类
+                for name, obj in inspect.getmembers(module, inspect.isclass):
+                    if (issubclass(obj, BaseStrategy) and 
+                        obj != BaseStrategy and 
+                        obj.__module__ == module.__name__):
+                        strategies.append(f"{module_name}.{name}")
+            except Exception as e:
+                # 静默忽略导入错误
+                pass
+    
     return strategies
 
 
-def select_strategies():
-    """选择策略（趋势和震荡）"""
-    print("\n选择策略:")
-    print("  1. TurtleStrategy (趋势策略)")
-    print("  2. RSIStrategy (震荡策略)")
-    print("  3. MovingAverageStrategy (趋势策略)")
-    print("  4. GridStrategy (震荡策略)")
+def get_strategy_params(strategy_class_name: str) -> Dict:
+    """
+    获取策略参数（用户输入）
+    
+    Args:
+        strategy_class_name: 策略类名称
+        
+    Returns:
+        参数字典
+    """
+    print(f"\n配置 {strategy_class_name} 参数:")
+    print("  直接回车使用默认值")
+    
+    params = {}
+    
+    # 根据策略类型设置默认参数
+    if 'Turtle' in strategy_class_name:
+        params = {
+            'n_entries': 3,
+            'atr_length': 20,
+            'bo_length': 20,
+            'fs_length': 55,
+            'te_length': 10,
+            'use_filter': False,
+            'mas': 10,
+            'mal': 20
+        }
+        # 允许用户修改参数
+        n_entries_input = input("加仓次数 (默认3): ").strip()
+        if n_entries_input:
+            try:
+                params['n_entries'] = int(n_entries_input)
+            except:
+                pass
+    elif 'FinalMultiplePeriod' in strategy_class_name:
+        # FinalMultiplePeriodStrategy的默认参数
+        params = {
+            'ema_lens': [5, 10, 20, 30],
+            'ma_len_daily': 25,
+            'tp_pct': 3.0,
+            'vol_factor': 1.2,
+            'watch_bars': 5
+        }
+    else:
+        # 其他策略使用空参数字典（策略会使用自己的默认值）
+        params = {}
+    
+    return params
 
+
+def select_strategies() -> Dict[str, BaseStrategy]:
+    """
+    让用户选择策略（趋势类和/或震荡类）
+    
+    Returns:
+        策略字典 {'trending': 趋势策略, 'ranging': 震荡策略} 或 None
+    """
+    print("\n" + "=" * 60)
+    print("选择交易策略")
+    print("=" * 60)
+    
+    # 列出可用策略
+    available_strategies = list_available_strategies()
+    if not available_strategies:
+        print("未找到可用策略")
+        return None
+    
+    print("\n可用策略:")
+    for i, strategy_name in enumerate(available_strategies, 1):
+        print(f"  {i}. {strategy_name}")
+    
     strategies = {}
-
-    trending_choice = input("请选择趋势策略 (1-4，回车跳过): ").strip()
-    if trending_choice == '1':
-        strategies['trending'] = TurtleStrategy()
-    elif trending_choice == '3':
-        from strategies import MovingAverageStrategy
-        strategies['trending'] = MovingAverageStrategy()
-
-    ranging_choice = input("请选择震荡策略 (1-4，回车跳过): ").strip()
-    if ranging_choice == '2':
-        from strategies import RSIStrategy
-        strategies['ranging'] = RSIStrategy()
-    elif ranging_choice == '4':
-        from strategies import GridStrategy
-        strategies['ranging'] = GridStrategy()
-
-    return strategies if strategies else None
+    
+    # 选择趋势类策略
+    print("\n选择趋势类策略（用于趋势市场）:")
+    print("  输入策略编号，或直接回车跳过（不选择趋势策略）")
+    trend_choice = input("请选择: ").strip()
+    
+    if trend_choice:
+        try:
+            trend_idx = int(trend_choice) - 1
+            if 0 <= trend_idx < len(available_strategies):
+                strategy_name = available_strategies[trend_idx]
+                module_name, class_name = strategy_name.split('.')
+                
+                # 获取策略参数
+                params = get_strategy_params(class_name)
+                
+                strategies['trending'] = load_strategy_from_module(module_name, class_name, params)
+                print(f" 已选择趋势策略: {strategy_name}")
+            else:
+                print("无效选择")
+        except Exception as e:
+            print(f"加载趋势策略失败: {str(e)}")
+    
+    # 选择震荡类策略
+    print("\n选择震荡类策略（用于震荡市场）:")
+    print("  输入策略编号，或直接回车跳过（不选择震荡策略）")
+    range_choice = input("请选择: ").strip()
+    
+    if range_choice:
+        try:
+            range_idx = int(range_choice) - 1
+            if 0 <= range_idx < len(available_strategies):
+                strategy_name = available_strategies[range_idx]
+                module_name, class_name = strategy_name.split('.')
+                
+                # 获取策略参数
+                params = get_strategy_params(class_name)
+                
+                strategies['ranging'] = load_strategy_from_module(module_name, class_name, params)
+                print(f" 已选择震荡策略: {strategy_name}")
+            else:
+                print("无效选择")
+        except Exception as e:
+            print(f"加载震荡策略失败: {str(e)}")
+    
+    if not strategies:
+        print("\n警告: 未选择任何策略，将退出")
+        return None
+    
+    return strategies
 
 
 def select_regime_detection_method() -> str:
@@ -1256,6 +1551,148 @@ def select_regime_detection_method() -> str:
         return 'segmentation'
     else:
         return 'per_kline'
+
+
+# ==================== Flask Web服务器 ====================
+
+if FLASK_AVAILABLE:
+    class LiveTradingServer:
+        """实盘交易Web服务器（简化版，仅监控功能）"""
+
+        def __init__(self, trading_system):
+            self.trading_system = trading_system
+            self.app = Flask(__name__)
+            self.app.secret_key = 'your-secret-key-change-in-production'  # 生产环境请更改
+            CORS(self.app)
+            self.setup_routes()
+
+        def setup_routes(self):
+            """设置路由"""
+
+            @self.app.route('/')
+            def index():
+                """首页 - 重定向到监控页面"""
+                return redirect(url_for('monitor'))
+
+            @self.app.route('/monitor')
+            def monitor():
+                """实时监控页面"""
+                return render_template('monitor.html') if hasattr(self.app, 'send_static_file') else "监控页面（需要templates/monitor.html）"
+
+            @self.app.route('/api/status')
+            def get_status():
+                """获取交易状态"""
+                return jsonify(self.trading_system.get_trading_status())
+
+            @self.app.route('/api/positions')
+            def get_positions():
+                """获取当前持仓"""
+                positions_dict = {}
+                for pos in self.trading_system.engine.positions:
+                    positions_dict[pos['position_id']] = {
+                        'position_id': pos['position_id'],
+                        'size': pos['size'],
+                        'entry_price': pos['entry_price'],
+                        'entry_time': pos['entry_time'].isoformat() if isinstance(pos['entry_time'], datetime) else str(pos['entry_time']),
+                        'entry_count': pos.get('entry_count', 1),
+                        'strategy': pos.get('strategy').name if pos.get('strategy') and hasattr(pos.get('strategy'), 'name') else 'Unknown'
+                    }
+                return jsonify(positions_dict)
+
+            @self.app.route('/api/trades')
+            def get_trades():
+                """获取交易记录"""
+                # 转换datetime对象为字符串
+                trades_list = []
+                for trade in self.trading_system.engine.trades:
+                    trade_dict = trade.copy()
+                    if 'timestamp' in trade_dict and isinstance(trade_dict['timestamp'], datetime):
+                        trade_dict['timestamp'] = trade_dict['timestamp'].isoformat()
+                    trades_list.append(trade_dict)
+                return jsonify(trades_list)
+
+            @self.app.route('/api/capital_curve')
+            def get_capital_curve():
+                """获取资金曲线"""
+                # 转换datetime对象为字符串
+                curve_list = []
+                for point in self.trading_system.capital_curve:
+                    point_dict = point.copy()
+                    if 'timestamp' in point_dict and isinstance(point_dict['timestamp'], datetime):
+                        point_dict['timestamp'] = point_dict['timestamp'].isoformat()
+                    curve_list.append(point_dict)
+                return jsonify(curve_list)
+
+            @self.app.route('/api/monitor/data')
+            def monitor_data():
+                """获取监控数据API"""
+                # 从币安API实时获取账户信息
+                account_info = None
+                try:
+                    account_info = self.trading_system.binance_api.get_account_info()
+                except Exception as e:
+                    print(f"获取账户信息失败: {str(e)}")
+
+                # 解析账户信息
+                balance = 0.0
+                equity = 0.0
+                available = 0.0
+
+                if account_info:
+                    balance = float(account_info.get('totalWalletBalance', 0))
+                    available = float(account_info.get('availableBalance', 0))
+                    unrealized_profit = float(account_info.get('totalUnrealizedProfit', 0))
+                    equity = balance + unrealized_profit
+
+                status = self.trading_system.get_trading_status()
+                return jsonify({
+                    'status': 'running' if self.trading_system.running else 'stopped',
+                    'symbol': self.trading_system.symbol,
+                    'positions': {pos['position_id']: {
+                        'position_id': pos['position_id'],
+                        'size': pos['size'],
+                        'entry_price': pos['entry_price'],
+                        'entry_time': pos['entry_time'].isoformat() if isinstance(pos['entry_time'], datetime) else str(pos['entry_time']),
+                        'entry_count': pos.get('entry_count', 1)
+                    } for pos in self.trading_system.engine.positions},
+                    'account': {
+                        'balance': balance if balance > 0 else self.trading_system.engine.balance,
+                        'equity': equity if equity > 0 else self.trading_system.engine.equity,
+                        'available': available if available > 0 else self.trading_system.engine.balance
+                    },
+                    'trading_status': status
+                })
+
+            @self.app.route('/api/start_trading', methods=['POST'])
+            def start_trading():
+                """开始交易"""
+                if not self.trading_system.running:
+                    self.trading_system.running = True
+                    return jsonify({'status': 'success', 'message': '交易已开始'})
+                else:
+                    return jsonify({'status': 'error', 'message': '交易已在运行中'})
+
+            @self.app.route('/api/stop_trading', methods=['POST'])
+            def stop_trading():
+                """停止交易"""
+                if self.trading_system.running:
+                    self.trading_system.running = False
+                    return jsonify({'status': 'success', 'message': '交易已停止'})
+                else:
+                    return jsonify({'status': 'error', 'message': '交易未在运行'})
+
+        def run(self, host='0.0.0.0', port=5000, debug=False):
+            """运行服务器"""
+            print(f"启动实盘交易Web服务器: http://{host}:{port}")
+            self.app.run(host=host, port=port, debug=debug)
+else:
+    # Flask不可用时的占位类
+    class LiveTradingServer:
+        def __init__(self, trading_system):
+            print("警告: Flask未安装，Web服务器不可用")
+        
+        def run(self, host='0.0.0.0', port=5000, debug=False):
+            print("警告: Flask未安装，无法启动Web服务器")
 
 
 # ==================== 主函数 ====================
@@ -1312,8 +1749,24 @@ def main():
             print(f"  {i}. {strategy_name}")
 
         choice = input(f"请选择策略 (1-{len(available_strategies)}): ").strip()
-        # 这里简化处理，实际需要根据选择创建策略实例
-        strategy = None
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_strategies):
+                strategy_name = available_strategies[idx]
+                module_name, class_name = strategy_name.split('.')
+                
+                # 获取策略参数
+                params = get_strategy_params(class_name)
+                
+                strategy = load_strategy_from_module(module_name, class_name, params)
+                strategies = None
+                print(f" 已选择策略: {strategy_name}")
+            else:
+                print("无效选择")
+                return
+        except Exception as e:
+            print(f"加载策略失败: {str(e)}")
+            return
 
     # 4. 配置交易参数
     print("\n3. 配置交易参数")
@@ -1337,12 +1790,13 @@ def main():
     print("  1. 1m (1分钟)")
     print("  2. 5m (5分钟)")
     print("  3. 15m (15分钟)")
-    print("  4. 1h (1小时)")
-    print("  5. 4h (4小时)")
-    print("  6. 1d (1天)")
+    print("  4. 30m (30分钟)")
+    print("  5. 1h (1小时)")
+    print("  6. 4h (4小时)")
+    print("  7. 1d (1天)")
 
     interval_choice = input("请选择 (1-6，默认4): ").strip()
-    interval_map = {'1': '1m', '2': '5m', '3': '15m', '4': '1h', '5': '4h', '6': '1d'}
+    interval_map = {'1': '1m', '2': '5m', '3': '15m', '4': '30m','5': '1h', '6': '4h', '7': '1d'}
     interval = interval_map.get(interval_choice, '1h')
 
     # 7. 初始化数据管理器
@@ -1351,7 +1805,7 @@ def main():
 
     # 8. 收集预热数据
     print("\n7. 收集预热数据")
-    warmup_period = 200
+    warmup_period = 1000
     warmup_data = data_manager.collect_warmup_data([symbol], interval=interval, warmup_period=warmup_period)
     data_manager.data_cache = warmup_data
 
@@ -1418,16 +1872,28 @@ def main():
     print("\n10. 启动实时数据收集")
     data_manager.start_data_collection([symbol], interval=interval)
 
-    # 12. 启动交易
-    print("\n11. 启动实盘交易")
-    print("按 Ctrl+C 停止交易")
-    print("=" * 80)
+    # 12. 启动Web服务器
+    print("\n11. 启动Web服务器")
+    server = LiveTradingServer(trading_system)
+
+    # 13. 启动交易循环
+    print("\n12. 启动交易循环")
+    trading_system.running = True
+
+    def trading_loop():
+        """交易循环（在后台线程中运行）"""
+        trading_system.start_trading(max_entries=3)
+
+    # 启动交易循环线程
+    trading_thread = threading.Thread(target=trading_loop)
+    trading_thread.daemon = True
+    trading_thread.start()
 
     try:
-        trading_system.start_trading(max_entries=3)
+        # 启动Web服务器（阻塞主线程）
+        server.run(host='0.0.0.0', port=5000, debug=False)
     except KeyboardInterrupt:
-        print("\n收到停止信号")
-    finally:
+        print("\n停止实盘交易...")
         trading_system.running = False
         data_manager.stop_data_collection()
         print("实盘交易已停止")
