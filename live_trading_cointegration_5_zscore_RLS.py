@@ -15,7 +15,7 @@
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import warnings
 import time
 import threading
@@ -75,8 +75,8 @@ except ImportError:
 # ==================== 币安API配置 ====================
 
 # API配置（请修改为您的实际API密钥）
-API_KEY = "SdTSZxmdf61CFsze3udgLRWq0aCaVyyFjsrYKMUOWIfMkm7q3sGRkzSk6QSbM5Qk"
-SECRET_KEY = "9HZ04wgrKTy5kDPF5Kman4WSmS9D7YlTscPA7FtX2YLK7vTbpORFNB2jTABQY6HY"
+API_KEY = "ZvJOtao1z4MktIjXue9qcJjRDMvZ5kL94rcF5tHnZcNw747iWxRDojslVMV8ZpVt"
+SECRET_KEY = "idr9iHAmV3aOUubPkgDZggiXxyjjcq3859sWkMVW4e6A95rwM1hNtqTF57SpvVLx"
 BASE_URL = "https://testnet.binancefuture.com"  # 测试网，实盘请改为 "https://fapi.binance.com"
 
 
@@ -314,6 +314,73 @@ class BinanceAPI:
             return None
 
 
+# ==================== K线边界对齐工具函数 ====================
+
+def get_seconds_until_next_kline_boundary(interval: str, buffer_seconds: int = 5) -> float:
+    """
+    计算距离下一个K线收盘边界的秒数（用于在整点附近更新数据）
+    
+    Binance使用UTC时间，K线在整点/整5分钟等边界收盘。
+    增加buffer_seconds是为了确保交易所已将该K线数据最终化后再请求。
+    
+    Args:
+        interval: K线周期，如 '1m', '5m', '15m', '30m', '1h', '4h', '1d'
+        buffer_seconds: K线收盘后等待的缓冲秒数（默认5秒）
+    
+    Returns:
+        float: 需要等待的秒数
+    """
+    now_utc = datetime.now(timezone.utc)
+    
+    if interval == '1m':
+        # 下一分钟整（如 10:23:xx -> 10:24:00）
+        next_boundary = (now_utc + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    elif interval == '5m':
+        # 下一个5分钟整点 (:00, :05, :10, ...)
+        next_minute = ((now_utc.minute // 5) + 1) * 5
+        if next_minute >= 60:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=next_minute, second=0, microsecond=0)
+    elif interval == '15m':
+        # 下一个15分钟整点 (:00, :15, :30, :45)
+        next_minute = ((now_utc.minute // 15) + 1) * 15
+        if next_minute >= 60:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=next_minute, second=0, microsecond=0)
+    elif interval == '30m':
+        # 下一个30分钟整点 (:00, :30)
+        next_minute = 30 if now_utc.minute < 30 else 0
+        if next_minute == 0:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=30, second=0, microsecond=0)
+    elif interval == '1h':
+        # 下一小时整
+        next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    elif interval == '4h':
+        # 4小时K线: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+        next_hour = ((now_utc.hour // 4) + 1) * 4
+        if next_hour >= 24:
+            next_boundary = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+    elif interval == '1d':
+        # 日线: 每日 00:00 UTC
+        next_boundary = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        # 未知周期，使用1小时作为默认
+        next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    
+    # 加上缓冲时间，确保K线数据已最终化
+    target_time = next_boundary + timedelta(seconds=buffer_seconds)
+    wait_seconds = (target_time - now_utc).total_seconds()
+    
+    # 确保至少等待1秒，避免过于频繁请求
+    return max(1.0, wait_seconds)
+
+
 # ==================== 实时数据管理 ====================
 
 class RealTimeDataManager:
@@ -346,9 +413,16 @@ class RealTimeDataManager:
         print("停止数据收集")
 
     def _update_data_loop(self):
-        """数据更新循环"""
+        """
+        数据更新循环（对齐K线整点）
+        
+        在每次K线收盘后立即更新数据，确保交易时机与参数优化时的逻辑一致。
+        例如1h周期：在 11:00:05、12:00:05、13:00:05... 更新（整点后5秒缓冲）
+        """
+        first_run = True
         while self.running:
             try:
+                # 获取K线数据
                 for symbol in self.symbols:
                     klines = self.binance_api.get_klines(symbol, self.interval, 100)
                     if klines:
@@ -356,15 +430,24 @@ class RealTimeDataManager:
                         df.set_index('timestamp', inplace=True)
                         self.data_cache[symbol] = df['close']
 
-                # 根据interval确定更新频率
-                if self.interval == '1m':
-                    time.sleep(60)
-                elif self.interval == '5m':
-                    time.sleep(300)
-                elif self.interval == '1h':
-                    time.sleep(3600)
-                else:
-                    time.sleep(60)
+                now_utc = datetime.now(timezone.utc)
+                if first_run:
+                    print(f"  [数据更新] 初始数据已加载 ({now_utc.strftime('%H:%M:%S')} UTC)")
+                    first_run = False
+
+                # 计算距离下一个K线边界的等待时间（对齐整点）
+                wait_seconds = get_seconds_until_next_kline_boundary(self.interval, buffer_seconds=5)
+                
+                # 分段sleep，以便能响应running=False的停止信号
+                sleep_interval = 1.0  # 每秒检查一次
+                total_waited = 0.0
+                while total_waited < wait_seconds and self.running:
+                    time.sleep(min(sleep_interval, wait_seconds - total_waited))
+                    total_waited += sleep_interval
+                
+                if not self.running:
+                    break
+                    
             except Exception as e:
                 print(f"数据更新异常: {str(e)}")
                 time.sleep(10)
@@ -937,6 +1020,8 @@ class AdvancedCointegrationTrading:
         self.trades = []  # 交易记录
         self.capital_curve = []  # 资金曲线
         self.running = False
+        # 单边平仓失败时的待恢复列表：{pair_name: {'symbol': 待平仓的symbol, 'side': 'BUY'/'SELL', 'quantity': 数量}}
+        self.pending_recovery_close = {}
 
         # RLS相关参数
         self.use_rls = use_rls
@@ -1561,7 +1646,7 @@ class AdvancedCointegrationTrading:
         return False, ""
 
     def close_position(self, pair_info, current_prices, reason, timestamp, current_spread):
-        """平仓"""
+        """平仓（支持单边失败时的恢复逻辑）"""
         pair_name = pair_info['pair_name']
         if pair_name not in self.positions:
             return None
@@ -1595,34 +1680,88 @@ class AdvancedCointegrationTrading:
             abs(position['symbol2_size'])
         )
 
-        if close_order1 and close_order2:
-            # 记录平仓交易
-            trade = {
-                'timestamp': timestamp,
-                'pair': pair_name,
-                'action': 'CLOSE',
-                'symbol1': symbol1,
-                'symbol2': symbol2,
-                'symbol1_size': -position['symbol1_size'],
-                'symbol2_size': -position['symbol2_size'],
-                'symbol1_price': price1,
-                'symbol2_price': price2,
-                'hedge_ratio': position['hedge_ratio'],
-                'signal': {'action': 'CLOSE', 'description': reason},
-                'pnl': total_pnl,
-                'holding_hours': (timestamp - position['entry_time']).total_seconds() / 3600
+        def _add_pending_recovery(remaining_symbol, remaining_side, remaining_quantity):
+            """将未平仓的一边加入待恢复列表，后续每10秒尝试平仓"""
+            self.pending_recovery_close[pair_name] = {
+                'symbol': remaining_symbol,
+                'side': remaining_side,
+                'quantity': remaining_quantity
             }
-            self.trades.append(trade)
-
-            print(f"实盘平仓: {pair_name}")
-            print(f"   平仓原因: {reason}")
-            print(f"   盈亏: {total_pnl:.2f}")
-            print(f"   持仓时间: {trade['holding_hours']:.1f}小时")
-
-            # 移除持仓
             del self.positions[pair_name]
+            print(f"   单边平仓失败: {remaining_symbol} 未平仓，已加入待恢复列表（每10秒重试）")
 
-            return trade
+        if close_order1 and close_order2:
+            # 两个订单都提交成功，等待成交
+            success, status1, status2 = self.wait_for_orders_completion(
+                close_order1, close_order2, symbol1, symbol2, max_wait=30
+            )
+            if success:
+                # 两边都成交，正常完成平仓
+                trade = {
+                    'timestamp': timestamp,
+                    'pair': pair_name,
+                    'action': 'CLOSE',
+                    'symbol1': symbol1,
+                    'symbol2': symbol2,
+                    'symbol1_size': -position['symbol1_size'],
+                    'symbol2_size': -position['symbol2_size'],
+                    'symbol1_price': price1,
+                    'symbol2_price': price2,
+                    'hedge_ratio': position['hedge_ratio'],
+                    'signal': {'action': 'CLOSE', 'description': reason},
+                    'pnl': total_pnl,
+                    'holding_hours': (timestamp - position['entry_time']).total_seconds() / 3600
+                }
+                self.trades.append(trade)
+                print(f"实盘平仓: {pair_name}")
+                print(f"   平仓原因: {reason}")
+                print(f"   盈亏: {total_pnl:.2f}")
+                print(f"   持仓时间: {trade['holding_hours']:.1f}小时")
+                del self.positions[pair_name]
+                return trade
+            else:
+                # 一方或双方成交失败，需判断哪边未平仓
+                fill1 = status1 and status1.get('status') in ['FILLED', 'PARTIALLY_FILLED'] if status1 else False
+                fill2 = status2 and status2.get('status') in ['FILLED', 'PARTIALLY_FILLED'] if status2 else False
+                if fill1 and not fill2:
+                    # symbol1 已平，symbol2 未平
+                    _add_pending_recovery(
+                        symbol2,
+                        'BUY' if position['symbol2_size'] < 0 else 'SELL',
+                        abs(position['symbol2_size'])
+                    )
+                elif fill2 and not fill1:
+                    # symbol2 已平，symbol1 未平
+                    _add_pending_recovery(
+                        symbol1,
+                        'BUY' if position['symbol1_size'] < 0 else 'SELL',
+                        abs(position['symbol1_size'])
+                    )
+                # 两边都未成交则保持原持仓，下一周期重试
+                return None
+
+        elif close_order1 and close_order1.get('orderId') and (not close_order2 or not close_order2.get('orderId')):
+            # 仅 order1 提交成功，order2 提交失败
+            success, _, _ = self.wait_for_orders_completion(close_order1, None, symbol1, None, max_wait=30)
+            if success:
+                _add_pending_recovery(
+                    symbol2,
+                    'BUY' if position['symbol2_size'] < 0 else 'SELL',
+                    abs(position['symbol2_size'])
+                )
+            # order1 也未成交则保持原持仓
+            return None
+
+        elif close_order2 and close_order2.get('orderId') and (not close_order1 or not close_order1.get('orderId')):
+            # 仅 order2 提交成功，order1 提交失败
+            success, _, _ = self.wait_for_orders_completion(close_order2, None, symbol2, None, max_wait=30)
+            if success:
+                _add_pending_recovery(
+                    symbol1,
+                    'BUY' if position['symbol1_size'] < 0 else 'SELL',
+                    abs(position['symbol1_size'])
+                )
+            return None
 
         return None
 
@@ -1699,6 +1838,29 @@ class AdvancedCointegrationTrading:
         except Exception as e:
             print(f"✗ 紧急平仓异常: {symbol} - {str(e)}")
             return False
+
+    def process_pending_recovery_close(self):
+        """
+        处理待恢复平仓列表：每10秒由交易循环调用，持续尝试平掉单边平仓失败后剩余的腿
+        不依赖K线周期，尽快消除单边持仓风险
+        """
+        if not self.pending_recovery_close:
+            return
+
+        for pair_name in list(self.pending_recovery_close.keys()):
+            pending = self.pending_recovery_close[pair_name]
+            symbol = pending['symbol']
+            side = pending['side']
+            quantity = pending['quantity']
+
+            print(f"\n  [恢复平仓] 尝试平仓 {pair_name} 的剩余腿: {symbol} {side} {quantity}")
+            success = self.emergency_close_position(
+                symbol, side, quantity,
+                reason=f"单边平仓恢复-{pair_name}"
+            )
+            if success:
+                del self.pending_recovery_close[pair_name]
+                print(f"  [恢复平仓] ✓ {pair_name} 已完全平仓")
 
     def update_capital_curve(self):
         """更新资金曲线"""
@@ -2842,6 +3004,9 @@ def test_live_trading():
 
         while trading_strategy.running:
             try:
+                # 优先处理单边平仓失败的恢复（不依赖K线，每轮都检查）
+                trading_strategy.process_pending_recovery_close()
+
                 # 获取当前数据
                 current_data = data_manager.get_current_data()
                 current_prices = data_manager.get_current_prices()  # 实时价格，用于监控显示
@@ -3202,8 +3367,8 @@ def test_live_trading():
                                                                 current_spread)
                                 print(f"   平仓: {close_reason}")
 
-                        # 检查开仓条件（使用K线收盘价）
-                        elif len(trading_strategy.positions) == 0:
+                        # 检查开仓条件（使用K线收盘价，且无待恢复平仓时方可开仓）
+                        elif len(trading_strategy.positions) == 0 and len(trading_strategy.pending_recovery_close) == 0:
                             signal = trading_strategy.generate_trading_signal(current_z_score)
                             signal['z_score'] = current_z_score
 
